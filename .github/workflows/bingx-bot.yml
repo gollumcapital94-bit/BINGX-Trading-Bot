@@ -1,0 +1,36 @@
+name: BingX Trading Bot - Pasos 1 a 13
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      demo_mode:
+        description: "Ejecutar en cuenta DEMO (VST) en vez de cuenta real"
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar bot
+        env:
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
+          BINGX_DEMO: ${{ github.event.inputs.demo_mode || vars.BINGX_DEMO || 'true' }}
+        run: python bingx_bot.py
