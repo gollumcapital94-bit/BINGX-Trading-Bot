@@ -242,7 +242,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 {"positionSide": "SHORT"},
             )
             log.info(
-                "[Paso 13] Entrada a MERCADO ejecutada: %s | margen=%.2f USDT | lev=%dx | orden_id=%s",
+                "[Step 13] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
                 symbol, margin_usdt, leverage, order.get("id"),
             )
         else:
@@ -256,7 +256,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 {"stopPrice": ma20_5m_value, "positionSide": "SHORT"},
             )
             log.info(
-                "[Paso 13] Orden STOP-LIMIT corta colocada en MA20(5m)=%.6f: %s | margen=%.2f USDT | lev=%dx | orden_id=%s",
+                "[Step 13] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
                 ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"),
             )
 
