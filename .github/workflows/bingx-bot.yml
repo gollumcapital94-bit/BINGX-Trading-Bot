@@ -33,4 +33,19 @@ jobs:
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO: ${{ github.event.inputs.demo_mode || vars.BINGX_DEMO || 'true' }}
-        run: python bingx_bot.py
+        run: python bingx_bot.py 2>&1 | tee bot_output.log
+
+      - name: Enviar seÃ±ales a Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          grep -E "Market entry executed|Short STOP-LIMIT order placed" bot_output.log > signals.txt || true
+          if [ -s signals.txt ]; then
+            MSG=$(cat signals.txt)
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=ðŸ“Š BingX Bot:
+          ${MSG}"
+          fi
