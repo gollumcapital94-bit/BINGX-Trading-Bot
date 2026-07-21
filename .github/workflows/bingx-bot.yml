@@ -2,7 +2,10 @@ name: BingX Trading Bot - Pasos 1 a 13
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    # Se ejecuta una vez por hora, en el minuto 7 (no en :00) para evitar
+    # la congestiÃ³n de GitHub Actions -- el minuto :00 es el mÃ¡s saturado
+    # de la plataforma y a veces provoca que se salten ejecuciones.
+    - cron: "7 * * * *"
   workflow_dispatch:
     inputs:
       demo_mode:
