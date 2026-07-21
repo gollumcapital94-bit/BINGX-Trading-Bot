@@ -33,7 +33,9 @@ jobs:
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO: ${{ github.event.inputs.demo_mode || vars.BINGX_DEMO || 'true' }}
-        run: python bingx_bot.py 2>&1 | tee bot_output.log
+        run: |
+          set -o pipefail
+          python bingx_bot.py 2>&1 | tee bot_output.log
 
       - name: Enviar seÃ±ales a Telegram
         if: always()
