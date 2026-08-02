@@ -41,6 +41,10 @@ LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 OHLCV_LIMIT_1H = 500   # histórico suficiente para encontrar el inicio del round
 OHLCV_LIMIT_LOWER_TF = 300  # para 15m / 5m
 
+# BingX usa "VST" (Virtual USDT) como código de moneda en la cuenta DEMO,
+# y "USDT" en la cuenta real. Revisamos ambas por si acaso.
+BALANCE_CURRENCY_CANDIDATES = ("USDT", "VST")
+
 
 def _to_dataframe(ohlcv: list) -> pd.DataFrame:
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -213,7 +217,6 @@ async def check_step_10(exchange, symbol: str):
     quote_volume = ticker.get("quoteVolume")
 
     if quote_volume is None:
-        # Fallback: baseVolume * last price
         base_volume = ticker.get("baseVolume") or 0
         last = ticker.get("last") or 0
         quote_volume = base_volume * last
@@ -255,17 +258,11 @@ def calculate_leverage(max_high_5m: float, ma20_5m_value: float) -> float:
         raise ValueError("La MA20(5m) está por encima del máximo, distancia inválida")
 
     leverage = LEVERAGE_BASE / distancia_pct
-    # Redondeo por defecto (hacia abajo) a múltiplo de 5
     leverage_rounded = math.floor(leverage / LEVERAGE_ROUND_STEP) * LEVERAGE_ROUND_STEP
     return max(leverage_rounded, LEVERAGE_ROUND_STEP)
 
 
 async def get_max_leverage_for_symbol(exchange, symbol: str, default: int = 20) -> int:
-    """
-    Intenta obtener el apalancamiento máximo permitido por BingX para el par.
-    Recurre a exchange.markets[symbol]['limits']['leverage']['max'] y,
-    si no está disponible, a fetch_leverage_tiers.
-    """
     market = exchange.markets.get(symbol, {})
     max_lev = (market.get("limits", {}) or {}).get("leverage", {}).get("max")
     if max_lev:
@@ -285,16 +282,11 @@ async def get_max_leverage_for_symbol(exchange, symbol: str, default: int = 20) 
 
 
 async def get_max_notional_for_leverage(exchange, symbol: str, leverage: int, default: float = 1_000_000.0) -> float:
-    """
-    Busca en las tiers de apalancamiento el notional máximo permitido para
-    el nivel de apalancamiento elegido, para poder calcular el margen máximo.
-    """
     try:
         tiers = await exchange.fetch_leverage_tiers([symbol])
         symbol_tiers = tiers.get(symbol, [])
         candidates = [t for t in symbol_tiers if t.get("maxLeverage", 0) >= leverage]
         if candidates:
-            # la tier más restrictiva compatible con el leverage elegido
             best = min(candidates, key=lambda t: t.get("maxNotional", default))
             return float(best.get("maxNotional", default))
     except Exception as exc:
@@ -303,15 +295,31 @@ async def get_max_notional_for_leverage(exchange, symbol: str, leverage: int, de
     return default
 
 
+def _get_available_balance(balance: dict) -> float:
+    """
+    Devuelve el saldo total disponible, revisando primero USDT (cuenta
+    real) y luego VST (cuenta DEMO de BingX -- "Virtual USDT"). Esto
+    evita que el bot calcule margen=0 en modo demo solo porque el saldo
+    está bajo una clave de moneda distinta.
+    """
+    for currency in BALANCE_CURRENCY_CANDIDATES:
+        entry = balance.get(currency)
+        if entry:
+            total = float(entry.get("total") or 0)
+            if total > 0:
+                return total
+    return 0.0
+
+
 async def calculate_position_size(exchange, symbol: str, leverage: int) -> float:
     """
-    Devuelve el margen (en USDT) a usar: el menor entre el 20% del margen
-    total de la cuenta y el margen máximo que permite el apalancamiento
-    elegido para ese par.
+    Devuelve el margen (en USDT/VST) a usar: el menor entre el 20% del
+    margen total de la cuenta y el margen máximo que permite el
+    apalancamiento elegido para ese par.
     """
     balance = await exchange.fetch_balance()
-    usdt_total = float(balance.get("USDT", {}).get("total", 0) or 0)
-    margin_20pct = usdt_total * MARGIN_PCT_OF_ACCOUNT
+    total_balance = _get_available_balance(balance)
+    margin_20pct = total_balance * MARGIN_PCT_OF_ACCOUNT
 
     max_notional = await get_max_notional_for_leverage(exchange, symbol, leverage)
     max_margin_by_leverage = max_notional / leverage if leverage else max_notional
@@ -323,12 +331,12 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
 # Pipeline completo por símbolo (pasos 2 a 12, deja el 13 -paso final
 # de ejecución de orden- para bingx_bot.py)
 # ----------------------------------------------------------------------
-async def evaluate_symbol(exchange, symbol: str) -> dict | None:
+async def evaluate_symbol(exchange, symbol: str):
     try:
         raw_1h = await exchange.fetch_ohlcv(symbol, timeframe="1h", limit=OHLCV_LIMIT_1H)
         df_1h = _drop_unclosed_candle(_to_dataframe(raw_1h))
         if len(df_1h) < 210:
-            return None  # datos insuficientes para EMA200 + margen
+            return None
 
         ok, info = check_step_2_3(df_1h)
         if not ok:
@@ -379,7 +387,6 @@ async def evaluate_symbol(exchange, symbol: str) -> dict | None:
             )
             return None
 
-        # Paso 12: apalancamiento y margen
         close_5m = df_5m["close"]
         ma20_5m = sma(close_5m, 20)
         max_idx_5m = info_5m["idx"]
