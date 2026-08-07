@@ -1,11 +1,8 @@
 name: BingX Trading Bot - Pasos 1 a 13
 
 on:
-  schedule:
-    # Se ejecuta una vez por hora, en el minuto 7 (no en :00) para evitar
-    # la congestiÃ³n de GitHub Actions -- el minuto :00 es el mÃ¡s saturado
-    # de la plataforma y a veces provoca que se salten ejecuciones.
-    - cron: "7 * * * *"
+  repository_dispatch:
+    types: [bingx-trigger]
   workflow_dispatch:
     inputs:
       demo_mode:
@@ -40,7 +37,7 @@ jobs:
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
 
-      - name: Enviar seÃ±ales a Telegram
+      - name: Enviar señales a Telegram
         if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -51,6 +48,6 @@ jobs:
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=ðŸ“Š BingX Bot:
+              --data-urlencode "text=📊 BingX Bot:
           ${MSG}"
           fi
