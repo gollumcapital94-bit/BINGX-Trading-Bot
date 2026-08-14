@@ -3,7 +3,7 @@ Bot de trading para BingX
 --------------------------
 PASO 1  -> Gestión de posiciones abiertas: coloca Take Profit en EMA200(1h)
            cuando el precio ya tocó la EMA50(1h).
-PASOS 2-13 -> Escáner de nuevas entradas en corto, siguiendo la cascada
+PASOS 2-15 -> Escáner de nuevas entradas en corto, siguiendo la cascada
            completa de condiciones (round alcista, RSI6, W%R6/12/24,
            singularidad matemática, apalancamiento dinámico, etc.)
            Ver strategy_entries.py para el detalle de cada paso.
@@ -277,10 +277,10 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         log.error("Error ejecutando entrada para %s: %s", symbol, exc)
 
 
-async def run_pasos_2_a_13_entradas(exchange: "ccxt.bingx", allowed_symbols: set[str], symbols_with_position: set[str]) -> None:
+async def run_pasos_2_a_15_entradas(exchange: "ccxt.bingx", allowed_symbols: set[str], symbols_with_position: set[str]) -> None:
     """
     Escanea todos los pares permitidos que NO tengan ya una posición
-    abierta, evaluando la cascada completa de pasos 2-13.
+    abierta, evaluando la cascada completa de pasos 2-15.
     """
     candidatos = [s for s in allowed_symbols if s not in symbols_with_position]
     log.info("[Pasos 2-15] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
@@ -316,7 +316,7 @@ async def main() -> None:
         # corren de forma concurrente.
         await asyncio.gather(
             run_paso1_gestion_tp(exchange, allowed_symbols),
-            run_pasos_2_a_13_entradas(exchange, allowed_symbols, symbols_with_position),
+            run_pasos_2_a_15_entradas(exchange, allowed_symbols, symbols_with_position),
         )
 
     finally:
