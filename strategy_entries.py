@@ -38,9 +38,7 @@ MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 14)
 LEVERAGE_BASE = 90  # numerador de la fórmula de apalancamiento
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 
-OHLCV_LIMIT_1H = 1000   # histórico inicial (~41 días) para que SMA20/EMA50/EMA200 converjan
-OHLCV_LIMIT_1H_MAX = 3000  # tope de velas al expandir la ventana de búsqueda (~125 días)
-OHLCV_LIMIT_1H_GROWTH = 1.5  # factor de crecimiento (+50%) cuando no se encuentra el patrón
+OHLCV_LIMIT_1H = 1200   # histórico fijo (~50 días) para que SMA20/EMA50/EMA200 converjan; una sola petición, sin reintentos
 OHLCV_LIMIT_LOWER_TF = 500  # para 15m / 5m (más margen de calentamiento para RSI/W%R)
 
 # BingX usa "VST" (Virtual USDT) como código de moneda en la cuenta DEMO,
@@ -553,49 +551,24 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
 
 
 # ----------------------------------------------------------------------
-# Paso 2: obtención de velas 1h con ventana expansiva.
-# Si con el límite actual no se encuentra el patrón completo del round
-# (cruce SMA20/EMA50 por debajo de la EMA200 -> cruce SMA20 sobre EMA200
-# -> cruce EMA50 sobre EMA200), se reintenta pidiendo un 50% más de
-# velas, hasta un tope de OHLCV_LIMIT_1H_MAX.
+# Paso 2: obtención de velas 1h con ventana FIJA (una sola petición).
+# Se pide siempre OHLCV_LIMIT_1H velas (~50 días); si en ese historial
+# no aparece el patrón completo del round, se descarta el par sin
+# reintentar con más velas (evita peticiones extra a la API de BingX).
 # ----------------------------------------------------------------------
 async def fetch_1h_with_expanding_window(exchange, symbol: str):
     """
-    Devuelve (df_1h_closed, info_step23) donde info_step23 es el resultado
-    de check_step_2_3 ya evaluado con la ventana que sí encontró el
-    patrón (o la ventana máxima, si nunca se encuentra).
+    Devuelve (df_1h_closed, info_step23) con una única petición de
+    OHLCV_LIMIT_1H velas de 1h. No reintenta ni expande la ventana.
     """
-    limit = OHLCV_LIMIT_1H
-    last_df = None
-    last_result = (False, {"reason": "Sin datos"})
+    raw_1h = await exchange.fetch_ohlcv(symbol, timeframe="1h", limit=OHLCV_LIMIT_1H)
+    df_1h = _drop_unclosed_candle(_to_dataframe(raw_1h))
 
-    while True:
-        raw_1h = await exchange.fetch_ohlcv(symbol, timeframe="1h", limit=int(limit))
-        df_1h = _drop_unclosed_candle(_to_dataframe(raw_1h))
-        last_df = df_1h
+    if len(df_1h) < 220:
+        return df_1h, (False, {"reason": "Datos insuficientes (< 220 velas cerradas)"})
 
-        if len(df_1h) < 220:
-            last_result = (False, {"reason": "Datos insuficientes (< 220 velas cerradas)"})
-        else:
-            ok, info = check_step_2_3(df_1h)
-            last_result = (ok, info)
-            if ok:
-                return df_1h, last_result
-            # Si el motivo NO es "ventana insuficiente" sino que simplemente
-            # no hay round activo ahora mismo, no tiene sentido seguir
-            # ampliando la ventana: no vamos a encontrar un round que no
-            # existe. Solo ampliamos cuando puede ser un problema de
-            # historial corto (streak_start está muy cerca del borde de
-            # los datos disponibles, o los datos son insuficientes).
-            reason = info.get("reason", "")
-            near_edge = ("insuficientes" in reason) or ("ventana" in reason)
-            if not near_edge:
-                return df_1h, last_result
-
-        if limit >= OHLCV_LIMIT_1H_MAX:
-            return last_df, last_result
-
-        limit = min(limit * OHLCV_LIMIT_1H_GROWTH, OHLCV_LIMIT_1H_MAX)
+    ok, info = check_step_2_3(df_1h)
+    return df_1h, (ok, info)
 
 
 # ----------------------------------------------------------------------
