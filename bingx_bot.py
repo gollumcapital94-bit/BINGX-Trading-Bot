@@ -38,7 +38,10 @@ log = logging.getLogger("bingx_bot")
 TIMEFRAME_TP = "1h"
 EMA_FAST = 50
 EMA_SLOW = 200
-OHLCV_LIMIT_TP = EMA_SLOW + 10
+# Se pide mucho más historial que EMA_SLOW+10 para que la EMA50/EMA200
+# converjan de forma similar a como las calcula BingX en su gráfico
+# (que usa todo el historial disponible del par desde su listado).
+OHLCV_LIMIT_TP = 1000
 
 
 def _env_flag(name: str, default: str = "false") -> bool:
@@ -196,8 +199,16 @@ async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]
 
 
 # ----------------------------------------------------------------------
-# PASO 13: ejecución de la orden de entrada (short) para símbolos que
-# pasaron todos los filtros de strategy_entries.evaluate_symbol
+# PASO 15: ejecución de la orden de entrada (short) para símbolos que
+# pasaron todos los filtros de strategy_entries.evaluate_symbol.
+#   - Si el precio YA tocó la MA20(5m) -> orden a MERCADO.
+#   - Si el precio AÚN NO la tocó -> orden STOP-LIMIT en la MA20(5m),
+#     esperando a que el precio la cruce de arriba hacia abajo.
+# En ambos casos, el margen/apalancamiento (plan["margin_usdt"] /
+# plan["leverage"]) ya viene calculado en el Paso 14: el MENOR entre el
+# 10% del margen total de la cuenta y el máximo margen que permite la
+# plataforma para ese apalancamiento (nunca se reduce el apalancamiento
+# para poder meter más margen).
 # ----------------------------------------------------------------------
 async def price_already_touched_ma20_5m(exchange: "ccxt.bingx", symbol: str, ma20_5m_value: float) -> bool:
     """
@@ -223,9 +234,11 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         return
 
     try:
-        # Configurar margen aislado y apalancamiento antes de operar
+        # Configurar margen aislado y apalancamiento antes de operar.
+        # BingX exige el parámetro 'side' (LONG/SHORT/BOTH) en setLeverage;
+        # como esta estrategia siempre abre en corto, se usa "SHORT".
         await exchange.set_margin_mode("isolated", symbol)
-        await exchange.set_leverage(leverage, symbol)
+        await exchange.set_leverage(leverage, symbol, params={"side": "SHORT"})
 
         # Tamaño de la posición en contratos/base currency:
         # notional = margen * apalancamiento ; amount = notional / precio
@@ -242,7 +255,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 {"positionSide": "SHORT"},
             )
             log.info(
-                "[Step 13] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                "[Paso 15] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
                 symbol, margin_usdt, leverage, order.get("id"),
             )
         else:
@@ -256,7 +269,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 {"stopPrice": ma20_5m_value, "positionSide": "SHORT"},
             )
             log.info(
-                "[Step 13] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                "[Paso 15] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
                 ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"),
             )
 
@@ -270,7 +283,7 @@ async def run_pasos_2_a_13_entradas(exchange: "ccxt.bingx", allowed_symbols: set
     abierta, evaluando la cascada completa de pasos 2-13.
     """
     candidatos = [s for s in allowed_symbols if s not in symbols_with_position]
-    log.info("[Pasos 2-13] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
+    log.info("[Pasos 2-15] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
 
     semaphore = asyncio.Semaphore(10)  # limitar concurrencia por rate limits
 
@@ -281,7 +294,7 @@ async def run_pasos_2_a_13_entradas(exchange: "ccxt.bingx", allowed_symbols: set
     results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
     plans = [r for r in results if r is not None]
 
-    log.info("[Pasos 2-13] Pares que cumplen TODAS las condiciones: %d", len(plans))
+    log.info("[Pasos 2-15] Pares que cumplen TODAS las condiciones: %d", len(plans))
     for plan in plans:
         log.info("  -> %s | lev=%dx | margen=%.2f USDT", plan["symbol"], plan["leverage"], plan["margin_usdt"])
 
@@ -299,7 +312,7 @@ async def main() -> None:
         open_positions = await get_open_positions(exchange, allowed_symbols)
         symbols_with_position = {p["symbol"] for p in open_positions}
 
-        # Paso 1 (gestión de TP) y Pasos 2-13 (búsqueda de nuevas entradas)
+        # Paso 1 (gestión de TP) y Pasos 2-15 (búsqueda de nuevas entradas)
         # corren de forma concurrente.
         await asyncio.gather(
             run_paso1_gestion_tp(exchange, allowed_symbols),
