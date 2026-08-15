@@ -261,11 +261,12 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         else:
             # Orden stop-limit corta en la MA20(5m): se dispara cuando el
             # precio cruza la MA20 de arriba hacia abajo.
-            # NOTA: el nombre/params exactos de stop-limit pueden variar
-            # según la versión de ccxt/BingX; revisar y ajustar si el
-            # exchange rechaza estos parámetros.
+            # BingX no reconoce el tipo "STOP_LIMIT"; el tipo correcto
+            # para una orden que se dispara en 'stopPrice' y se ejecuta
+            # como límite en ese mismo precio es "STOP" (confirmado por
+            # el error 109400 que lista los tipos válidos del exchange).
             order = await exchange.create_order(
-                symbol, "STOP_LIMIT", "sell", amount, ma20_5m_value,
+                symbol, "STOP", "sell", amount, ma20_5m_value,
                 {"stopPrice": ma20_5m_value, "positionSide": "SHORT"},
             )
             log.info(
