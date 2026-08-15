@@ -303,12 +303,32 @@ async def run_pasos_2_a_15_entradas(exchange: "ccxt.bingx", allowed_symbols: set
         await execute_entry(exchange, plan)
 
 
+async def ensure_hedge_mode(exchange: "ccxt.bingx") -> None:
+    """
+    Todo el bot asume que la cuenta está en HEDGE MODE (positionSide
+    LONG/SHORT independientes), tanto para el Take Profit (Paso 1) como
+    para las entradas (Paso 15). Si la cuenta está en One-way Mode
+    (positionSide=BOTH), BingX rechaza esas llamadas con el error
+    109420 "position not exist". Para evitarlo, se fuerza el Hedge Mode
+    automáticamente al arrancar, antes de tocar cualquier posición.
+    """
+    try:
+        await exchange.set_position_mode(True)
+        log.info("Modo de posición configurado en HEDGE (dual side) correctamente.")
+    except Exception as exc:
+        log.warning(
+            "No se pudo confirmar/forzar el Hedge Mode (puede que ya esté activado, "
+            "o que ya existan posiciones abiertas que impiden cambiarlo): %s", exc,
+        )
+
+
 # ----------------------------------------------------------------------
 # Orquestación general
 # ----------------------------------------------------------------------
 async def main() -> None:
     exchange = build_exchange()
     try:
+        await ensure_hedge_mode(exchange)
         allowed_symbols = set(await get_usdt_futures_symbols(exchange))
         open_positions = await get_open_positions(exchange, allowed_symbols)
         symbols_with_position = {p["symbol"] for p in open_positions}
