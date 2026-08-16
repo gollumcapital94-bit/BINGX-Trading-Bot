@@ -3,7 +3,7 @@ Bot de trading para BingX
 --------------------------
 PASO 1  -> Gestión de posiciones abiertas: coloca Take Profit en EMA200(1h)
            cuando el precio ya tocó la EMA50(1h).
-PASOS 2-15 -> Escáner de nuevas entradas en corto, siguiendo la cascada
+PASOS 2-13 -> Escáner de nuevas entradas en corto, siguiendo la cascada
            completa de condiciones (round alcista, RSI6, W%R6/12/24,
            singularidad matemática, apalancamiento dinámico, etc.)
            Ver strategy_entries.py para el detalle de cada paso.
@@ -137,34 +137,68 @@ def _price_touched_ema(high: float, low: float, ema_value: float) -> bool:
     return low <= ema_value <= high
 
 
-async def set_take_profit(exchange: "ccxt.bingx", position: dict, tp_price: float) -> None:
+async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, tp_price: float) -> None:
+    """
+    Se llama SOLO cuando el precio ya tocó la EMA50(1h). Coloca DOS
+    órdenes:
+      - Take Profit en la EMA200(1h).
+      - Stop Loss en BREAK EVEN (al precio de entrada de la posición),
+        para proteger la operación sin arriesgar pérdida.
+    Ambas órdenes usan precio ÚLTIMO (workingType=CONTRACT_PRICE), no
+    precio de marca, para asegurar que se ejecuten y cierren la
+    operación correctamente.
+    """
     symbol = position["symbol"]
     side = position.get("side")  # 'long' o 'short'
     amount = abs(float(position.get("contracts") or 0))
+    entry_price = position.get("entryPrice")
 
     if amount <= 0:
         log.warning("Cantidad de contratos inválida para %s, se omite.", symbol)
         return
 
-    tp_order_side = "sell" if side == "long" else "buy"
+    close_order_side = "sell" if side == "long" else "buy"
     position_side = "LONG" if side == "long" else "SHORT"
 
-    params = {
+    # ---- Take Profit en EMA200(1h) ----
+    tp_params = {
         "stopPrice": tp_price,
         "reduceOnly": True,
         "positionSide": position_side,
+        "workingType": "CONTRACT_PRICE",  # precio último, no precio de marca
     }
-
     try:
-        order = await exchange.create_order(
-            symbol, "TAKE_PROFIT_MARKET", tp_order_side, amount, None, params,
+        tp_order = await exchange.create_order(
+            symbol, "TAKE_PROFIT_MARKET", close_order_side, amount, None, tp_params,
         )
         log.info(
             "Take Profit colocado: %s | lado posición=%s | TP=%.6f | orden_id=%s",
-            symbol, side, tp_price, order.get("id"),
+            symbol, side, tp_price, tp_order.get("id"),
         )
     except Exception as exc:
         log.error("Error colocando Take Profit para %s: %s", symbol, exc)
+
+    # ---- Stop Loss en BREAK EVEN (precio de entrada) ----
+    if entry_price is None:
+        log.warning("%s: no se pudo obtener el precio de entrada, se omite el Stop Loss en break even.", symbol)
+        return
+
+    sl_params = {
+        "stopPrice": float(entry_price),
+        "reduceOnly": True,
+        "positionSide": position_side,
+        "workingType": "CONTRACT_PRICE",  # precio último, no precio de marca
+    }
+    try:
+        sl_order = await exchange.create_order(
+            symbol, "STOP_MARKET", close_order_side, amount, None, sl_params,
+        )
+        log.info(
+            "Stop Loss en break even colocado: %s | lado posición=%s | SL=%.6f | orden_id=%s",
+            symbol, side, float(entry_price), sl_order.get("id"),
+        )
+    except Exception as exc:
+        log.error("Error colocando Stop Loss (break even) para %s: %s", symbol, exc)
 
 
 async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
@@ -180,8 +214,8 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
         ema50, ema200 = _calculate_emas(closes)
 
         if _price_touched_ema(last_high, last_low, ema50):
-            log.info("%s tocó EMA50(1h) -> EMA50=%.6f | EMA200=%.6f. Colocando TP...", symbol, ema50, ema200)
-            await set_take_profit(exchange, position, ema200)
+            log.info("%s tocó EMA50(1h) -> EMA50=%.6f | EMA200=%.6f. Colocando TP y SL (break even)...", symbol, ema50, ema200)
+            await set_take_profit_and_stop_loss(exchange, position, ema200)
         else:
             log.info("%s aún no toca EMA50(1h) [vela: %.6f-%.6f | EMA50=%.6f]", symbol, last_low, last_high, ema50)
 
@@ -199,13 +233,13 @@ async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]
 
 
 # ----------------------------------------------------------------------
-# PASO 15: ejecución de la orden de entrada (short) para símbolos que
+# PASO 13: ejecución de la orden de entrada (short) para símbolos que
 # pasaron todos los filtros de strategy_entries.evaluate_symbol.
 #   - Si el precio YA tocó la MA20(5m) -> orden a MERCADO.
 #   - Si el precio AÚN NO la tocó -> orden STOP-LIMIT en la MA20(5m),
 #     esperando a que el precio la cruce de arriba hacia abajo.
 # En ambos casos, el margen/apalancamiento (plan["margin_usdt"] /
-# plan["leverage"]) ya viene calculado en el Paso 14: el MENOR entre el
+# plan["leverage"]) ya viene calculado en el Paso 12: el MENOR entre el
 # 10% del margen total de la cuenta y el máximo margen que permite la
 # plataforma para ese apalancamiento (nunca se reduce el apalancamiento
 # para poder meter más margen).
@@ -255,7 +289,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 {"positionSide": "SHORT"},
             )
             log.info(
-                "[Paso 15] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                "[Paso 13] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
                 symbol, margin_usdt, leverage, order.get("id"),
             )
         else:
@@ -270,7 +304,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 {"stopPrice": ma20_5m_value, "positionSide": "SHORT"},
             )
             log.info(
-                "[Paso 15] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                "[Paso 13] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
                 ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"),
             )
 
@@ -278,13 +312,13 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         log.error("Error ejecutando entrada para %s: %s", symbol, exc)
 
 
-async def run_pasos_2_a_15_entradas(exchange: "ccxt.bingx", allowed_symbols: set[str], symbols_with_position: set[str]) -> None:
+async def run_pasos_2_a_13_entradas(exchange: "ccxt.bingx", allowed_symbols: set[str], symbols_with_position: set[str]) -> None:
     """
     Escanea todos los pares permitidos que NO tengan ya una posición
-    abierta, evaluando la cascada completa de pasos 2-15.
+    abierta, evaluando la cascada completa de pasos 2-13.
     """
     candidatos = [s for s in allowed_symbols if s not in symbols_with_position]
-    log.info("[Pasos 2-15] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
+    log.info("[Pasos 2-13] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
 
     semaphore = asyncio.Semaphore(10)  # limitar concurrencia por rate limits
 
@@ -295,7 +329,7 @@ async def run_pasos_2_a_15_entradas(exchange: "ccxt.bingx", allowed_symbols: set
     results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
     plans = [r for r in results if r is not None]
 
-    log.info("[Pasos 2-15] Pares que cumplen TODAS las condiciones: %d", len(plans))
+    log.info("[Pasos 2-13] Pares que cumplen TODAS las condiciones: %d", len(plans))
     for plan in plans:
         log.info("  -> %s | lev=%dx | margen=%.2f USDT", plan["symbol"], plan["leverage"], plan["margin_usdt"])
 
@@ -307,7 +341,7 @@ async def ensure_hedge_mode(exchange: "ccxt.bingx") -> None:
     """
     Todo el bot asume que la cuenta está en HEDGE MODE (positionSide
     LONG/SHORT independientes), tanto para el Take Profit (Paso 1) como
-    para las entradas (Paso 15). Si la cuenta está en One-way Mode
+    para las entradas (Paso 13). Si la cuenta está en One-way Mode
     (positionSide=BOTH), BingX rechaza esas llamadas con el error
     109420 "position not exist". Para evitarlo, se fuerza el Hedge Mode
     automáticamente al arrancar, antes de tocar cualquier posición.
@@ -333,11 +367,11 @@ async def main() -> None:
         open_positions = await get_open_positions(exchange, allowed_symbols)
         symbols_with_position = {p["symbol"] for p in open_positions}
 
-        # Paso 1 (gestión de TP) y Pasos 2-15 (búsqueda de nuevas entradas)
+        # Paso 1 (gestión de TP) y Pasos 2-13 (búsqueda de nuevas entradas)
         # corren de forma concurrente.
         await asyncio.gather(
             run_paso1_gestion_tp(exchange, allowed_symbols),
-            run_pasos_2_a_15_entradas(exchange, allowed_symbols, symbols_with_position),
+            run_pasos_2_a_13_entradas(exchange, allowed_symbols, symbols_with_position),
         )
 
     finally:
