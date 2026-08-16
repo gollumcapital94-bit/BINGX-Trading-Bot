@@ -612,6 +612,11 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en %s", symbol, res5["reason"])
             return None
         idx_15m = res5["idx"]
+        ts_15m = int(df_15m["ts"].iloc[idx_15m])
+        log.info(
+            "%s [Diagnóstico] Vela máxima 15m: ts_utc_ms=%d (%s UTC) | high=%.8f",
+            symbol, ts_15m, pd.to_datetime(ts_15m, unit="ms", utc=True), res5["max_high"],
+        )
 
         # ---- Paso 6: máximo en 5m coincide con 1h y es vela roja ----
         ok, res6 = check_max_candle_matches_and_is_red(
@@ -621,6 +626,11 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en %s", symbol, res6["reason"])
             return None
         idx_5m = res6["idx"]
+        ts_5m = int(df_5m["ts"].iloc[idx_5m])
+        log.info(
+            "%s [Diagnóstico] Vela máxima 5m: ts_utc_ms=%d (%s UTC) | high=%.8f",
+            symbol, ts_5m, pd.to_datetime(ts_5m, unit="ms", utc=True), res6["max_high"],
+        )
 
         # ---- Paso 7: W%R6/12/24 todos distintos en la vela roja de 15m ----
         ok, res7 = check_wr_all_distinct(df_15m, idx_15m, "15m", step_num=7)
@@ -639,12 +649,20 @@ async def evaluate_symbol(exchange, symbol: str):
         if not ok:
             log.info("%s descartado en %s", symbol, res9["reason"])
             return None
+        log.info(
+            "%s aprobó [Paso 9] en 15m: |RSI6|=%.4f > |W%%R6|=%.4f",
+            symbol, abs(res9["rsi6"]), abs(res7["wr6"]),
+        )
 
         # ---- Paso 10: |RSI6| > |W%R6| en la vela roja de 5m ----
         ok, res10 = check_rsi6_greater_than_wr6(df_5m, idx_5m, res8["wr6"], "5m", step_num=10)
         if not ok:
             log.info("%s descartado en %s", symbol, res10["reason"])
             return None
+        log.info(
+            "%s aprobó [Paso 10] en 5m: |RSI6|=%.4f > |W%%R6|=%.4f",
+            symbol, abs(res10["rsi6"]), abs(res8["wr6"]),
+        )
 
         # Empaqueto los resultados de 15m y 5m con el mismo formato que
         # usaban las funciones de singularidad (Paso 12) más abajo.
