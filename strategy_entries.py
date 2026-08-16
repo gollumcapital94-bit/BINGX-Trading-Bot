@@ -34,7 +34,7 @@ log = logging.getLogger("bingx_bot.strategy")
 # ----------------------------------------------------------------------
 RSI_OVERBOUGHT = 90
 MIN_VOLUME_24H_USDT = 2_000_000
-MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 14)
+MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 12)
 LEVERAGE_BASE = 90  # numerador de la fórmula de apalancamiento
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 
@@ -313,37 +313,24 @@ def check_wr_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, step
     return True, {"wr6": v_wr6, "wr12": v_wr12, "wr24": v_wr24}
 
 
-def check_rsi6_greater_than_wr6(df_closed: pd.DataFrame, idx: int, wr6_value: float, tf_label: str, step_num: int):
+def _get_rsi6_rsi12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
     """
-    FUNCIÓN INDEPENDIENTE para el Paso {step_num}: en la vela `idx`,
-    chequea que |RSI6| > |W%R6|. Recibe wr6_value ya calculado en el
-    paso anterior (WR distintos) para no recalcularlo dos veces.
+    Devuelve (RSI6, RSI12) en la vela `idx`. Se usa para alimentar el
+    cálculo de la singularidad (antes Pasos 12-13, ahora Pasos 10-11),
+    ya sin el chequeo intermedio |RSI6|>|W%R6| que se eliminó.
     """
     close = df_closed["close"]
     rsi6 = rsi(close, 6)
     rsi12 = rsi(close, 12)
-
-    v_rsi6 = float(rsi6.iloc[idx])
-    v_rsi12 = float(rsi12.iloc[idx])
-
-    if abs(v_rsi6) <= abs(wr6_value):
-        return False, {
-            "reason": (
-                f"[Paso {step_num}] |RSI6|<=|W%R6| en {tf_label} "
-                f"({v_rsi6:.2f} <= {wr6_value:.2f})"
-            ),
-            "failed_step": step_num,
-        }
-
-    return True, {"rsi6": v_rsi6, "rsi12": v_rsi12}
+    return float(rsi6.iloc[idx]), float(rsi12.iloc[idx])
 
 
 # ----------------------------------------------------------------------
-# Paso 11: volumen 24h -- filtra "gemas" listadas solo en BingX con bajo
+# Paso 9: volumen 24h -- filtra "gemas" listadas solo en BingX con bajo
 # volumen, donde el arbitraje entre exchanges no tiene efecto y el
 # precio puede ser manipulado más fácilmente por la propia plataforma.
 # ----------------------------------------------------------------------
-async def check_step_11_volume(exchange, symbol: str):
+async def check_step_9_volume(exchange, symbol: str):
     ticker = await exchange.fetch_ticker(symbol)
     quote_volume = ticker.get("quoteVolume")
 
@@ -355,25 +342,42 @@ async def check_step_11_volume(exchange, symbol: str):
     if quote_volume is None or quote_volume < MIN_VOLUME_24H_USDT:
         return False, {
             "reason": (
-                f"[Paso 11] Volumen 24h {quote_volume} < {MIN_VOLUME_24H_USDT} USDT "
+                f"[Paso 9] Volumen 24h {quote_volume} < {MIN_VOLUME_24H_USDT} USDT "
                 f"-- posible gema de baja liquidez, se descarta"
             ),
-            "failed_step": 11,
+            "failed_step": 9,
         }
 
     return True, {"volume_24h_usdt": quote_volume}
 
 
 # ----------------------------------------------------------------------
-# Fórmula genérica de singularidad, reutilizada por el Paso 12 (15m) y
-# el Paso 13 (5m, próximo a definir)
+# Fórmula genérica de singularidad, reutilizada por el Paso 10 (15m) y
+# el Paso 11 (5m)
 # ----------------------------------------------------------------------
 def calculate_singularity(rsi6, rsi12, wr6, wr12, es_verde_1h: bool):
+    """
+    S = ln(2k) - 1
+
+    a = |W%R6 - W%R12|   (en la vela roja del máximo, misma temporalidad
+                           que rsi6/rsi12/wr6/wr12)
+
+    El cálculo de r depende de |W%R6| en esa misma vela roja:
+      r = (RSI6 - RSI12)        si |W%R6| < 50
+      r = 2 * (RSI6 - RSI12)    si |W%R6| > 50
+    (En el caso límite |W%R6| == 50 se usa la fórmula sin duplicar,
+    igual que el caso < 50.)
+
+    k = a / r     si la vela del máximo en 1h es VERDE
+    k = a / |r|   si la vela del máximo en 1h es ROJA (la vela 1h roja
+                  actúa como modulador -- valor absoluto -- de r)
+    """
     a = abs(wr6 - wr12)
-    r = rsi6 - rsi12
+    r_base = rsi6 - rsi12
+    r = 2 * r_base if abs(wr6) > 50 else r_base
 
     if r == 0:
-        return None, {"reason": "r=0 (RSI6-RSI12), no se puede calcular k"}
+        return None, {"reason": "r=0, no se puede calcular k"}
 
     k = a / r if es_verde_1h else a / abs(r)
 
@@ -385,11 +389,11 @@ def calculate_singularity(rsi6, rsi12, wr6, wr12, es_verde_1h: bool):
 
 
 # ----------------------------------------------------------------------
-# Paso 12: ecuación de singularidad en TEMPORALIDAD 15M
+# Paso 10: ecuación de singularidad en TEMPORALIDAD 15M
 # ----------------------------------------------------------------------
-def check_step_12_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: float, wr12_15m: float, es_verde_1h: bool):
+def check_step_10_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: float, wr12_15m: float, es_verde_1h: bool):
     """
-    FUNCIÓN INDEPENDIENTE para el Paso 12: calcula la singularidad
+    FUNCIÓN INDEPENDIENTE para el Paso 10: calcula la singularidad
     S = ln(2k) - 1 usando los valores de RSI6/RSI12 y W%R6/W%R12 de la
     vela roja del máximo en TEMPORALIDAD 15M (nunca datos de 5m aquí).
 
@@ -401,7 +405,7 @@ def check_step_12_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: f
                         modulador de r, el denominador)
 
     IMPORTANTE: si S <= 0 (no hay singularidad en 15m), este paso NO
-    descarta el par por sí solo -- el llamador debe continuar al Paso 13
+    descarta el par por sí solo -- el llamador debe continuar al Paso 11
     (la misma ecuación pero en 5m) antes de decidir si se descarta.
     """
     s, meta = calculate_singularity(rsi6_15m, rsi12_15m, wr6_15m, wr12_15m, es_verde_1h)
@@ -409,19 +413,19 @@ def check_step_12_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: f
 
     if not passed:
         motivo_k = meta.get("reason", "")
-        reason = f"[Paso 12] Sin singularidad en 15m (S={s}) {motivo_k}".strip()
+        reason = f"[Paso 10] Sin singularidad en 15m (S={s}) {motivo_k}".strip()
     else:
         reason = None
 
     return passed, {"s": s, "reason": reason, **{k: v for k, v in meta.items() if k != "reason"}}
 
 
-def check_step_13_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float, wr12_5m: float, es_verde_1h: bool):
+def check_step_11_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float, wr12_5m: float, es_verde_1h: bool):
     """
-    FUNCIÓN INDEPENDIENTE para el Paso 13: calcula la singularidad
+    FUNCIÓN INDEPENDIENTE para el Paso 11: calcula la singularidad
     S = ln(2k) - 1 usando los valores de RSI6/RSI12 y W%R6/W%R12 de la
     vela roja del máximo en TEMPORALIDAD 5M (nunca datos de 15m aquí).
-    Misma fórmula que el Paso 12, pero con datos exclusivamente de 5m.
+    Misma fórmula que el Paso 10, pero con datos exclusivamente de 5m.
 
     Excentricidad k:
       a = |W%R6 - W%R12|                     (siempre en valor absoluto)
@@ -430,7 +434,7 @@ def check_step_13_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
       k = a / |r|      si la vela del máximo en 1h es ROJA (actúa como
                         modulador de r, el denominador)
 
-    IMPORTANTE: este paso solo se ejecuta cuando el Paso 12 (15m) ya
+    IMPORTANTE: este paso solo se ejecuta cuando el Paso 10 (15m) ya
     falló. Si aquí TAMBIÉN falla (S <= 0), ahora sí se descarta el par,
     porque ya se buscó la singularidad en ambas temporalidades (15m y 5m).
     """
@@ -439,7 +443,7 @@ def check_step_13_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
 
     if not passed:
         motivo_k = meta.get("reason", "")
-        reason = f"[Paso 13] Sin singularidad en 5m (S={s}) {motivo_k}".strip()
+        reason = f"[Paso 11] Sin singularidad en 5m (S={s}) {motivo_k}".strip()
     else:
         reason = None
 
@@ -447,7 +451,7 @@ def check_step_13_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
 
 
 # ----------------------------------------------------------------------
-# Paso 14: apalancamiento y tamaño de posición
+# Paso 12: apalancamiento y tamaño de posición
 # ----------------------------------------------------------------------
 def calculate_leverage(max_high_5m: float, ma20_5m_value: float) -> float:
     if max_high_5m <= 0:
@@ -497,7 +501,7 @@ async def get_max_notional_for_leverage(exchange, symbol: str, leverage: int, de
 
 def _get_available_balance(balance: dict) -> float:
     """
-    Devuelve el MARGEN TOTAL de la cuenta de futuros perpetuos (Paso 14):
+    Devuelve el MARGEN TOTAL de la cuenta de futuros perpetuos (Paso 12):
     margen LIBRE + margen ya USADO en otras operaciones abiertas.
 
     Ej.: 90 USDT libres + 10 USDT usados en una operación abierta = 100
@@ -529,7 +533,7 @@ def _get_available_balance(balance: dict) -> float:
 
 async def calculate_position_size(exchange, symbol: str, leverage: int) -> float:
     """
-    PASO 14: devuelve el margen (en USDT/VST) a usar en la posición:
+    PASO 12: devuelve el margen (en USDT/VST) a usar en la posición:
     el MENOR entre:
       a) el 10% del margen total de la cuenta (libre + usado en otras
          operaciones abiertas), y
@@ -644,75 +648,59 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en %s", symbol, res8["reason"])
             return None
 
-        # ---- Paso 9: |RSI6| > |W%R6| en la vela roja de 15m ----
-        ok, res9 = check_rsi6_greater_than_wr6(df_15m, idx_15m, res7["wr6"], "15m", step_num=9)
+        # ---- Paso 9: volumen 24h ----
+        ok, info9_vol = await check_step_9_volume(exchange, symbol)
         if not ok:
-            log.info("%s descartado en %s", symbol, res9["reason"])
+            log.info("%s descartado en %s", symbol, info9_vol["reason"])
             return None
-        log.info(
-            "%s aprobó [Paso 9] en 15m: |RSI6|=%.4f > |W%%R6|=%.4f",
-            symbol, abs(res9["rsi6"]), abs(res7["wr6"]),
-        )
 
-        # ---- Paso 10: |RSI6| > |W%R6| en la vela roja de 5m ----
-        ok, res10 = check_rsi6_greater_than_wr6(df_5m, idx_5m, res8["wr6"], "5m", step_num=10)
-        if not ok:
-            log.info("%s descartado en %s", symbol, res10["reason"])
-            return None
-        log.info(
-            "%s aprobó [Paso 10] en 5m: |RSI6|=%.4f > |W%%R6|=%.4f",
-            symbol, abs(res10["rsi6"]), abs(res8["wr6"]),
-        )
+        # RSI6/RSI12 en la vela roja del máximo (15m y 5m), necesarios
+        # para el cálculo de la singularidad de los Pasos 10 y 11.
+        rsi6_15m, rsi12_15m = _get_rsi6_rsi12(df_15m, idx_15m)
+        rsi6_5m, rsi12_5m = _get_rsi6_rsi12(df_5m, idx_5m)
 
-        # Empaqueto los resultados de 15m y 5m con el mismo formato que
-        # usaban las funciones de singularidad (Paso 12) más abajo.
         info_15m = {
             "idx": idx_15m,
-            "rsi6": res9["rsi6"], "rsi12": res9["rsi12"],
+            "rsi6": rsi6_15m, "rsi12": rsi12_15m,
             "wr6": res7["wr6"], "wr12": res7["wr12"], "wr24": res7["wr24"],
         }
         info_5m = {
             "idx": idx_5m,
-            "rsi6": res10["rsi6"], "rsi12": res10["rsi12"],
+            "rsi6": rsi6_5m, "rsi12": rsi12_5m,
             "wr6": res8["wr6"], "wr12": res8["wr12"], "wr24": res8["wr24"],
         }
 
-        ok, info11_vol = await check_step_11_volume(exchange, symbol)
-        if not ok:
-            log.info("%s descartado en %s", symbol, info11_vol["reason"])
-            return None
-
-        # ---- Paso 12: singularidad S=ln(2k)-1 en la vela roja de 15m ----
-        ok12, res12 = check_step_12_singularidad_15m(
+        # ---- Paso 10: singularidad S=ln(2k)-1 en la vela roja de 15m ----
+        ok10, res10 = check_step_10_singularidad_15m(
             info_15m["rsi6"], info_15m["rsi12"], info_15m["wr6"], info_15m["wr12"], es_verde_1h
         )
-        if ok12:
-            log.info("%s aprobó [Paso 12]: singularidad en 15m (S=%.6f)", symbol, res12["s"])
+        if ok10:
+            log.info("%s aprobó [Paso 10]: singularidad en 15m (S=%.6f)", symbol, res10["s"])
             singularidad_15m = True
         else:
-            log.info("%s no aprobó %s -> continúa al Paso 13 (5m)", symbol, res12["reason"])
+            log.info("%s no aprobó %s -> continúa al Paso 11 (5m)", symbol, res10["reason"])
             singularidad_15m = False
 
-        # ---- Paso 13: singularidad S=ln(2k)-1 en la vela roja de 5m ----
-        # Solo se ejecuta si el Paso 12 (15m) falló. Si también falla
+        # ---- Paso 11: singularidad S=ln(2k)-1 en la vela roja de 5m ----
+        # Solo se ejecuta si el Paso 10 (15m) falló. Si también falla
         # aquí, ahí sí se descarta el par (ya se agotaron las dos
         # temporalidades).
         if not singularidad_15m:
-            ok13, res13 = check_step_13_singularidad_5m(
+            ok11, res11 = check_step_11_singularidad_5m(
                 info_5m["rsi6"], info_5m["rsi12"], info_5m["wr6"], info_5m["wr12"], es_verde_1h
             )
-            if ok13:
-                log.info("%s aprobó [Paso 13]: singularidad en 5m (S=%.6f)", symbol, res13["s"])
+            if ok11:
+                log.info("%s aprobó [Paso 11]: singularidad en 5m (S=%.6f)", symbol, res11["s"])
                 singularidad_5m = True
             else:
-                log.info("%s descartado en %s (ya falló también en Paso 12)", symbol, res13["reason"])
+                log.info("%s descartado en %s (ya falló también en Paso 10)", symbol, res11["reason"])
                 return None
         else:
             singularidad_5m = False
 
-        # ---- Paso 14: apalancamiento y margen ----
+        # ---- Paso 12: apalancamiento y margen ----
         # Solo se llega aquí si existe singularidad en AL MENOS una de
-        # las dos temporalidades (15m -> Paso 12, o 5m -> Paso 13). Si
+        # las dos temporalidades (15m -> Paso 10, o 5m -> Paso 11). Si
         # existe en ambas, se trata igual que si fuera una sola.
         close_5m = df_5m["close"]
         ma20_5m = sma(close_5m, 20)
@@ -723,7 +711,7 @@ async def evaluate_symbol(exchange, symbol: str):
         try:
             leverage_calc = calculate_leverage(max_high_5m, ma20_5m_value)
         except ValueError as exc:
-            log.info("%s descartado en [Paso 14]: %s", symbol, exc)
+            log.info("%s descartado en [Paso 12]: %s", symbol, exc)
             return None
 
         max_leverage_exchange = await get_max_leverage_for_symbol(exchange, symbol)
@@ -732,11 +720,11 @@ async def evaluate_symbol(exchange, symbol: str):
         margin_usdt = await calculate_position_size(exchange, symbol, leverage_final)
 
         if margin_usdt <= 0:
-            log.info("%s descartado en [Paso 14]: margen calculado <= 0", symbol)
+            log.info("%s descartado en [Paso 12]: margen calculado <= 0", symbol)
             return None
 
         log.info(
-            "%s aprobó [Paso 14]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%dx) | margen=%.2f USDT",
+            "%s aprobó [Paso 12]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%dx) | margen=%.2f USDT",
             symbol, leverage_final, leverage_calc, max_leverage_exchange, margin_usdt,
         )
 
