@@ -1,4 +1,4 @@
-# BingX Trading Bot — Pasos 1 a 15
+# BingX Trading Bot — Pasos 1 a 13
 
 Bot asincrónico para futuros perpetuos USDT-M en BingX, compuesto por dos módulos que corren en paralelo en cada ejecución:
 
@@ -8,7 +8,7 @@ Bot asincrónico para futuros perpetuos USDT-M en BingX, compuesto por dos módu
 - Revisa tus posiciones abiertas.
 - Si el precio ya tocó la EMA50 (1h), coloca el Take Profit en la EMA200 (1h).
 
-## Pasos 2 a 15 — Escáner de nuevas entradas en corto
+## Pasos 2 a 13 — Escáner de nuevas entradas en corto
 
 Para cada par SIN posición abierta:
 
@@ -20,11 +20,10 @@ Para cada par SIN posición abierta:
 | 5 | El máximo en 15m debe estar en vela roja y coincidir con el máximo de 1h |
 | 6 | El máximo en 5m debe estar en vela roja y coincidir con el máximo de 1h |
 | 7-8 | W%R6, W%R12, W%R24 de esa vela roja son todos distintos entre sí (15m y 5m) |
-| 9-10 | \|RSI6\| > \|W%R6\| en esa vela roja (15m y 5m) |
-| 11 | Volumen 24h > 2,000,000 USDT |
-| 12-13 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 12) y/o 5m (paso 13) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/\|r\| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
-| 14 | Apalancamiento = 90% ÷ (% de distancia entre el máximo y la SMA20 en 5m), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
-| 15 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP-LIMIT en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
+| 9 | Volumen 24h > 2,000,000 USDT |
+| 10-11 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 10) y/o 5m (paso 11) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/\|r\| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
+| 12 | Apalancamiento = 90% ÷ (% de distancia entre el máximo y la SMA20 en 5m), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
+| 13 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
 
 Todas las posiciones se abren en margen aislado, en corto (short).
 
@@ -33,7 +32,7 @@ Todas las posiciones se abren en margen aislado, en corto (short).
 - MA20 = SMA20 (media simple).
 - "Máximo" del round / de 15m / de 5m = el high (mecha) de la vela, no el cierre.
 - El apalancamiento calculado se limita al máximo que permite BingX para ese par cuando el cálculo da un valor mayor.
-- El margen total de la cuenta (Paso 14) se calcula como margen libre + margen ya usado en otras operaciones abiertas, no solo el saldo libre.
+- El margen total de la cuenta (Paso 12) se calcula como margen libre + margen ya usado en otras operaciones abiertas, no solo el saldo libre.
 
 ## Configuración
 
@@ -52,7 +51,7 @@ En **Settings → Secrets and variables → Actions**, agrega:
 - `TELEGRAM_BOT_TOKEN` (token de tu bot de Telegram)
 - `TELEGRAM_CHAT_ID` (chat_id de tu conversación PRIVADA con el bot — no de un grupo)
 
-La Action corre cada 15 minutos por defecto (ajustable en el cron), se puede disparar manualmente desde **Actions → Run workflow**, o de forma externa vía `repository_dispatch` (por ejemplo, usando cronjob.org para mayor puntualidad). Cada entrada exitosa (a mercado o STOP-LIMIT) se notifica automáticamente por Telegram.
+La Action corre cada 15 minutos por defecto (ajustable en el cron), se puede disparar manualmente desde **Actions → Run workflow**, o de forma externa vía `repository_dispatch` (por ejemplo, usando cronjob.org para mayor puntualidad). Cada entrada exitosa (a mercado o STOP) se notifica automáticamente por Telegram.
 
 ## 🧪 Probar en cuenta DEMO (VST) antes de ir a real
 
@@ -77,8 +76,9 @@ Verifica en los logs que aparece `MODO DEMO (VST) ACTIVADO`, y confirma en la ap
 
 - Este bot abre posiciones apalancadas en corto de forma 100% automática, sin confirmación manual. Revisa cuidadosamente la lógica antes de usarlo con capital real.
 - El API key debe tener permisos de lectura y trading de futuros (nunca de retiro de fondos).
+- El bot fuerza automáticamente el **Hedge Mode** en la cuenta al arrancar (necesario porque todo el código usa `positionSide` LONG/SHORT). Si tienes posiciones abiertas al momento de correrlo por primera vez, ese cambio puede no aplicarse hasta que las cierres.
 - BingX exige el parámetro `side` (LONG/SHORT/BOTH) en `set_leverage()`; el bot ya lo envía como `"SHORT"`, ya que la estrategia siempre abre en corto.
-- El nombre exacto de los parámetros para la orden `STOP_LIMIT` (Paso 15) no se ha validado aún en una ejecución real exitosa — si el exchange la rechaza, revisa el mensaje de error del log y ajusta los params en `bingx_bot.py`. La orden a mercado (`"market"`) es más confiable porque usa un tipo estándar de ccxt.
-- Prueba primero en cuenta demo/testnet o con montos pequeños, y revisa tanto "Posiciones" como el "Historial de órdenes" en BingX — una orden STOP-LIMIT puede quedar "colocada" en el log sin llegar a ejecutarse si el precio nunca la cruza.
+- El tipo de orden correcto para la entrada condicional (Paso 13, cuando el precio aún no tocó la SMA20) es `"STOP"` en la API de BingX (no `"STOP_LIMIT"`, que el exchange rechaza).
+- Prueba primero en cuenta demo/testnet o con montos pequeños, y revisa tanto "Posiciones" como el "Historial de órdenes" en BingX — una orden STOP puede quedar "colocada" en el log sin llegar a ejecutarse si el precio nunca la cruza.
 - El trading con apalancamiento conlleva riesgo real de pérdida total del capital, especialmente con una estrategia con tantas variables y ejecución automática.
 - La interpretación de "máximo en 15m/5m" se hizo tomando como ventana de búsqueda la hora exacta de la vela 1h que se confirmó como máximo del round (Paso 3).
