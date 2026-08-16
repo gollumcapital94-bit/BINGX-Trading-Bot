@@ -1,4 +1,4 @@
-name: BingX Trading Bot - Pasos 1 a 13
+name: BingX Trading Bot - Pasos 1 a 15
 
 on:
   repository_dispatch:
