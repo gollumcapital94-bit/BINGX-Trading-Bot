@@ -18,6 +18,7 @@ Dependencias: ccxt, pandas, numpy (ver requirements.txt)
 import asyncio
 import logging
 import os
+import re
 import sys
 
 import pandas as pd
@@ -83,25 +84,78 @@ def build_exchange() -> "ccxt.bingx":
     return exchange
 
 
+# BUG CORREGIDO (visto en producción: el bot entró en NCFXCAD2JPY/USDT:USDT
+# y NCFXEURSGD2USD/USDT:USDT, es decir CAD/JPY y EUR/SGD, pares de FOREX).
+#
+# BingX expone su línea de "Standard Futures" (forex, índices, commodities)
+# BAJO LOS MISMOS FLAGS swap=True / linear=True / quote=USDT / settle=USDT
+# que los futuros perpetuos cripto reales. Los flags de ccxt por sí solos
+# NO bastan para distinguirlos -- el supuesto original del README/docstring
+# ("esos mercados no existen bajo 'swap' USDT-M") era incorrecto.
+#
+# Filtro con dos capas de defensa:
+#   1) El id crudo de BingX para ese producto no-cripto usa el prefijo
+#      "NCFX" (confirmado con los símbolos reales del bug).
+#   2) Por si BingX usa otro prefijo en el futuro: ningún futuro perpetuo
+#      cripto real tiene como moneda BASE una divisa fiat (CAD, EUR, JPY,
+#      etc.) -- las fiat solo aparecen como quote/settle en BingX.
+FIAT_CURRENCY_CODES = {
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "SGD", "HKD",
+    "CNY", "CNH", "ZAR", "MXN", "TRY", "SEK", "NOK", "DKK", "PLN", "THB",
+    "IDR", "INR", "KRW", "RUB", "BRL", "ILS", "AED", "SAR", "CZK", "HUF",
+    "PHP", "MYR", "VND", "TWD", "CLP", "COP", "ARS", "EGP", "NGN", "PKR",
+    "BDT", "LKR", "KES", "GHS", "UAH", "RON", "BGN", "HRK", "ISK", "QAR",
+    "KWD", "BHD", "OMR", "JOD",
+}
+
+NON_CRYPTO_ID_PREFIXES = ("NCFX",)
+
+
+def _looks_like_forex_or_cfd(market: dict) -> bool:
+    market_id = str(market.get("id") or "").upper()
+    base = str(market.get("base") or "").upper()
+
+    if market_id.startswith(NON_CRYPTO_ID_PREFIXES):
+        return True
+
+    if base in FIAT_CURRENCY_CODES:
+        return True
+
+    return False
+
+
 async def get_usdt_futures_symbols(exchange: "ccxt.bingx") -> list[str]:
     """
-    Solo pares de futuros perpetuos (swap) con quote/settle en USDT.
-    Descarta de forma natural CFDs de acciones, forex, commodities e
-    índices, ya que esos mercados no existen bajo 'swap' USDT-M en BingX.
+    Solo pares de futuros perpetuos CRIPTO (swap) con quote/settle en
+    USDT. Descarta explícitamente el "Standard Futures" de BingX (forex,
+    índices, commodities), que usa los mismos flags swap/linear/USDT que
+    los futuros cripto reales -- ver _looks_like_forex_or_cfd().
     """
     markets = await exchange.load_markets()
 
     symbols = []
+    excluded_non_crypto = []
     for symbol, market in markets.items():
         is_swap = market.get("swap") is True
         is_linear = market.get("linear") is True
         is_usdt = market.get("quote") == "USDT" and market.get("settle") == "USDT"
         is_active = market.get("active", True)
 
-        if is_swap and is_linear and is_usdt and is_active:
-            symbols.append(symbol)
+        if not (is_swap and is_linear and is_usdt and is_active):
+            continue
 
-    log.info("Pares de futuros USDT-M detectados: %d", len(symbols))
+        if _looks_like_forex_or_cfd(market):
+            excluded_non_crypto.append(symbol)
+            continue
+
+        symbols.append(symbol)
+
+    log.info("Pares de futuros USDT-M cripto detectados: %d", len(symbols))
+    if excluded_non_crypto:
+        log.warning(
+            "Excluidos %d símbolos no-cripto (forex/CFD/índices/commodities), ej: %s",
+            len(excluded_non_crypto), excluded_non_crypto[:5],
+        )
     return symbols
 
 
@@ -257,6 +311,134 @@ async def price_already_touched_ma20_5m(exchange: "ccxt.bingx", symbol: str, ma2
     return float(last_price) <= ma20_5m_value
 
 
+# BUG CORREGIDO: el Paso 12 intenta calcular de antemano el notional
+# máximo permitido por BingX para el apalancamiento elegido (vía
+# fetch_leverage_tiers), pero ese cálculo puede fallar o quedar
+# desactualizado -- en producción esto dejó pasar una orden de
+# ~200,000 USDT de notional cuando el límite real de BingX para ese par
+# a 20x era 100,000 USDT, y la orden fue rechazada:
+#   {"code":101209,"msg":"The maximum position value for this leverage is 100000 USDT."}
+#
+# En vez de seguir confiando ciegamente en el cálculo previo, se agrega
+# una red de seguridad: si BingX rechaza la orden por exceder el
+# notional máximo, se parsea el límite real desde el propio mensaje de
+# error y se reintenta UNA vez con el tamaño ajustado a ese límite
+# (con un pequeño margen de seguridad para no rozar el límite exacto).
+_MAX_POSITION_VALUE_RE = re.compile(
+    r"maximum position value for this leverage is\s*([\d.]+)", re.IGNORECASE
+)
+_NOTIONAL_CAP_SAFETY_FACTOR = 0.995  # 0.5% de colchón bajo el límite real
+
+
+def _extract_max_position_value(exc: Exception) -> float | None:
+    match = _MAX_POSITION_VALUE_RE.search(str(exc))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+async def _create_order_with_notional_cap_retry(
+    exchange: "ccxt.bingx", symbol: str, order_type: str, side: str,
+    amount: float, price, params: dict, last_price: float,
+) -> dict:
+    """
+    Envuelve exchange.create_order(): si BingX rechaza la orden porque
+    excede el notional máximo permitido para el apalancamiento actual,
+    recalcula `amount` a partir del límite real informado por el propio
+    exchange en el mensaje de error, y reintenta UNA sola vez.
+    Si el error es de otro tipo, o el reintento también falla, la
+    excepción se propaga tal cual para que el llamador la loguee.
+    """
+    try:
+        return await exchange.create_order(symbol, order_type, side, amount, price, params)
+    except Exception as exc:
+        max_notional = _extract_max_position_value(exc)
+        if max_notional is None:
+            raise
+
+        capped_amount = (max_notional * _NOTIONAL_CAP_SAFETY_FACTOR) / last_price
+        if capped_amount <= 0:
+            raise
+
+        log.warning(
+            "%s: la orden excedía el notional máximo permitido por BingX para este apalancamiento "
+            "(límite real=%.2f USDT). Reintentando UNA vez con tamaño reducido: amount=%.8f (antes %.8f)",
+            symbol, max_notional, capped_amount, amount,
+        )
+        return await exchange.create_order(symbol, order_type, side, capped_amount, price, params)
+
+
+# BUG CORREGIDO: get_max_leverage_for_symbol() en strategy_entries.py
+# tenía un default=20 que se devolvía silenciosamente cada vez que
+# fetch_leverage_tiers() fallaba -- la MISMA llamada que ya se demostró
+# poco confiable con el bug del notional máximo. Como el apalancamiento
+# calculado por la fórmula (Paso 12) suele superar 20x, el bot terminaba
+# SIEMPRE operando a 20x, sin relación real con el cálculo de la
+# estrategia ni con el máximo real del par.
+#
+# Ahora ya no se adivina ningún número: se intenta el apalancamiento
+# calculado tal cual contra BingX, y si el exchange lo rechaza, se
+# interpreta el límite real desde su propio mensaje de error y se
+# reintenta UNA vez con ese valor -- el mismo criterio ya aplicado al
+# bug del notional máximo (Paso 13).
+_MAX_LEVERAGE_RE_PATTERNS = (
+    re.compile(r"maximum leverage (?:is|allowed is)\s*([\d.]+)", re.IGNORECASE),
+    re.compile(r"leverage[^\d]{0,40}([\d]{1,4})\s*x?\b[^.]{0,40}(?:max|maximum)", re.IGNORECASE),
+    re.compile(r"(?:max|maximum)[^\d]{0,20}leverage[^\d]{0,20}([\d]{1,4})", re.IGNORECASE),
+)
+
+
+def _extract_max_leverage(exc: Exception) -> int | None:
+    text = str(exc)
+    for pattern in _MAX_LEVERAGE_RE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            try:
+                value = int(float(match.group(1)))
+                if value > 0:
+                    return value
+            except ValueError:
+                continue
+    return None
+
+
+async def _set_leverage_with_cap_retry(exchange: "ccxt.bingx", symbol: str, leverage: int) -> int | None:
+    """
+    Intenta configurar el apalancamiento calculado tal cual. Si BingX lo
+    rechaza por exceder el máximo real del par, interpreta ese límite
+    real desde el mensaje de error y reintenta UNA vez con ese valor.
+    Devuelve el apalancamiento que quedó realmente configurado, o None
+    si no se pudo configurar ninguno (en cuyo caso la entrada se omite
+    en vez de asumir un valor adivinado).
+    """
+    try:
+        await exchange.set_leverage(leverage, symbol, params={"side": "SHORT"})
+        return leverage
+    except Exception as exc:
+        max_leverage = _extract_max_leverage(exc)
+        if max_leverage is None:
+            log.error(
+                "%s: BingX rechazó el apalancamiento %dx y no se pudo interpretar el límite real "
+                "del mensaje de error (guárdalo para ajustar el parser): %s",
+                symbol, leverage, exc,
+            )
+            return None
+
+        log.warning(
+            "%s: BingX rechazó %dx por exceder el máximo real del par. Reintentando con el máximo real: %dx",
+            symbol, leverage, max_leverage,
+        )
+        try:
+            await exchange.set_leverage(max_leverage, symbol, params={"side": "SHORT"})
+            return max_leverage
+        except Exception as exc2:
+            log.error("%s: también falló al configurar el apalancamiento máximo real (%dx): %s", symbol, max_leverage, exc2)
+            return None
+
+
 async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     symbol = plan["symbol"]
     leverage = int(plan["leverage"])
@@ -267,12 +449,37 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         log.warning("%s: margen calculado <= 0, se omite la entrada.", symbol)
         return
 
+    # Defensa en profundidad: aunque get_usdt_futures_symbols() ya
+    # filtra el universo de símbolos antes de escanear, se revalida acá
+    # justo antes de ejecutar la orden real. Así, si algún día un
+    # símbolo forex/CFD/índice se cuela por otra ruta (caché de
+    # mercados desactualizado, símbolo pasado manualmente, etc.),
+    # nunca se llega a abrir la posición.
+    market = exchange.markets.get(symbol, {})
+    if _looks_like_forex_or_cfd(market):
+        log.error(
+            "%s: BLOQUEADO -- parece ser forex/CFD/índice, no un futuro perpetuo cripto. No se ejecuta la entrada.",
+            symbol,
+        )
+        return
+
     try:
-        # Configurar margen aislado y apalancamiento antes de operar.
-        # BingX exige el parámetro 'side' (LONG/SHORT/BOTH) en setLeverage;
-        # como esta estrategia siempre abre en corto, se usa "SHORT".
+        # Configurar margen aislado antes de operar.
         await exchange.set_margin_mode("isolated", symbol)
-        await exchange.set_leverage(leverage, symbol, params={"side": "SHORT"})
+
+        # BUG CORREGIDO: strategy_entries.py ya NO capa el apalancamiento
+        # calculado con un valor por defecto adivinado (antes: 20x fijo
+        # cuando fetch_leverage_tiers() fallaba, causando que el bot
+        # SIEMPRE terminara operando a 20x sin relación con el cálculo
+        # real de la estrategia). Ahora BingX es la única fuente de
+        # verdad: se intenta el apalancamiento calculado tal cual, y si
+        # BingX lo rechaza por exceder el máximo real del par, se
+        # parsea el límite real del propio mensaje de error y se
+        # reintenta UNA vez con ese valor.
+        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage)
+        if leverage is None:
+            log.error("%s: no se pudo configurar el apalancamiento en BingX, se omite la entrada.", symbol)
+            return
 
         # Tamaño de la posición en contratos/base currency:
         # notional = margen * apalancamiento ; amount = notional / precio
@@ -284,9 +491,9 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         touched = await price_already_touched_ma20_5m(exchange, symbol, ma20_5m_value)
 
         if touched:
-            order = await exchange.create_order(
-                symbol, "market", "sell", amount, None,
-                {"positionSide": "SHORT"},
+            order = await _create_order_with_notional_cap_retry(
+                exchange, symbol, "market", "sell", amount, None,
+                {"positionSide": "SHORT"}, last_price,
             )
             log.info(
                 "[Paso 13] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
@@ -299,9 +506,9 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
             # para una orden que se dispara en 'stopPrice' y se ejecuta
             # como límite en ese mismo precio es "STOP" (confirmado por
             # el error 109400 que lista los tipos válidos del exchange).
-            order = await exchange.create_order(
-                symbol, "STOP", "sell", amount, ma20_5m_value,
-                {"stopPrice": ma20_5m_value, "positionSide": "SHORT"},
+            order = await _create_order_with_notional_cap_retry(
+                exchange, symbol, "STOP", "sell", amount, ma20_5m_value,
+                {"stopPrice": ma20_5m_value, "positionSide": "SHORT"}, last_price,
             )
             log.info(
                 "[Paso 13] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
