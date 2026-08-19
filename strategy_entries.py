@@ -35,7 +35,7 @@ log = logging.getLogger("bingx_bot.strategy")
 RSI_OVERBOUGHT = 90
 MIN_VOLUME_24H_USDT = 2_000_000
 MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 12)
-LEVERAGE_BASE = 90  # numerador de la fórmula de apalancamiento
+LEVERAGE_BASE = 80  # numerador de la fórmula de apalancamiento (antes 90)
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 
 OHLCV_LIMIT_1H = 1200   # histórico fijo (~50 días) para que SMA20/EMA50/EMA200 converjan; una sola petición, sin reintentos
@@ -466,7 +466,23 @@ def calculate_leverage(max_high_5m: float, ma20_5m_value: float) -> float:
     return max(leverage_rounded, LEVERAGE_ROUND_STEP)
 
 
-async def get_max_leverage_for_symbol(exchange, symbol: str, default: int = 20) -> int:
+async def get_max_leverage_for_symbol(exchange, symbol: str):
+    """
+    Devuelve el apalancamiento máximo REAL que permite BingX para este
+    símbolo, o None si no se pudo confirmar de ninguna fuente.
+
+    BUG CORREGIDO: esta función tenía un `default: int = 20` que se
+    devolvía silenciosamente cada vez que fetch_leverage_tiers()
+    fallaba o no traía datos utilizables -- la MISMA llamada que ya
+    demostró ser poco confiable en get_max_notional_for_leverage() (ver
+    el bug del notional máximo). Como leverage_calc (Paso 12) suele dar
+    más de 20x, `min(leverage_calc, 20)` terminaba eligiendo 20x casi
+    siempre, sin relación alguna con el límite real del par.
+    En vez de adivinar con un número fijo, ahora se devuelve None
+    cuando no se puede confirmar, y es el llamador (evaluate_symbol)
+    quien decide no capar el apalancamiento calculado -- BingX validará
+    el valor real al momento de exchange.set_leverage() en bingx_bot.py.
+    """
     market = exchange.markets.get(symbol, {})
     max_lev = (market.get("limits", {}) or {}).get("leverage", {}).get("max")
     if max_lev:
@@ -482,7 +498,7 @@ async def get_max_leverage_for_symbol(exchange, symbol: str, default: int = 20) 
     except Exception as exc:
         log.warning("No se pudo obtener leverage tiers para %s: %s", symbol, exc)
 
-    return default
+    return None
 
 
 async def get_max_notional_for_leverage(exchange, symbol: str, leverage: int, default: float = 1_000_000.0) -> float:
@@ -708,14 +724,48 @@ async def evaluate_symbol(exchange, symbol: str):
         max_high_5m = float(df_5m["high"].iloc[max_idx_5m])
         ma20_5m_value = float(ma20_5m.iloc[max_idx_5m])
 
+        # DIAGNÓSTICO: log de cada número intermedio del cálculo de
+        # apalancamiento, para poder verificar la fórmula 90/distancia%
+        # contra datos reales de producción en vez de revisar el código
+        # a ciegas. distancia_pct y leverage_sin_redondear se recalculan
+        # acá SOLO para el log (duplicando la fórmula de
+        # calculate_leverage), sin alterar el valor que de verdad se usa.
+        distancia_pct_debug = (max_high_5m - ma20_5m_value) / max_high_5m * 100 if max_high_5m else None
+        leverage_sin_redondear_debug = (
+            LEVERAGE_BASE / distancia_pct_debug if distancia_pct_debug else None
+        )
+        log.info(
+            "%s [Diagnóstico Paso 12] max_high_5m=%.8f | ma20_5m_value=%.8f | distancia_pct=%s | "
+            "leverage_base=%d | leverage_sin_redondear=%s",
+            symbol, max_high_5m, ma20_5m_value,
+            f"{distancia_pct_debug:.4f}%" if distancia_pct_debug is not None else "N/A",
+            LEVERAGE_BASE,
+            f"{leverage_sin_redondear_debug:.4f}x" if leverage_sin_redondear_debug is not None else "N/A",
+        )
+
         try:
             leverage_calc = calculate_leverage(max_high_5m, ma20_5m_value)
         except ValueError as exc:
             log.info("%s descartado en [Paso 12]: %s", symbol, exc)
             return None
 
+        log.info("%s [Diagnóstico Paso 12] leverage_calc (redondeado a múltiplos de 5)=%.1fx", symbol, leverage_calc)
+
         max_leverage_exchange = await get_max_leverage_for_symbol(exchange, symbol)
-        leverage_final = min(leverage_calc, max_leverage_exchange)
+        if max_leverage_exchange is not None:
+            leverage_final = min(int(leverage_calc), max_leverage_exchange)
+        else:
+            # No se pudo confirmar el máximo real desde ccxt/BingX -- en
+            # vez de capar con un valor adivinado, se usa el apalancamiento
+            # calculado tal cual. exchange.set_leverage() en bingx_bot.py
+            # es quien validará (y, si hace falta, corregirá) el valor
+            # real contra BingX al momento de abrir la posición.
+            leverage_final = int(leverage_calc)
+            log.warning(
+                "%s: no se pudo confirmar el apalancamiento máximo real del exchange; "
+                "se usará el calculado (%dx) sin capar -- BingX lo validará al ejecutar la entrada.",
+                symbol, leverage_final,
+            )
 
         margin_usdt = await calculate_position_size(exchange, symbol, leverage_final)
 
@@ -724,8 +774,10 @@ async def evaluate_symbol(exchange, symbol: str):
             return None
 
         log.info(
-            "%s aprobó [Paso 12]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%dx) | margen=%.2f USDT",
-            symbol, leverage_final, leverage_calc, max_leverage_exchange, margin_usdt,
+            "%s aprobó [Paso 12]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%s) | margen=%.2f USDT",
+            symbol, leverage_final, leverage_calc,
+            f"{max_leverage_exchange}x" if max_leverage_exchange is not None else "desconocido",
+            margin_usdt,
         )
 
         return {
