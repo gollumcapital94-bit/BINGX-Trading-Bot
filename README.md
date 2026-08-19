@@ -4,7 +4,7 @@ Bot asincrónico para futuros perpetuos USDT-M en BingX, compuesto por dos módu
 
 ## Paso 1 — Gestión de Take Profit
 
-- Filtra solo pares de futuros perpetuos con USDT como referencia (descarta CFDs de acciones, forex, commodities e índices).
+- Filtra solo pares de futuros perpetuos CRIPTO con USDT como referencia, excluyendo explícitamente el "Standard Futures" de BingX (forex, índices, commodities) — ver `_looks_like_forex_or_cfd()` en `bingx_bot.py`.
 - Revisa tus posiciones abiertas.
 - Si el precio ya tocó la EMA50 (1h), coloca el Take Profit en la EMA200 (1h).
 
@@ -22,7 +22,7 @@ Para cada par SIN posición abierta:
 | 7-8 | W%R6, W%R12, W%R24 de esa vela roja son todos distintos entre sí (15m y 5m) |
 | 9 | Volumen 24h > 2,000,000 USDT |
 | 10-11 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 10) y/o 5m (paso 11) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/\|r\| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
-| 12 | Apalancamiento = 90% ÷ (% de distancia entre el máximo y la SMA20 en 5m), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
+| 12 | Apalancamiento = 80% ÷ (% de distancia entre el máximo y la SMA20 en 5m), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
 | 13 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
 
 Todas las posiciones se abren en margen aislado, en corto (short).
@@ -71,6 +71,10 @@ python bingx_bot.py
 Cuando `BINGX_DEMO=true`, el bot llama a `exchange.set_sandbox_mode(True)` justo después de crear la conexión, lo que redirige las peticiones de futuros al entorno VST de BingX (`open-api-vst.bingx.com`). Todo lo demás —lectura de posiciones, órdenes, indicadores— funciona igual que en producción, pero con dinero virtual.
 
 Verifica en los logs que aparece `MODO DEMO (VST) ACTIVADO`, y confirma en la app/web de BingX (sección Demo Trading) que las órdenes y posiciones se reflejan ahí antes de pasar a real.
+
+## 🐛 Bug corregido: entradas en pares de forex (NCFX)
+
+En producción el bot llegó a abrir posiciones en `NCFXCAD2JPY/USDT:USDT` y `NCFXEURSGD2USD/USDT:USDT` (CAD/JPY y EUR/SGD), es decir, en el producto "Standard Futures" de BingX (forex/índices/commodities), no en futuros perpetuos cripto. Causa: ese producto usa exactamente los mismos flags `swap=True` / `linear=True` / `quote=USDT` / `settle=USDT` que ccxt reporta para los futuros cripto reales, así que el filtro original no los distinguía. Se corrigió excluyendo explícitamente cualquier símbolo con prefijo `NCFX` y cualquier símbolo cuya moneda base sea una divisa fiat (CAD, EUR, JPY, etc.), con una segunda verificación justo antes de ejecutar la orden como defensa adicional.
 
 ## ⚠️ Advertencias importantes
 
