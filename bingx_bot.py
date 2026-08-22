@@ -402,31 +402,24 @@ async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]
 
 
 # ----------------------------------------------------------------------
-# PASO 13: ejecución de la orden de entrada (short) para símbolos que
-# pasaron todos los filtros de strategy_entries.evaluate_symbol.
-#   - Si el precio YA tocó la MA20(5m) -> orden a MERCADO.
-#   - Si el precio AÚN NO la tocó -> orden STOP-LIMIT en la MA20(5m),
-#     esperando a que el precio la cruce de arriba hacia abajo.
-# En ambos casos, el margen/apalancamiento (plan["margin_usdt"] /
-# plan["leverage"]) ya viene calculado en el Paso 12: el MENOR entre el
-# 10% del margen total de la cuenta y el máximo margen que permite la
-# plataforma para ese apalancamiento (nunca se reduce el apalancamiento
-# para poder meter más margen).
+# PASOS 13-14: apalancamiento/margen (Paso 13) y ejecución de la orden
+# de entrada en corto (Paso 14) para símbolos que pasaron todos los
+# filtros de strategy_entries.evaluate_symbol.
+#   - Si el precio YA tocó la SMA20(5m) -> orden a MERCADO. La
+#     distancia del Paso 13 usa el precio actual (el punto donde se
+#     abre la orden), NO la SMA20.
+#   - Si el precio AÚN NO la tocó -> orden STOP en la SMA20(5m),
+#     esperando a que el precio la cruce de arriba hacia abajo. La
+#     distancia del Paso 13 usa la SMA20(5m), sin cambios.
+# El margen (Paso 13) sigue siendo el MENOR entre el 10% del margen
+# total de la cuenta y el máximo margen que permite la plataforma para
+# ese apalancamiento (nunca se reduce el apalancamiento para poder
+# meter más margen). Ver el comentario de cabecera de execute_entry()
+# para el detalle completo.
 # ----------------------------------------------------------------------
-async def price_already_touched_ma20_5m(exchange: "ccxt.bingx", symbol: str, ma20_5m_value: float) -> bool:
-    """
-    Revisa si el precio actual (o la vela 5m en formación) ya tocó/cruzó
-    la MA20(5m) desde el máximo detectado, es decir si el precio actual
-    está en o por debajo de la MA20.
-    """
-    ticker = await exchange.fetch_ticker(symbol)
-    last_price = ticker.get("last")
-    if last_price is None:
-        return False
-    return float(last_price) <= ma20_5m_value
 
 
-# BUG CORREGIDO: el Paso 12 intenta calcular de antemano el notional
+# BUG CORREGIDO: el Paso 13 intenta calcular de antemano el notional
 # máximo permitido por BingX para el apalancamiento elegido (vía
 # fetch_leverage_tiers), pero ese cálculo puede fallar o quedar
 # desactualizado -- en producción esto dejó pasar una orden de
@@ -490,7 +483,7 @@ async def _create_order_with_notional_cap_retry(
 # tenía un default=20 que se devolvía silenciosamente cada vez que
 # fetch_leverage_tiers() fallaba -- la MISMA llamada que ya se demostró
 # poco confiable con el bug del notional máximo. Como el apalancamiento
-# calculado por la fórmula (Paso 12) suele superar 20x, el bot terminaba
+# calculado por la fórmula (Paso 13) suele superar 20x, el bot terminaba
 # SIEMPRE operando a 20x, sin relación real con el cálculo de la
 # estrategia ni con el máximo real del par.
 #
@@ -555,14 +548,23 @@ async def _set_leverage_with_cap_retry(exchange: "ccxt.bingx", symbol: str, leve
 
 
 async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
+    """
+    Combina el Paso 13 (apalancamiento y margen) con el Paso 14
+    (ejecución de la orden). Se calculan juntos porque la fórmula del
+    Paso 13 (80% ÷ distancia%) usa una distancia distinta según el tipo
+    de entrada que se decide en el Paso 14:
+      - Orden STOP (precio aún no tocó la SMA20(5m)): distancia =
+        máximo -> SMA20(5m). Fórmula original, sin cambios.
+      - Entrada a MERCADO (precio ya tocó la SMA20(5m)): distancia =
+        máximo -> precio actual en el momento exacto de abrir la
+        orden a mercado, NO la SMA20.
+    Por eso el apalancamiento no puede calcularse antes (en
+    strategy_entries.evaluate_symbol) -- se necesita el precio en vivo
+    de este instante para saber cuál de las dos distancias aplica.
+    """
     symbol = plan["symbol"]
-    leverage = int(plan["leverage"])
-    margin_usdt = plan["margin_usdt"]
+    max_high_5m = plan["max_high_5m"]
     ma20_5m_value = plan["ma20_5m_value"]
-
-    if margin_usdt <= 0:
-        log.warning("%s: margen calculado <= 0, se omite la entrada.", symbol)
-        return
 
     # Defensa en profundidad: aunque get_usdt_futures_symbols() ya
     # filtra el universo de símbolos antes de escanear, se revalida acá
@@ -579,6 +581,74 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         return
 
     try:
+        # Un solo fetch del precio en vivo: se usa TANTO para decidir
+        # el tipo de entrada (Paso 14) COMO para elegir la distancia
+        # correcta en el cálculo de apalancamiento (Paso 13), así
+        # ambos quedan basados exactamente en el mismo precio.
+        ticker = await exchange.fetch_ticker(symbol)
+        last_price = ticker.get("last")
+        if last_price is None:
+            log.error("%s: no se pudo obtener el precio actual, se omite la entrada.", symbol)
+            return
+        last_price = float(last_price)
+
+        touched = last_price <= ma20_5m_value
+
+        if touched:
+            # Entrada a MERCADO -> distancia = máximo -> precio actual
+            # (el punto exacto donde se abriría la orden).
+            reference_price = last_price
+            log.info(
+                "%s [Paso 13] Entrada será a MERCADO -> distancia usa el precio actual=%.8f (no la SMA20)",
+                symbol, reference_price,
+            )
+        else:
+            # Orden STOP -> distancia = máximo -> SMA20(5m), sin cambios.
+            reference_price = ma20_5m_value
+            log.info(
+                "%s [Paso 13] Entrada será STOP -> distancia usa la SMA20(5m)=%.8f",
+                symbol, reference_price,
+            )
+
+        # DIAGNÓSTICO: log de cada número intermedio del cálculo de
+        # apalancamiento, para poder verificar la fórmula 80/distancia%
+        # contra datos reales de producción en vez de revisar el código
+        # a ciegas. distancia_pct_debug se recalcula acá SOLO para el
+        # log (duplicando la fórmula de strat.calculate_leverage), sin
+        # alterar el valor que de verdad se usa.
+        distancia_pct_debug = (
+            (max_high_5m - reference_price) / max_high_5m * 100 if max_high_5m else None
+        )
+        log.info(
+            "%s [Diagnóstico Paso 13] max_high_5m=%.8f | reference_price=%.8f | distancia_pct=%s",
+            symbol, max_high_5m, reference_price,
+            f"{distancia_pct_debug:.4f}%" if distancia_pct_debug is not None else "N/A",
+        )
+
+        try:
+            leverage_calc = strat.calculate_leverage(max_high_5m, reference_price)
+        except ValueError as exc:
+            log.info("%s descartado en [Paso 13]: %s", symbol, exc)
+            return
+
+        log.info("%s [Diagnóstico Paso 13] leverage_calc (redondeado a múltiplos de 5)=%.1fx", symbol, leverage_calc)
+
+        max_leverage_exchange = await strat.get_max_leverage_for_symbol(exchange, symbol)
+        if max_leverage_exchange is not None:
+            leverage_wanted = min(int(leverage_calc), max_leverage_exchange)
+        else:
+            # No se pudo confirmar el máximo real desde ccxt/BingX -- en
+            # vez de capar con un valor adivinado, se usa el apalancamiento
+            # calculado tal cual. exchange.set_leverage() más abajo es
+            # quien validará (y, si hace falta, corregirá) el valor real
+            # contra BingX al momento de abrir la posición.
+            leverage_wanted = int(leverage_calc)
+            log.warning(
+                "%s: no se pudo confirmar el apalancamiento máximo real del exchange; "
+                "se usará el calculado (%dx) sin capar -- BingX lo validará al ejecutar la entrada.",
+                symbol, leverage_wanted,
+            )
+
         # Configurar margen aislado antes de operar.
         await exchange.set_margin_mode("isolated", symbol)
 
@@ -591,19 +661,27 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         # BingX lo rechaza por exceder el máximo real del par, se
         # parsea el límite real del propio mensaje de error y se
         # reintenta UNA vez con ese valor.
-        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage)
+        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage_wanted)
         if leverage is None:
             log.error("%s: no se pudo configurar el apalancamiento en BingX, se omite la entrada.", symbol)
             return
 
+        margin_usdt = await strat.calculate_position_size(exchange, symbol, leverage)
+        if margin_usdt <= 0:
+            log.info("%s descartado en [Paso 13]: margen calculado <= 0", symbol)
+            return
+
+        log.info(
+            "%s aprobó [Paso 13]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%s) | margen=%.2f USDT",
+            symbol, leverage, leverage_calc,
+            f"{max_leverage_exchange}x" if max_leverage_exchange is not None else "desconocido",
+            margin_usdt,
+        )
+
         # Tamaño de la posición en contratos/base currency:
         # notional = margen * apalancamiento ; amount = notional / precio
-        ticker = await exchange.fetch_ticker(symbol)
-        last_price = float(ticker["last"])
         notional = margin_usdt * leverage
         amount = notional / last_price
-
-        touched = await price_already_touched_ma20_5m(exchange, symbol, ma20_5m_value)
 
         if touched:
             order = await _create_order_with_notional_cap_retry(
@@ -659,11 +737,34 @@ async def run_pasos_2_a_14_entradas(
             return await strat.evaluate_symbol(exchange, symbol, volume_exchange=volume_exchange)
 
     results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
-    plans = [r for r in results if r is not None]
+    plans = [plan for plan, _failed_step in results if plan is not None]
+
+    # RESUMEN POR PASO: cuenta en qué paso se descartó cada símbolo que
+    # NO llegó a plan. Esto permite ver de un vistazo, sin leer el log
+    # completo símbolo por símbolo, si TODOS los candidatos se están
+    # cayendo en un mismo paso (posible señal de un bug o de un filtro
+    # demasiado estricto para las condiciones actuales del mercado) o
+    # si la caída está repartida de forma normal a lo largo de la
+    # cascada.
+    rejection_counts: dict = {}
+    for _plan, failed_step in results:
+        if failed_step is not None:
+            rejection_counts[failed_step] = rejection_counts.get(failed_step, 0) + 1
+
+    if rejection_counts:
+        resumen = ", ".join(
+            f"Paso {paso}: {count}"
+            for paso, count in sorted(rejection_counts.items(), key=lambda x: str(x[0]))
+        )
+        log.info("[Pasos 2-14] Resumen de descartes por paso -> %s", resumen)
 
     log.info("[Pasos 2-14] Pares que cumplen TODAS las condiciones: %d", len(plans))
     for plan in plans:
-        log.info("  -> %s | lev=%dx | margen=%.2f USDT", plan["symbol"], plan["leverage"], plan["margin_usdt"])
+        # El apalancamiento y el margen (Paso 13) ya no están en el
+        # plan -- se calculan justo antes de ejecutar la orden (ver
+        # execute_entry), porque dependen del precio en vivo en ese
+        # momento para saber qué distancia usar en la fórmula.
+        log.info("  -> %s | máximo(5m)=%.8f | SMA20(5m)=%.8f", plan["symbol"], plan["max_high_5m"], plan["ma20_5m_value"])
 
     for plan in plans:
         await execute_entry(exchange, plan)
