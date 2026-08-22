@@ -23,7 +23,7 @@ Para cada par SIN posición abierta:
 | 9 | Volumen 24h > 2,000,000 USDT (siempre del mercado real, ver más abajo) |
 | 10 | SMA20 por encima de la EMA50, en temporalidad 4h (histórico fijo de 1200 velas, mismo criterio que 1h) |
 | 11-12 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 11) y/o 5m (paso 12) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/|r| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
-| 13 | Apalancamiento = 80% ÷ (% de distancia entre el máximo y la SMA20 en 5m), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
+| 13 | Apalancamiento = 80% ÷ (% de distancia). La distancia usa la SMA20(5m) si la entrada es STOP, o el precio actual si es a mercado (ver detalle más abajo), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
 | 14 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
 
 Todas las posiciones se abren en margen aislado, en corto (short).
@@ -105,6 +105,31 @@ El filtro de volumen del Paso 9 (`MIN_VOLUME_24H_USDT = 2,000,000`) consulta **s
 Motivo: en modo demo, `exchange.set_sandbox_mode(True)` redirige todas las peticiones al entorno VST (`open-api-vst.bingx.com`), que tiene su propio volumen simulado de la cuenta demo — no refleja la liquidez real del par. Un par no deja de ser una "gema" de baja liquidez real solo porque el bot esté operando con dinero virtual.
 
 Para lograrlo, cuando el bot corre en modo demo se abre una **segunda conexión** a BingX (mismas API keys, sin sandbox) usada exclusivamente para esa consulta de volumen — el resto del bot (posiciones, órdenes, indicadores) sigue usando la conexión demo normalmente. En modo real no hace falta abrir esta segunda conexión, ya que la principal ya apunta al mercado real.
+
+## 📐 Apalancamiento (Paso 13): la distancia depende del tipo de entrada
+
+La fórmula sigue siendo **80% ÷ distancia%**, pero la **distancia** usada cambia según cómo termine ejecutándose la entrada (Paso 14):
+
+- **Orden STOP** (el precio aún no tocó la SMA20(5m)): distancia = máximo → **SMA20(5m)**. Fórmula original, sin cambios.
+- **Entrada a MERCADO** (el precio ya tocó la SMA20(5m)): distancia = máximo → **precio actual** en el momento exacto de abrir la orden — **no** la SMA20.
+
+Por esto, el cálculo de apalancamiento y margen (Paso 13) ya **no** se hace durante el escaneo (Pasos 2-12, en `strategy_entries.evaluate_symbol`), sino justo antes de ejecutar la orden (Paso 14, en `bingx_bot.execute_entry`): solo ahí se conoce el precio en vivo necesario para decidir qué tipo de entrada corresponde y, por lo tanto, qué distancia usar. El escaneo (Paso 13 "preliminar") solo deja preparados el máximo de 5m y el valor de la SMA20(5m); el apalancamiento y el margen se calculan con el mismo precio en vivo que decide si la orden es a mercado o STOP, para que ambos queden siempre alineados.
+
+## 🔍 Diagnóstico: resumen de descartes por paso
+
+Cada corrida del escáner de entradas (Pasos 2-14) ahora termina con una línea de resumen en el log:
+
+```
+[Pasos 2-14] Resumen de descartes por paso -> Paso 2/3: 340, Paso 4: 12, Paso 9: 5, Paso 10: 48, Paso 12: 3
+```
+
+Esto permite ver de un vistazo en qué paso se está cayendo la mayoría de los candidatos, sin tener que leer el log completo símbolo por símbolo — útil sobre todo para confirmar si un filtro nuevo (como el Paso 10) está funcionando como se espera o si algo se está descartando de forma anómala.
+
+También se agregaron dos logs que antes no existían:
+- `[Paso 10]` ahora deja rastro tanto cuando **aprueba** (mostrando los valores de SMA20/EMA50 en 4h) como cuando descarta — antes solo se veía el rechazo.
+- Un log de diagnóstico muestra cuántas velas de 4h devolvió realmente BingX frente a las 1200 solicitadas, para descartar que la API esté truncando el histórico silenciosamente.
+
+Si en algún momento el resumen muestra que el 100% de los candidatos se cae en un mismo paso (por ejemplo, "Paso 10: 400" cuando había 400 candidatos), eso es una señal fuerte de revisar ese paso específico — ya sea porque el filtro es legítimamente muy estricto para las condiciones actuales del mercado, o porque hay un problema real que vale la pena investigar con esos números en la mano.
 
 ## 🐛 Bug corregido: entradas en pares de forex (NCFX)
 
