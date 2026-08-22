@@ -1,5 +1,5 @@
 """
-Motor de la estrategia de ENTRADA (Pasos 2 a 13).
+Motor de la estrategia de ENTRADA (Pasos 2 a 14).
 
 Este módulo recibe un símbolo ya filtrado como futuro perpetuo USDT-M
 (ver bingx_bot.py / Paso 1) y evalúa toda la cascada de condiciones.
@@ -34,11 +34,12 @@ log = logging.getLogger("bingx_bot.strategy")
 # ----------------------------------------------------------------------
 RSI_OVERBOUGHT = 90
 MIN_VOLUME_24H_USDT = 2_000_000
-MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 12)
+MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 13)
 LEVERAGE_BASE = 80  # numerador de la fórmula de apalancamiento (antes 90)
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 
 OHLCV_LIMIT_1H = 1200   # histórico fijo (~50 días) para que SMA20/EMA50/EMA200 converjan; una sola petición, sin reintentos
+OHLCV_LIMIT_4H = 1200   # mismo criterio que OHLCV_LIMIT_1H, pero en 4h (~200 días) para el Paso 10 (SMA20 vs EMA50 en 4h)
 OHLCV_LIMIT_LOWER_TF = 500  # para 15m / 5m (más margen de calentamiento para RSI/W%R)
 
 # BingX usa "VST" (Virtual USDT) como código de moneda en la cuenta DEMO,
@@ -330,8 +331,16 @@ def _get_rsi6_rsi12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
 # volumen, donde el arbitraje entre exchanges no tiene efecto y el
 # precio puede ser manipulado más fácilmente por la propia plataforma.
 # ----------------------------------------------------------------------
-async def check_step_9_volume(exchange, symbol: str):
-    ticker = await exchange.fetch_ticker(symbol)
+async def check_step_9_volume(volume_exchange, symbol: str):
+    """
+    IMPORTANTE: `volume_exchange` debe ser SIEMPRE una conexión al
+    mercado REAL, nunca al sandbox/VST de la cuenta demo -- ver
+    build_volume_exchange() en bingx_bot.py. Un par no deja de ser una
+    "gema" de baja liquidez real solo porque el bot esté operando con
+    dinero virtual, así que este filtro no debe depender del modo
+    demo/real en el que esté corriendo el bot.
+    """
+    ticker = await volume_exchange.fetch_ticker(symbol)
     quote_volume = ticker.get("quoteVolume")
 
     if quote_volume is None:
@@ -342,7 +351,7 @@ async def check_step_9_volume(exchange, symbol: str):
     if quote_volume is None or quote_volume < MIN_VOLUME_24H_USDT:
         return False, {
             "reason": (
-                f"[Paso 9] Volumen 24h {quote_volume} < {MIN_VOLUME_24H_USDT} USDT "
+                f"[Paso 9] Volumen 24h REAL {quote_volume} < {MIN_VOLUME_24H_USDT} USDT "
                 f"-- posible gema de baja liquidez, se descarta"
             ),
             "failed_step": 9,
@@ -352,8 +361,54 @@ async def check_step_9_volume(exchange, symbol: str):
 
 
 # ----------------------------------------------------------------------
-# Fórmula genérica de singularidad, reutilizada por el Paso 10 (15m) y
-# el Paso 11 (5m)
+# Paso 10: SMA20 por encima de la EMA50, en TEMPORALIDAD 4H.
+#
+# Se pide un histórico fijo de OHLCV_LIMIT_4H (1200 velas de 4h, ~200
+# días) en una sola petición -- el mismo criterio que ya se usa para
+# 1h en fetch_1h_with_expanding_window() -- para que la SMA20 y la
+# EMA50 converjan de forma estable antes de evaluarlas, en vez de
+# calcularlas sobre una ventana corta con poco calentamiento.
+# ----------------------------------------------------------------------
+async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
+    """
+    FUNCIÓN INDEPENDIENTE para el Paso 10: descarta la vela de 4h en
+    formación (igual que el resto del bot, solo se evalúan velas
+    cerradas) y valida que, en la última vela 4h cerrada, la SMA20 esté
+    POR ENCIMA de la EMA50 (tendencia de más largo plazo alineada antes
+    de seguir evaluando el resto de la cascada).
+    """
+    raw_4h = await exchange.fetch_ohlcv(symbol, timeframe="4h", limit=OHLCV_LIMIT_4H)
+    closed_4h = raw_4h[:-1]  # se descarta la vela en formación
+
+    if len(closed_4h) < 60:
+        return False, {
+            "reason": "[Paso 10] Datos insuficientes en 4h (< 60 velas cerradas) para calcular SMA20/EMA50",
+            "failed_step": 10,
+        }
+
+    close_4h = pd.Series([c[4] for c in closed_4h], dtype="float64")
+    sma20_4h = sma(close_4h, 20)
+    ema50_4h = ema(close_4h, 50)
+
+    sma20_value = float(sma20_4h.iloc[-1])
+    ema50_value = float(ema50_4h.iloc[-1])
+
+    if not (sma20_value > ema50_value):
+        return False, {
+            "reason": (
+                f"[Paso 10] SMA20(4h)={sma20_value:.8f} NO está por encima de la "
+                f"EMA50(4h)={ema50_value:.8f}, se descarta"
+            ),
+            "failed_step": 10,
+        }
+
+    return True, {"sma20_4h": sma20_value, "ema50_4h": ema50_value}
+
+
+
+# ----------------------------------------------------------------------
+# Fórmula genérica de singularidad, reutilizada por el Paso 11 (15m) y
+# el Paso 12 (5m)
 # ----------------------------------------------------------------------
 def calculate_singularity(rsi6, rsi12, wr6, wr12, es_verde_1h: bool):
     """
@@ -389,11 +444,11 @@ def calculate_singularity(rsi6, rsi12, wr6, wr12, es_verde_1h: bool):
 
 
 # ----------------------------------------------------------------------
-# Paso 10: ecuación de singularidad en TEMPORALIDAD 15M
+# Paso 11: ecuación de singularidad en TEMPORALIDAD 15M
 # ----------------------------------------------------------------------
-def check_step_10_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: float, wr12_15m: float, es_verde_1h: bool):
+def check_step_11_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: float, wr12_15m: float, es_verde_1h: bool):
     """
-    FUNCIÓN INDEPENDIENTE para el Paso 10: calcula la singularidad
+    FUNCIÓN INDEPENDIENTE para el Paso 11: calcula la singularidad
     S = ln(2k) - 1 usando los valores de RSI6/RSI12 y W%R6/W%R12 de la
     vela roja del máximo en TEMPORALIDAD 15M (nunca datos de 5m aquí).
 
@@ -405,7 +460,7 @@ def check_step_10_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: f
                         modulador de r, el denominador)
 
     IMPORTANTE: si S <= 0 (no hay singularidad en 15m), este paso NO
-    descarta el par por sí solo -- el llamador debe continuar al Paso 11
+    descarta el par por sí solo -- el llamador debe continuar al Paso 12
     (la misma ecuación pero en 5m) antes de decidir si se descarta.
     """
     s, meta = calculate_singularity(rsi6_15m, rsi12_15m, wr6_15m, wr12_15m, es_verde_1h)
@@ -413,19 +468,19 @@ def check_step_10_singularidad_15m(rsi6_15m: float, rsi12_15m: float, wr6_15m: f
 
     if not passed:
         motivo_k = meta.get("reason", "")
-        reason = f"[Paso 10] Sin singularidad en 15m (S={s}) {motivo_k}".strip()
+        reason = f"[Paso 11] Sin singularidad en 15m (S={s}) {motivo_k}".strip()
     else:
         reason = None
 
     return passed, {"s": s, "reason": reason, **{k: v for k, v in meta.items() if k != "reason"}}
 
 
-def check_step_11_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float, wr12_5m: float, es_verde_1h: bool):
+def check_step_12_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float, wr12_5m: float, es_verde_1h: bool):
     """
-    FUNCIÓN INDEPENDIENTE para el Paso 11: calcula la singularidad
+    FUNCIÓN INDEPENDIENTE para el Paso 12: calcula la singularidad
     S = ln(2k) - 1 usando los valores de RSI6/RSI12 y W%R6/W%R12 de la
     vela roja del máximo en TEMPORALIDAD 5M (nunca datos de 15m aquí).
-    Misma fórmula que el Paso 10, pero con datos exclusivamente de 5m.
+    Misma fórmula que el Paso 11, pero con datos exclusivamente de 5m.
 
     Excentricidad k:
       a = |W%R6 - W%R12|                     (siempre en valor absoluto)
@@ -434,7 +489,7 @@ def check_step_11_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
       k = a / |r|      si la vela del máximo en 1h es ROJA (actúa como
                         modulador de r, el denominador)
 
-    IMPORTANTE: este paso solo se ejecuta cuando el Paso 10 (15m) ya
+    IMPORTANTE: este paso solo se ejecuta cuando el Paso 11 (15m) ya
     falló. Si aquí TAMBIÉN falla (S <= 0), ahora sí se descarta el par,
     porque ya se buscó la singularidad en ambas temporalidades (15m y 5m).
     """
@@ -443,7 +498,7 @@ def check_step_11_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
 
     if not passed:
         motivo_k = meta.get("reason", "")
-        reason = f"[Paso 11] Sin singularidad en 5m (S={s}) {motivo_k}".strip()
+        reason = f"[Paso 12] Sin singularidad en 5m (S={s}) {motivo_k}".strip()
     else:
         reason = None
 
@@ -451,15 +506,32 @@ def check_step_11_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
 
 
 # ----------------------------------------------------------------------
-# Paso 12: apalancamiento y tamaño de posición
+# Paso 13: apalancamiento y tamaño de posición
+#
+# La fórmula (80% ÷ distancia%) es la misma en ambos casos, pero la
+# DISTANCIA usa un precio de referencia distinto según el tipo de
+# entrada del Paso 14 -- por eso `calculate_leverage()` recibe un
+# `reference_price` genérico en vez de asumir siempre la SMA20(5m):
+#   - Orden STOP (precio aún no tocó la SMA20): reference_price =
+#     SMA20(5m) -- fórmula original, sin cambios.
+#   - Entrada a MERCADO (precio ya tocó la SMA20): reference_price =
+#     precio actual en el momento exacto de abrir la orden a mercado,
+#     NO la SMA20.
+# Quién decide cuál usar es bingx_bot.execute_entry(), justo antes de
+# ejecutar el Paso 14, con el precio en vivo de ese instante.
 # ----------------------------------------------------------------------
-def calculate_leverage(max_high_5m: float, ma20_5m_value: float) -> float:
+def calculate_leverage(max_high_5m: float, reference_price: float) -> float:
+    """
+    reference_price: SMA20(5m) para una orden STOP, o el precio actual
+    (al momento de abrir la orden) para una entrada a MERCADO. Ver el
+    comentario de cabecera de esta sección para el criterio completo.
+    """
     if max_high_5m <= 0:
         raise ValueError("max_high_5m inválido")
 
-    distancia_pct = (max_high_5m - ma20_5m_value) / max_high_5m * 100
+    distancia_pct = (max_high_5m - reference_price) / max_high_5m * 100
     if distancia_pct <= 0:
-        raise ValueError("La MA20(5m) está por encima del máximo, distancia inválida")
+        raise ValueError("El precio de referencia está por encima del máximo, distancia inválida")
 
     leverage = LEVERAGE_BASE / distancia_pct
     leverage_rounded = math.floor(leverage / LEVERAGE_ROUND_STEP) * LEVERAGE_ROUND_STEP
@@ -475,7 +547,7 @@ async def get_max_leverage_for_symbol(exchange, symbol: str):
     devolvía silenciosamente cada vez que fetch_leverage_tiers()
     fallaba o no traía datos utilizables -- la MISMA llamada que ya
     demostró ser poco confiable en get_max_notional_for_leverage() (ver
-    el bug del notional máximo). Como leverage_calc (Paso 12) suele dar
+    el bug del notional máximo). Como leverage_calc (Paso 13) suele dar
     más de 20x, `min(leverage_calc, 20)` terminaba eligiendo 20x casi
     siempre, sin relación alguna con el límite real del par.
     En vez de adivinar con un número fijo, ahora se devuelve None
@@ -517,7 +589,7 @@ async def get_max_notional_for_leverage(exchange, symbol: str, leverage: int, de
 
 def _get_available_balance(balance: dict) -> float:
     """
-    Devuelve el MARGEN TOTAL de la cuenta de futuros perpetuos (Paso 12):
+    Devuelve el MARGEN TOTAL de la cuenta de futuros perpetuos (Paso 13):
     margen LIBRE + margen ya USADO en otras operaciones abiertas.
 
     Ej.: 90 USDT libres + 10 USDT usados en una operación abierta = 100
@@ -549,7 +621,7 @@ def _get_available_balance(balance: dict) -> float:
 
 async def calculate_position_size(exchange, symbol: str, leverage: int) -> float:
     """
-    PASO 12: devuelve el margen (en USDT/VST) a usar en la posición:
+    PASO 13: devuelve el margen (en USDT/VST) a usar en la posición:
     el MENOR entre:
       a) el 10% del margen total de la cuenta (libre + usado en otras
          operaciones abiertas), y
@@ -595,7 +667,15 @@ async def fetch_1h_with_expanding_window(exchange, symbol: str):
 # Pipeline completo por símbolo (pasos 2 a 12, deja el 13 -paso final
 # de ejecución de orden- para bingx_bot.py)
 # ----------------------------------------------------------------------
-async def evaluate_symbol(exchange, symbol: str):
+async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
+    """
+    `volume_exchange`: conexión al mercado REAL usada exclusivamente
+    para el Paso 9 (volumen 24h) -- ver check_step_9_volume() y
+    build_volume_exchange() en bingx_bot.py. Si no se pasa (por
+    ejemplo, al llamar esta función fuera del flujo normal del bot),
+    se usa `exchange` como fallback.
+    """
+    volume_exchange = volume_exchange or exchange
     try:
         df_1h, (ok, info) = await fetch_1h_with_expanding_window(exchange, symbol)
         if not ok:
@@ -665,13 +745,19 @@ async def evaluate_symbol(exchange, symbol: str):
             return None
 
         # ---- Paso 9: volumen 24h ----
-        ok, info9_vol = await check_step_9_volume(exchange, symbol)
+        ok, info9_vol = await check_step_9_volume(volume_exchange, symbol)
         if not ok:
             log.info("%s descartado en %s", symbol, info9_vol["reason"])
             return None
 
+        # ---- Paso 10: SMA20 por encima de la EMA50, en 4h ----
+        ok, info10 = await check_step_10_sma20_above_ema50_4h(exchange, symbol)
+        if not ok:
+            log.info("%s descartado en %s", symbol, info10["reason"])
+            return None
+
         # RSI6/RSI12 en la vela roja del máximo (15m y 5m), necesarios
-        # para el cálculo de la singularidad de los Pasos 10 y 11.
+        # para el cálculo de la singularidad de los Pasos 11 y 12.
         rsi6_15m, rsi12_15m = _get_rsi6_rsi12(df_15m, idx_15m)
         rsi6_5m, rsi12_5m = _get_rsi6_rsi12(df_5m, idx_5m)
 
@@ -686,104 +772,65 @@ async def evaluate_symbol(exchange, symbol: str):
             "wr6": res8["wr6"], "wr12": res8["wr12"], "wr24": res8["wr24"],
         }
 
-        # ---- Paso 10: singularidad S=ln(2k)-1 en la vela roja de 15m ----
-        ok10, res10 = check_step_10_singularidad_15m(
+        # ---- Paso 11: singularidad S=ln(2k)-1 en la vela roja de 15m ----
+        ok11, res11 = check_step_11_singularidad_15m(
             info_15m["rsi6"], info_15m["rsi12"], info_15m["wr6"], info_15m["wr12"], es_verde_1h
         )
-        if ok10:
-            log.info("%s aprobó [Paso 10]: singularidad en 15m (S=%.6f)", symbol, res10["s"])
+        if ok11:
+            log.info("%s aprobó [Paso 11]: singularidad en 15m (S=%.6f)", symbol, res11["s"])
             singularidad_15m = True
         else:
-            log.info("%s no aprobó %s -> continúa al Paso 11 (5m)", symbol, res10["reason"])
+            log.info("%s no aprobó %s -> continúa al Paso 12 (5m)", symbol, res11["reason"])
             singularidad_15m = False
 
-        # ---- Paso 11: singularidad S=ln(2k)-1 en la vela roja de 5m ----
-        # Solo se ejecuta si el Paso 10 (15m) falló. Si también falla
+        # ---- Paso 12: singularidad S=ln(2k)-1 en la vela roja de 5m ----
+        # Solo se ejecuta si el Paso 11 (15m) falló. Si también falla
         # aquí, ahí sí se descarta el par (ya se agotaron las dos
         # temporalidades).
         if not singularidad_15m:
-            ok11, res11 = check_step_11_singularidad_5m(
+            ok12, res12 = check_step_12_singularidad_5m(
                 info_5m["rsi6"], info_5m["rsi12"], info_5m["wr6"], info_5m["wr12"], es_verde_1h
             )
-            if ok11:
-                log.info("%s aprobó [Paso 11]: singularidad en 5m (S=%.6f)", symbol, res11["s"])
+            if ok12:
+                log.info("%s aprobó [Paso 12]: singularidad en 5m (S=%.6f)", symbol, res12["s"])
                 singularidad_5m = True
             else:
-                log.info("%s descartado en %s (ya falló también en Paso 10)", symbol, res11["reason"])
+                log.info("%s descartado en %s (ya falló también en Paso 11)", symbol, res12["reason"])
                 return None
         else:
             singularidad_5m = False
 
-        # ---- Paso 12: apalancamiento y margen ----
+        # ---- Paso 13 (datos crudos): máximo de 5m y SMA20(5m) ----
         # Solo se llega aquí si existe singularidad en AL MENOS una de
-        # las dos temporalidades (15m -> Paso 10, o 5m -> Paso 11). Si
+        # las dos temporalidades (15m -> Paso 11, o 5m -> Paso 12). Si
         # existe en ambas, se trata igual que si fuera una sola.
+        #
+        # IMPORTANTE: el cálculo de apalancamiento/margen del Paso 13
+        # (80% ÷ distancia%) NO se hace aquí. La distancia usada en la
+        # fórmula depende de si la entrada terminará siendo a MERCADO o
+        # con orden STOP (Paso 14) -- eso solo se sabe con el precio en
+        # vivo justo antes de ejecutar la orden, así que el cálculo
+        # completo del Paso 13 se hace en bingx_bot.execute_entry(),
+        # justo antes del Paso 14, usando el mismo precio en vivo con
+        # el que se decide el tipo de entrada:
+        #   - Entrada a MERCADO: distancia = máximo -> precio actual
+        #     (el punto exacto donde se abriría la orden a mercado).
+        #   - Orden STOP: distancia = máximo -> SMA20(5m) (sin cambios,
+        #     fórmula original).
         close_5m = df_5m["close"]
         ma20_5m = sma(close_5m, 20)
         max_idx_5m = info_5m["idx"]
         max_high_5m = float(df_5m["high"].iloc[max_idx_5m])
         ma20_5m_value = float(ma20_5m.iloc[max_idx_5m])
 
-        # DIAGNÓSTICO: log de cada número intermedio del cálculo de
-        # apalancamiento, para poder verificar la fórmula 90/distancia%
-        # contra datos reales de producción en vez de revisar el código
-        # a ciegas. distancia_pct y leverage_sin_redondear se recalculan
-        # acá SOLO para el log (duplicando la fórmula de
-        # calculate_leverage), sin alterar el valor que de verdad se usa.
-        distancia_pct_debug = (max_high_5m - ma20_5m_value) / max_high_5m * 100 if max_high_5m else None
-        leverage_sin_redondear_debug = (
-            LEVERAGE_BASE / distancia_pct_debug if distancia_pct_debug else None
-        )
         log.info(
-            "%s [Diagnóstico Paso 12] max_high_5m=%.8f | ma20_5m_value=%.8f | distancia_pct=%s | "
-            "leverage_base=%d | leverage_sin_redondear=%s",
+            "%s [Paso 13] Datos preparados para calcular apalancamiento en la ejecución: "
+            "max_high_5m=%.8f | ma20_5m_value=%.8f",
             symbol, max_high_5m, ma20_5m_value,
-            f"{distancia_pct_debug:.4f}%" if distancia_pct_debug is not None else "N/A",
-            LEVERAGE_BASE,
-            f"{leverage_sin_redondear_debug:.4f}x" if leverage_sin_redondear_debug is not None else "N/A",
-        )
-
-        try:
-            leverage_calc = calculate_leverage(max_high_5m, ma20_5m_value)
-        except ValueError as exc:
-            log.info("%s descartado en [Paso 12]: %s", symbol, exc)
-            return None
-
-        log.info("%s [Diagnóstico Paso 12] leverage_calc (redondeado a múltiplos de 5)=%.1fx", symbol, leverage_calc)
-
-        max_leverage_exchange = await get_max_leverage_for_symbol(exchange, symbol)
-        if max_leverage_exchange is not None:
-            leverage_final = min(int(leverage_calc), max_leverage_exchange)
-        else:
-            # No se pudo confirmar el máximo real desde ccxt/BingX -- en
-            # vez de capar con un valor adivinado, se usa el apalancamiento
-            # calculado tal cual. exchange.set_leverage() en bingx_bot.py
-            # es quien validará (y, si hace falta, corregirá) el valor
-            # real contra BingX al momento de abrir la posición.
-            leverage_final = int(leverage_calc)
-            log.warning(
-                "%s: no se pudo confirmar el apalancamiento máximo real del exchange; "
-                "se usará el calculado (%dx) sin capar -- BingX lo validará al ejecutar la entrada.",
-                symbol, leverage_final,
-            )
-
-        margin_usdt = await calculate_position_size(exchange, symbol, leverage_final)
-
-        if margin_usdt <= 0:
-            log.info("%s descartado en [Paso 12]: margen calculado <= 0", symbol)
-            return None
-
-        log.info(
-            "%s aprobó [Paso 12]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%s) | margen=%.2f USDT",
-            symbol, leverage_final, leverage_calc,
-            f"{max_leverage_exchange}x" if max_leverage_exchange is not None else "desconocido",
-            margin_usdt,
         )
 
         return {
             "symbol": symbol,
-            "leverage": leverage_final,
-            "margin_usdt": margin_usdt,
             "ma20_5m_value": ma20_5m_value,
             "max_high_5m": max_high_5m,
             "round_start_ts": round_start_ts,
