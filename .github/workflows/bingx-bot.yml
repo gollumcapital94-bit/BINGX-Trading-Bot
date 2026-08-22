@@ -10,11 +10,33 @@ on:
         required: true
         type: boolean
         default: true
+  schedule:
+    # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE a la gestión de
+    # TP/SL (Paso 1) -- ver BOT_MODE más abajo. Corre CADA HORA, en
+    # sintonía con TIMEFRAME_TP="1h" en bingx_bot.py: el Paso 1 solo
+    # evalúa velas 1h ya cerradas, así que revisar con más frecuencia
+    # no aportaría datos nuevos hasta que cierre la siguiente vela.
+    # NUNCA escanea ni abre nuevas entradas, así se evita duplicar una
+    # posición que el disparador externo (cronjob.org ->
+    # repository_dispatch) ya haya abierto.
+    - cron: "0 * * * *"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # IMPORTANTE: serializa las ejecuciones de este workflow. Sin esto,
+    # el cron interno (schedule) y el disparador externo (cronjob.org
+    # -> repository_dispatch) podrían caer en el mismo instante y correr
+    # EN PARALELO -- ambos verificarían "¿ya existe el TP/SL?" casi al
+    # mismo tiempo, verían que no, y crearían la orden duplicada de
+    # todos modos (el chequeo de duplicados en bingx_bot.py no es
+    # atómico frente a corridas simultáneas). `cancel-in-progress:
+    # false` hace que la segunda ejecución espere en cola a que termine
+    # la primera, en vez de cancelarla o correr al mismo tiempo.
+    concurrency:
+      group: bingx-trading-bot
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repositorio
@@ -33,6 +55,12 @@ jobs:
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO: ${{ github.event.inputs.demo_mode || vars.BINGX_DEMO || 'true' }}
+          # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1).
+          # Cualquier otro disparador -- manual (workflow_dispatch) o
+          # externo (repository_dispatch desde cronjob.org) -- corre el
+          # bot completo (Pasos 1 a 13), incluida la búsqueda de nuevas
+          # entradas.
+          BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
         run: |
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
@@ -43,7 +71,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|Short STOP-LIMIT order placed" bot_output.log > signals.txt || true
+          grep -E "Market entry executed|Short STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even colocado" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
