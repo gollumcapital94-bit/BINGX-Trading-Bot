@@ -380,6 +380,16 @@ async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
     raw_4h = await exchange.fetch_ohlcv(symbol, timeframe="4h", limit=OHLCV_LIMIT_4H)
     closed_4h = raw_4h[:-1]  # se descarta la vela en formación
 
+    # DIAGNÓSTICO: si BingX devuelve muchas menos velas de las 1200
+    # pedidas (por un límite de la API distinto para "4h", por ejemplo),
+    # SMA20/EMA50 seguirían siendo calculables pero con menos
+    # "calentamiento" del esperado. Este log permite confirmarlo en
+    # producción en vez de asumirlo.
+    log.info(
+        "%s [Diagnóstico Paso 10] velas 4h solicitadas=%d | recibidas (crudas)=%d | cerradas usadas=%d",
+        symbol, OHLCV_LIMIT_4H, len(raw_4h), len(closed_4h),
+    )
+
     if len(closed_4h) < 60:
         return False, {
             "reason": "[Paso 10] Datos insuficientes en 4h (< 60 velas cerradas) para calcular SMA20/EMA50",
@@ -674,13 +684,21 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
     build_volume_exchange() en bingx_bot.py. Si no se pasa (por
     ejemplo, al llamar esta función fuera del flujo normal del bot),
     se usa `exchange` como fallback.
+
+    Devuelve SIEMPRE una tupla (plan, failed_step):
+      - Si el símbolo pasa todos los filtros: (plan_dict, None).
+      - Si se descarta en algún paso: (None, <número de paso o
+        "exception">). Este segundo valor permite armar un resumen
+        agregado de "cuántos símbolos se cayeron en cada paso" (ver
+        run_pasos_2_a_14_entradas en bingx_bot.py) sin tener que leer
+        el log completo símbolo por símbolo.
     """
     volume_exchange = volume_exchange or exchange
     try:
         df_1h, (ok, info) = await fetch_1h_with_expanding_window(exchange, symbol)
         if not ok:
             log.info("%s descartado en %s", symbol, info.get("reason", "[Paso 2/3] motivo desconocido"))
-            return None
+            return None, info.get("failed_step", "2/3")
         last_idx = info["last_idx"]
         round_start_ts = info["round_start_ts"]
         es_verde_1h = info["es_verde_1h"]
@@ -697,7 +715,7 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
         ok, info4 = check_step_4(df_1h, last_idx)
         if not ok:
             log.info("%s descartado en [Paso 4]: %s", symbol, info4["reason"])
-            return None
+            return None, 4
 
         raw_15m = await exchange.fetch_ohlcv(symbol, timeframe="15m", limit=OHLCV_LIMIT_LOWER_TF)
         df_15m = _drop_unclosed_candle(_to_dataframe(raw_15m))
@@ -710,7 +728,7 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
         )
         if not ok:
             log.info("%s descartado en %s", symbol, res5["reason"])
-            return None
+            return None, 5
         idx_15m = res5["idx"]
         ts_15m = int(df_15m["ts"].iloc[idx_15m])
         log.info(
@@ -724,7 +742,7 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
         )
         if not ok:
             log.info("%s descartado en %s", symbol, res6["reason"])
-            return None
+            return None, 6
         idx_5m = res6["idx"]
         ts_5m = int(df_5m["ts"].iloc[idx_5m])
         log.info(
@@ -736,25 +754,29 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
         ok, res7 = check_wr_all_distinct(df_15m, idx_15m, "15m", step_num=7)
         if not ok:
             log.info("%s descartado en %s", symbol, res7["reason"])
-            return None
+            return None, 7
 
         # ---- Paso 8: W%R6/12/24 todos distintos en la vela roja de 5m ----
         ok, res8 = check_wr_all_distinct(df_5m, idx_5m, "5m", step_num=8)
         if not ok:
             log.info("%s descartado en %s", symbol, res8["reason"])
-            return None
+            return None, 8
 
         # ---- Paso 9: volumen 24h ----
         ok, info9_vol = await check_step_9_volume(volume_exchange, symbol)
         if not ok:
             log.info("%s descartado en %s", symbol, info9_vol["reason"])
-            return None
+            return None, 9
 
         # ---- Paso 10: SMA20 por encima de la EMA50, en 4h ----
         ok, info10 = await check_step_10_sma20_above_ema50_4h(exchange, symbol)
         if not ok:
             log.info("%s descartado en %s", symbol, info10["reason"])
-            return None
+            return None, 10
+        log.info(
+            "%s aprobó [Paso 10]: SMA20(4h)=%.8f > EMA50(4h)=%.8f",
+            symbol, info10["sma20_4h"], info10["ema50_4h"],
+        )
 
         # RSI6/RSI12 en la vela roja del máximo (15m y 5m), necesarios
         # para el cálculo de la singularidad de los Pasos 11 y 12.
@@ -796,7 +818,7 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
                 singularidad_5m = True
             else:
                 log.info("%s descartado en %s (ya falló también en Paso 11)", symbol, res12["reason"])
-                return None
+                return None, 12
         else:
             singularidad_5m = False
 
@@ -829,7 +851,7 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
             symbol, max_high_5m, ma20_5m_value,
         )
 
-        return {
+        plan = {
             "symbol": symbol,
             "ma20_5m_value": ma20_5m_value,
             "max_high_5m": max_high_5m,
@@ -838,7 +860,8 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
             "singularidad_15m": singularidad_15m,
             "singularidad_5m": singularidad_5m,
         }
+        return plan, None
 
     except Exception as exc:
         log.error("Error evaluando %s en el pipeline de entrada: %s", symbol, exc)
-        return None
+        return None, "exception"
