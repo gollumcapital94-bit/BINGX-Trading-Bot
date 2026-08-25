@@ -42,6 +42,17 @@ OHLCV_LIMIT_1H = 1200   # histórico fijo (~50 días) para que SMA20/EMA50/EMA20
 OHLCV_LIMIT_4H = 1200   # mismo criterio que OHLCV_LIMIT_1H, pero en 4h (~200 días) para el Paso 10 (SMA20 vs EMA50 en 4h)
 OHLCV_LIMIT_LOWER_TF = 500  # para 15m / 5m (más margen de calentamiento para RSI/W%R)
 
+# BingX impone un tope real de velas por PETICIÓN INDIVIDUAL de klines,
+# sin importar el `limit` que se le pida: 1440 velas máximo (confirmado
+# en la documentación oficial de BingX, "limit: default 500, maximum
+# 1440"). Como OHLCV_LIMIT_4H = OHLCV_LIMIT_1H = 1200 (< 1440), en la
+# práctica una sola petición YA alcanza para traer las 1200 completas
+# de una vez -- _fetch_ohlcv_paginated() solo entraría a paginar (pedir
+# bloques adicionales hacia atrás) si algún día se pidiera un total por
+# encima de 1440, o si el exchange devolviera menos de lo pedido por
+# cualquier otro motivo (símbolo con poco historial listado, etc.).
+BINGX_MAX_OHLCV_PER_REQUEST = 1440
+
 # BingX usa "VST" (Virtual USDT) como código de moneda en la cuenta DEMO,
 # y "USDT" en la cuenta real. Revisamos ambas por si acaso.
 BALANCE_CURRENCY_CANDIDATES = ("USDT", "VST")
@@ -360,6 +371,67 @@ async def check_step_9_volume(volume_exchange, symbol: str):
     return True, {"volume_24h_usdt": quote_volume}
 
 
+async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_limit: int) -> list:
+    """
+    Descarga hasta `total_limit` velas OHLCV, PAGINANDO hacia atrás en
+    el tiempo si una sola petición no alcanza a traer todas las velas
+    pedidas -- necesario porque BingX capa cada llamada individual a
+    `BINGX_MAX_OHLCV_PER_REQUEST` (1440) velas, sin importar el `limit`
+    real que se solicite. Con OHLCV_LIMIT_4H/1H=1200 (< 1440) esto en
+    la práctica se resuelve en una sola petición; la paginación queda
+    como red de seguridad para cuando el total pedido supere 1440, o
+    si el exchange devuelve menos de lo pedido por cualquier otro
+    motivo (símbolo con poco historial listado, etc.).
+
+    Estrategia:
+      1) Pide el primer bloque (el más reciente) con el límite máximo
+         permitido por petición.
+      2) Si con eso no alcanza el total pedido, sigue pidiendo bloques
+         cada vez más antiguos usando `since`, calculado a partir de la
+         vela más vieja que ya se tiene, hasta completar `total_limit`
+         velas o hasta que el exchange deje de devolver velas más
+         antiguas que las que ya se tienen (símbolo sin más historial,
+         por ejemplo uno recién listado).
+
+    Devuelve la lista ordenada de más antigua a más reciente (mismo
+    formato que fetch_ohlcv), con como máximo `total_limit` velas.
+    """
+    per_request = min(total_limit, BINGX_MAX_OHLCV_PER_REQUEST)
+    all_candles = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=per_request)
+
+    if not all_candles:
+        return all_candles
+
+    timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
+
+    while len(all_candles) < total_limit:
+        oldest_ts = all_candles[0][0]
+        remaining = total_limit - len(all_candles)
+        chunk_limit = min(remaining, BINGX_MAX_OHLCV_PER_REQUEST)
+
+        # Se pide el bloque de velas justo ANTERIOR al que ya se tiene,
+        # retrocediendo chunk_limit velas desde la más antigua actual.
+        since = oldest_ts - (chunk_limit * timeframe_ms)
+
+        older_chunk = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=chunk_limit)
+
+        # Se descarta cualquier vela que ya tengamos por solapamiento
+        # (algunos exchanges incluyen la vela en `since` en el resultado).
+        older_chunk = [c for c in older_chunk if c[0] < oldest_ts]
+
+        if not older_chunk:
+            # No hay más historial disponible para este símbolo -- se
+            # deja de paginar con lo que se logró reunir hasta ahora.
+            break
+
+        all_candles = older_chunk + all_candles
+
+    if len(all_candles) > total_limit:
+        all_candles = all_candles[-total_limit:]
+
+    return all_candles
+
+
 # ----------------------------------------------------------------------
 # Paso 10: patrón SMA20/EMA50/EMA200 en TEMPORALIDAD 4H.
 #
@@ -388,16 +460,28 @@ async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
     Ambas condiciones deben cumplirse a la vez; si falla cualquiera de
     las dos, se descarta el símbolo.
     """
-    raw_4h = await exchange.fetch_ohlcv(symbol, timeframe="4h", limit=OHLCV_LIMIT_4H)
+    # Se pide OHLCV_LIMIT_4H + 1 velas CRUDAS (1201): la última siempre
+    # está en formación y se descarta más abajo, así que para terminar
+    # con EXACTAMENTE las 1200 últimas velas de 4h ya CERRADAS (las que
+    # de verdad se usan para calcular SMA20/EMA50/EMA200) hay que pedir
+    # una de más. Pedir solo 1200 crudas dejaría 1199 cerradas, un
+    # dato menos del histórico que se busca garantizar.
+    #
+    # Se usa fetch paginado (ver _fetch_ohlcv_paginated) en vez de una
+    # sola llamada directa, para garantizar el total completo aunque
+    # BingX limite cada petición individual a menos -- así SMA20/EMA50/
+    # EMA200 convergen con el "calentamiento" real que se busca, en vez
+    # de quedarse cortas en silencio.
+    raw_4h = await _fetch_ohlcv_paginated(exchange, symbol, "4h", OHLCV_LIMIT_4H + 1)
     closed_4h = raw_4h[:-1]  # se descarta la vela en formación
 
-    # DIAGNÓSTICO: si BingX devuelve muchas menos velas de las 1200
-    # pedidas (por un límite de la API distinto para "4h", por ejemplo),
-    # SMA20/EMA50/EMA200 seguirían siendo calculables pero con menos
-    # "calentamiento" del esperado. Este log permite confirmarlo en
-    # producción en vez de asumirlo.
+    # DIAGNÓSTICO: si a pesar de la paginación BingX aún no logra
+    # completar las 1200 velas CERRADAS buscadas (símbolo con poco
+    # historial listado, por ejemplo), SMA20/EMA50/EMA200 seguirían
+    # siendo calculables pero con menos "calentamiento" del esperado.
+    # Este log permite confirmarlo en producción en vez de asumirlo.
     log.info(
-        "%s [Diagnóstico Paso 10] velas 4h solicitadas=%d | recibidas (crudas)=%d | cerradas usadas=%d",
+        "%s [Diagnóstico Paso 10] velas 4h cerradas objetivo=%d | crudas recibidas (tras paginación)=%d | cerradas usadas=%d",
         symbol, OHLCV_LIMIT_4H, len(raw_4h), len(closed_4h),
     )
 
