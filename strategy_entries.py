@@ -361,28 +361,39 @@ async def check_step_9_volume(volume_exchange, symbol: str):
 
 
 # ----------------------------------------------------------------------
-# Paso 10: SMA20 por encima de la EMA50, en TEMPORALIDAD 4H.
+# Paso 10: patrón SMA20/EMA50/EMA200 en TEMPORALIDAD 4H.
+#
+# PATRÓN EXACTO (confirmado con el usuario a partir de capturas reales
+# del gráfico de BingX en 4h -- MUSDT, SPACEUSDT, EULUSDT):
+#   - SMA20(4h) > EMA50(4h)
+#   - Y AMBAS (SMA20 y EMA50) están por DEBAJO de la EMA200(4h)
+# Si la SMA20 está por encima de la EMA50 pero alguna de las dos (o las
+# dos) ya cruzó por encima de la EMA200, el patrón buscado ya no aplica
+# y el símbolo se descarta -- no basta con el cruce SMA20/EMA50 solo.
 #
 # Se pide un histórico fijo de OHLCV_LIMIT_4H (1200 velas de 4h, ~200
 # días) en una sola petición -- el mismo criterio que ya se usa para
-# 1h en fetch_1h_with_expanding_window() -- para que la SMA20 y la
-# EMA50 converjan de forma estable antes de evaluarlas, en vez de
+# 1h en fetch_1h_with_expanding_window() -- para que la SMA20, la EMA50
+# y la EMA200 converjan de forma estable antes de evaluarlas, en vez de
 # calcularlas sobre una ventana corta con poco calentamiento.
 # ----------------------------------------------------------------------
 async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
     """
     FUNCIÓN INDEPENDIENTE para el Paso 10: descarta la vela de 4h en
     formación (igual que el resto del bot, solo se evalúan velas
-    cerradas) y valida que, en la última vela 4h cerrada, la SMA20 esté
-    POR ENCIMA de la EMA50 (tendencia de más largo plazo alineada antes
-    de seguir evaluando el resto de la cascada).
+    cerradas) y valida que, en la última vela 4h cerrada:
+      1) SMA20(4h) > EMA50(4h)
+      2) SMA20(4h) < EMA200(4h) y EMA50(4h) < EMA200(4h) (ambas por
+         debajo de la EMA200, no solo una de las dos)
+    Ambas condiciones deben cumplirse a la vez; si falla cualquiera de
+    las dos, se descarta el símbolo.
     """
     raw_4h = await exchange.fetch_ohlcv(symbol, timeframe="4h", limit=OHLCV_LIMIT_4H)
     closed_4h = raw_4h[:-1]  # se descarta la vela en formación
 
     # DIAGNÓSTICO: si BingX devuelve muchas menos velas de las 1200
     # pedidas (por un límite de la API distinto para "4h", por ejemplo),
-    # SMA20/EMA50 seguirían siendo calculables pero con menos
+    # SMA20/EMA50/EMA200 seguirían siendo calculables pero con menos
     # "calentamiento" del esperado. Este log permite confirmarlo en
     # producción en vez de asumirlo.
     log.info(
@@ -390,29 +401,42 @@ async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
         symbol, OHLCV_LIMIT_4H, len(raw_4h), len(closed_4h),
     )
 
-    if len(closed_4h) < 60:
+    # La EMA200 necesita bastante más "calentamiento" que la SMA20/EMA50
+    # para converger de forma estable -- se exige un mínimo más alto que
+    # antes (60) para no evaluar la EMA200 con muy poco historial.
+    if len(closed_4h) < 210:
         return False, {
-            "reason": "[Paso 10] Datos insuficientes en 4h (< 60 velas cerradas) para calcular SMA20/EMA50",
+            "reason": "[Paso 10] Datos insuficientes en 4h (< 210 velas cerradas) para calcular SMA20/EMA50/EMA200",
             "failed_step": 10,
         }
 
     close_4h = pd.Series([c[4] for c in closed_4h], dtype="float64")
     sma20_4h = sma(close_4h, 20)
     ema50_4h = ema(close_4h, 50)
+    ema200_4h = ema(close_4h, 200)
 
     sma20_value = float(sma20_4h.iloc[-1])
     ema50_value = float(ema50_4h.iloc[-1])
+    ema200_value = float(ema200_4h.iloc[-1])
 
-    if not (sma20_value > ema50_value):
+    sma20_above_ema50 = sma20_value > ema50_value
+    both_below_ema200 = sma20_value < ema200_value and ema50_value < ema200_value
+
+    if not (sma20_above_ema50 and both_below_ema200):
         return False, {
             "reason": (
-                f"[Paso 10] SMA20(4h)={sma20_value:.8f} NO está por encima de la "
-                f"EMA50(4h)={ema50_value:.8f}, se descarta"
+                f"[Paso 10] Patrón no cumplido en 4h -- SMA20={sma20_value:.8f}, "
+                f"EMA50={ema50_value:.8f}, EMA200={ema200_value:.8f} "
+                f"(SMA20>EMA50={sma20_above_ema50}, ambas<EMA200={both_below_ema200})"
             ),
             "failed_step": 10,
         }
 
-    return True, {"sma20_4h": sma20_value, "ema50_4h": ema50_value}
+    return True, {
+        "sma20_4h": sma20_value,
+        "ema50_4h": ema50_value,
+        "ema200_4h": ema200_value,
+    }
 
 
 
@@ -774,8 +798,8 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
             log.info("%s descartado en %s", symbol, info10["reason"])
             return None, 10
         log.info(
-            "%s aprobó [Paso 10]: SMA20(4h)=%.8f > EMA50(4h)=%.8f",
-            symbol, info10["sma20_4h"], info10["ema50_4h"],
+            "%s aprobó [Paso 10]: SMA20(4h)=%.8f > EMA50(4h)=%.8f, ambas < EMA200(4h)=%.8f",
+            symbol, info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
         )
 
         # RSI6/RSI12 en la vela roja del máximo (15m y 5m), necesarios
