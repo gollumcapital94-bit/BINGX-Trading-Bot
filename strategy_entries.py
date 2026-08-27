@@ -7,6 +7,15 @@ Si el símbolo pasa todos los filtros, devuelve un diccionario con la
 orden a ejecutar (short, stop-limit o mercado, con margen/apalancamiento
 ya calculados). Si en cualquier paso se descarta, devuelve None.
 
+LECTURA DE MERCADO SIEMPRE REAL: todas las funciones de este módulo que
+reciben un parámetro `exchange` (evaluate_symbol y sus pasos internos)
+esperan la conexión de MERCADO de bingx_bot.py (build_market_data_exchange),
+que SIEMPRE apunta al mercado real, sin importar si el bot corre en modo
+demo o real. La única excepción son get_max_leverage_for_symbol() y
+calculate_position_size(), que se llaman desde bingx_bot.execute_entry()
+con la conexión de CUENTA (demo/real), porque el apalancamiento máximo y
+el balance disponible sí dependen de qué cuenta va a operar.
+
 IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
   - MA20  -> SMA20 (media simple)
   - EMA50 / EMA200 -> exponenciales
@@ -342,16 +351,16 @@ def _get_rsi6_rsi12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
 # volumen, donde el arbitraje entre exchanges no tiene efecto y el
 # precio puede ser manipulado más fácilmente por la propia plataforma.
 # ----------------------------------------------------------------------
-async def check_step_9_volume(volume_exchange, symbol: str):
+async def check_step_9_volume(exchange, symbol: str):
     """
-    IMPORTANTE: `volume_exchange` debe ser SIEMPRE una conexión al
-    mercado REAL, nunca al sandbox/VST de la cuenta demo -- ver
-    build_volume_exchange() en bingx_bot.py. Un par no deja de ser una
-    "gema" de baja liquidez real solo porque el bot esté operando con
-    dinero virtual, así que este filtro no debe depender del modo
-    demo/real en el que esté corriendo el bot.
+    IMPORTANTE: `exchange` aquí debe ser SIEMPRE la conexión de mercado
+    (real) que recibe evaluate_symbol -- ver build_market_data_exchange()
+    en bingx_bot.py. Un par no deja de ser una "gema" de baja liquidez
+    real solo porque el bot esté operando con dinero virtual, así que
+    este filtro no debe depender del modo demo/real en el que esté
+    corriendo el bot.
     """
-    ticker = await volume_exchange.fetch_ticker(symbol)
+    ticker = await exchange.fetch_ticker(symbol)
     quote_volume = ticker.get("quoteVolume")
 
     if quote_volume is None:
@@ -637,6 +646,12 @@ def check_step_12_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
 #     NO la SMA20.
 # Quién decide cuál usar es bingx_bot.execute_entry(), justo antes de
 # ejecutar el Paso 14, con el precio en vivo de ese instante.
+#
+# `get_max_leverage_for_symbol` y `calculate_position_size` se llaman
+# desde bingx_bot.execute_entry() con la conexión de CUENTA (demo/real)
+# -- el apalancamiento máximo del par y el balance disponible dependen
+# de qué cuenta va a operar, a diferencia del resto de este módulo, que
+# siempre recibe la conexión de mercado (real).
 # ----------------------------------------------------------------------
 def calculate_leverage(max_high_5m: float, reference_price: float) -> float:
     """
@@ -661,6 +676,10 @@ async def get_max_leverage_for_symbol(exchange, symbol: str):
     Devuelve el apalancamiento máximo REAL que permite BingX para este
     símbolo, o None si no se pudo confirmar de ninguna fuente.
 
+    Se llama con la conexión de CUENTA (demo/real) desde
+    bingx_bot.execute_entry() -- el límite de apalancamiento puede
+    variar según el entorno (sandbox vs producción).
+
     BUG CORREGIDO: esta función tenía un `default: int = 20` que se
     devolvía silenciosamente cada vez que fetch_leverage_tiers()
     fallaba o no traía datos utilizables -- la MISMA llamada que ya
@@ -669,7 +688,7 @@ async def get_max_leverage_for_symbol(exchange, symbol: str):
     más de 20x, `min(leverage_calc, 20)` terminaba eligiendo 20x casi
     siempre, sin relación alguna con el límite real del par.
     En vez de adivinar con un número fijo, ahora se devuelve None
-    cuando no se puede confirmar, y es el llamador (evaluate_symbol)
+    cuando no se puede confirmar, y es el llamador (execute_entry)
     quien decide no capar el apalancamiento calculado -- BingX validará
     el valor real al momento de exchange.set_leverage() en bingx_bot.py.
     """
@@ -749,6 +768,10 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
     Ej.: si el 10% del margen total da 300 USDT, pero el apalancamiento
     de 20x en ese par solo permite un margen máximo de 250 USDT, se usa
     el menor: 250 USDT.
+
+    Se llama con la conexión de CUENTA (demo/real) desde
+    bingx_bot.execute_entry() -- el balance disponible es propio de esa
+    cuenta.
     """
     balance = await exchange.fetch_balance()
     total_balance = _get_available_balance(balance)
@@ -785,13 +808,12 @@ async def fetch_1h_with_expanding_window(exchange, symbol: str):
 # Pipeline completo por símbolo (pasos 2 a 12, deja el 13 -paso final
 # de ejecución de orden- para bingx_bot.py)
 # ----------------------------------------------------------------------
-async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
+async def evaluate_symbol(exchange, symbol: str):
     """
-    `volume_exchange`: conexión al mercado REAL usada exclusivamente
-    para el Paso 9 (volumen 24h) -- ver check_step_9_volume() y
-    build_volume_exchange() en bingx_bot.py. Si no se pasa (por
-    ejemplo, al llamar esta función fuera del flujo normal del bot),
-    se usa `exchange` como fallback.
+    `exchange`: SIEMPRE la conexión de MERCADO (real) de bingx_bot.py
+    (build_market_data_exchange) -- todo este pipeline (velas 1h/15m/
+    5m/4h, indicadores, volumen 24h) lee del mercado real sin importar
+    si el bot corre en modo demo o real.
 
     Devuelve SIEMPRE una tupla (plan, failed_step):
       - Si el símbolo pasa todos los filtros: (plan_dict, None).
@@ -801,7 +823,6 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
         run_pasos_2_a_14_entradas en bingx_bot.py) sin tener que leer
         el log completo símbolo por símbolo.
     """
-    volume_exchange = volume_exchange or exchange
     try:
         df_1h, (ok, info) = await fetch_1h_with_expanding_window(exchange, symbol)
         if not ok:
@@ -871,7 +892,7 @@ async def evaluate_symbol(exchange, symbol: str, volume_exchange=None):
             return None, 8
 
         # ---- Paso 9: volumen 24h ----
-        ok, info9_vol = await check_step_9_volume(volume_exchange, symbol)
+        ok, info9_vol = await check_step_9_volume(exchange, symbol)
         if not ok:
             log.info("%s descartado en %s", symbol, info9_vol["reason"])
             return None, 9
