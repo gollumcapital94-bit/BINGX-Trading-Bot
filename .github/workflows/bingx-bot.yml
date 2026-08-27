@@ -1,4 +1,4 @@
-name: BingX Trading Bot - Pasos 1 a 13
+name: BingX Trading Bot - Pasos 1 a 14
 
 on:
   repository_dispatch:
@@ -58,7 +58,7 @@ jobs:
           # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1).
           # Cualquier otro disparador -- manual (workflow_dispatch) o
           # externo (repository_dispatch desde cronjob.org) -- corre el
-          # bot completo (Pasos 1 a 13), incluida la búsqueda de nuevas
+          # bot completo (Pasos 1 a 14), incluida la búsqueda de nuevas
           # entradas.
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
         run: |
