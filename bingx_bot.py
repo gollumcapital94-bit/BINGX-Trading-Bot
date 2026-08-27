@@ -8,6 +8,22 @@ PASOS 2-14 -> Escáner de nuevas entradas en corto, siguiendo la cascada
            singularidad matemática, apalancamiento dinámico, etc.)
            Ver strategy_entries.py para el detalle de cada paso.
 
+LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO Y QUÉ NO:
+    - Universo de símbolos válidos (crypto perpetuo USDT-M) y TODO el
+      escaneo de nuevas entradas (Pasos 2-14: velas 1h/15m/5m/4h,
+      indicadores, volumen 24h del Paso 9) se leen SIEMPRE del mercado
+      REAL de BingX, sin importar BINGX_DEMO -- un patrón técnico o un
+      volumen real no cambian porque el bot opere con dinero virtual.
+      Ver build_market_data_exchange().
+    - El Paso 1 (gestión de Take Profit/Stop Loss) SÍ sigue la
+      variable BINGX_DEMO: lee sus velas 1h de la MISMA cuenta (demo o
+      real) donde vive la posición y donde se van a colocar las
+      órdenes de TP/SL -- ver process_position_tp().
+    - Las acciones que dependen de la CUENTA -- leer posiciones y
+      balance, colocar TP/SL (Paso 1), configurar apalancamiento/
+      margen y abrir la orden de entrada (Pasos 13-14) -- siempre van
+      contra `exchange` (VST/sandbox en demo, producción en real).
+
 Requiere las variables de entorno:
     BINGX_API_KEY
     BINGX_API_SECRET
@@ -50,6 +66,12 @@ def _env_flag(name: str, default: str = "false") -> bool:
 
 
 def build_exchange() -> "ccxt.bingx":
+    """
+    Conexión de CUENTA: se usa para todo lo que depende de la cuenta
+    real/demo -- posiciones, balance, colocar TP/SL, configurar
+    apalancamiento y ejecutar la orden de entrada. Va a sandbox (VST)
+    o a producción según BINGX_DEMO.
+    """
     api_key = os.environ.get("BINGX_API_KEY")
     api_secret = os.environ.get("BINGX_API_SECRET")
     demo_mode = _env_flag("BINGX_DEMO", "false")
@@ -84,29 +106,35 @@ def build_exchange() -> "ccxt.bingx":
     return exchange
 
 
-def build_volume_exchange(main_exchange: "ccxt.bingx", demo_mode: bool) -> "ccxt.bingx":
+def build_market_data_exchange(main_exchange: "ccxt.bingx", demo_mode: bool) -> "ccxt.bingx":
     """
-    Devuelve la conexión que se debe usar EXCLUSIVAMENTE para consultar
-    el volumen 24h en el Paso 9 (filtro de MIN_VOLUME_24H_USDT en
-    strategy_entries.py). Este chequeo SIEMPRE debe reflejar el
-    volumen REAL del mercado, sin importar si el bot corre en modo demo
-    o real -- un par no deja de ser una "gema" de baja liquidez real
-    solo porque el bot esté operando con dinero virtual.
+    Conexión de MERCADO: se usa para TODA la lectura de mercado de la
+    estrategia -- lista de símbolos, velas OHLCV de cualquier
+    temporalidad (1h, 15m, 5m, 4h) e indicadores derivados, y volumen
+    24h (Paso 9). Esto cubre TODO el script (Paso 1 y Pasos 2-14 por
+    igual), no una parte de él.
+
+    Esta conexión SIEMPRE apunta al mercado REAL, sin importar si el
+    bot corre en modo demo o real -- un patrón técnico, un volumen, o
+    un round alcista no cambian porque el bot esté operando con dinero
+    virtual, y la cuenta VST tiene su propio historial/volumen
+    simulado que no refleja el mercado real.
 
     - Modo REAL: `main_exchange` ya apunta a los endpoints reales de
       BingX, así que se reutiliza la misma conexión (no hace falta
       abrir una segunda).
     - Modo DEMO: `main_exchange` tiene el sandbox activado (apunta a
-      open-api-vst.bingx.com, que tiene su propio volumen simulado de
-      la cuenta VST). Se abre una SEGUNDA conexión, con las mismas API
-      keys pero SIN sandbox, dedicada solo a leer el volumen real.
+      open-api-vst.bingx.com). Se abre una SEGUNDA conexión, con las
+      mismas API keys pero SIN sandbox, dedicada solo a leer mercado.
+      `main_exchange` queda reservada exclusivamente para lo que
+      depende de la cuenta (posiciones, balance, órdenes).
     """
     if not demo_mode:
         return main_exchange
 
     api_key = os.environ.get("BINGX_API_KEY")
     api_secret = os.environ.get("BINGX_API_SECRET")
-    volume_exchange = ccxt.bingx(
+    market_exchange = ccxt.bingx(
         {
             "apiKey": api_key,
             "secret": api_secret,
@@ -118,26 +146,39 @@ def build_volume_exchange(main_exchange: "ccxt.bingx", demo_mode: bool) -> "ccxt
     )
     log.info(
         "Modo demo activo: se abrió una conexión adicional SIN sandbox, "
-        "usada solo para el Paso 9 (volumen 24h REAL del mercado)."
+        "usada para TODA la lectura de mercado (símbolos, velas, "
+        "indicadores, volumen) en los Pasos 1 a 14 -- siempre el mercado REAL."
     )
-    return volume_exchange
+    return market_exchange
 
 
 # BUG CORREGIDO (visto en producción: el bot entró en NCFXCAD2JPY/USDT:USDT
 # y NCFXEURSGD2USD/USDT:USDT, es decir CAD/JPY y EUR/SGD, pares de FOREX).
 #
-# BingX expone su línea de "Standard Futures" (forex, índices, commodities)
-# BAJO LOS MISMOS FLAGS swap=True / linear=True / quote=USDT / settle=USDT
-# que los futuros perpetuos cripto reales. Los flags de ccxt por sí solos
-# NO bastan para distinguirlos -- el supuesto original del README/docstring
-# ("esos mercados no existen bajo 'swap' USDT-M") era incorrecto.
+# BUG CORREGIDO #2 (visto en producción más adelante: el bot descartó
+# candidatos, pero el universo de símbolos incluía NCSKAPP2USD/USDT:USDT
+# y NCSKBRKB2USD/USDT:USDT -- acciones sintéticas de AppLovin y
+# Berkshire Hathaway B "contra USD", NO futuros perpetuos cripto).
 #
-# Filtro con dos capas de defensa:
-#   1) El id crudo de BingX para ese producto no-cripto usa el prefijo
-#      "NCFX" (confirmado con los símbolos reales del bug).
-#   2) Por si BingX usa otro prefijo en el futuro: ningún futuro perpetuo
-#      cripto real tiene como moneda BASE una divisa fiat (CAD, EUR, JPY,
-#      etc.) -- las fiat solo aparecen como quote/settle en BingX.
+# BingX expone TODA su línea de "Standard Futures" (forex, índices,
+# commodities, y ahora también acciones sintéticas) BAJO LOS MISMOS
+# FLAGS swap=True / linear=True / quote=USDT / settle=USDT que los
+# futuros perpetuos cripto reales. Los flags de ccxt por sí solos NO
+# bastan para distinguirlos.
+#
+# Se corrigió generalizando el filtro con DOS capas de defensa,
+# independientes entre sí:
+#   1) El id crudo de BingX para CUALQUIER producto no-cripto de esta
+#      línea usa el prefijo "NC" (confirmado con "NCFX" para forex y
+#      "NCSK" para acciones sintéticas -- se generaliza a "NC" para
+#      cubrir también cualquier subtipo nuevo que BingX agregue en el
+#      futuro bajo el mismo esquema de nombres).
+#   2) Independientemente del prefijo: ningún futuro perpetuo cripto
+#      real nombra su moneda BASE con el patrón "SUBYACENTE2REFERENCIA"
+#      (ej. "EUR2USD", "APP2USD", "BRKB2USD") -- ese patrón es
+#      exclusivo de este producto sintético de BingX. Además, ninguna
+#      base cripto real es una divisa fiat (CAD, EUR, JPY, etc.), que
+#      solo aparecen como quote/settle.
 FIAT_CURRENCY_CODES = {
     "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "SGD", "HKD",
     "CNY", "CNH", "ZAR", "MXN", "TRY", "SEK", "NOK", "DKK", "PLN", "THB",
@@ -147,7 +188,19 @@ FIAT_CURRENCY_CODES = {
     "KWD", "BHD", "OMR", "JOD",
 }
 
-NON_CRYPTO_ID_PREFIXES = ("NCFX",)
+# Generalizado de "NCFX" a "NC": cubre NCFX (forex), NCSK (acciones
+# sintéticas, visto en producción) y cualquier subtipo nuevo que BingX
+# agregue en el futuro bajo el mismo esquema de nombres del producto
+# "Standard Futures".
+NON_CRYPTO_ID_PREFIXES = ("NC",)
+
+# Patrón "SUBYACENTE2REFERENCIA" (ej. EUR2USD, APP2USD, BRKB2USD) usado
+# por BingX para nombrar la base de TODO su producto "Standard
+# Futures" (forex, acciones sintéticas, índices, commodities). Ningún
+# futuro perpetuo cripto real sigue este patrón -- sirve como segunda
+# señal, independiente del prefijo del id, por si BingX cambia el
+# prefijo en el futuro.
+_SYNTHETIC_UNDERLYING_RE = re.compile(r"^[A-Z]{1,10}2[A-Z]{2,6}$")
 
 
 def _looks_like_forex_or_cfd(market: dict) -> bool:
@@ -160,17 +213,25 @@ def _looks_like_forex_or_cfd(market: dict) -> bool:
     if base in FIAT_CURRENCY_CODES:
         return True
 
+    if _SYNTHETIC_UNDERLYING_RE.match(base):
+        return True
+
     return False
 
 
-async def get_usdt_futures_symbols(exchange: "ccxt.bingx") -> list[str]:
+async def get_usdt_futures_symbols(market_exchange: "ccxt.bingx") -> list[str]:
     """
     Solo pares de futuros perpetuos CRIPTO (swap) con quote/settle en
-    USDT. Descarta explícitamente el "Standard Futures" de BingX (forex,
-    índices, commodities), que usa los mismos flags swap/linear/USDT que
-    los futuros cripto reales -- ver _looks_like_forex_or_cfd().
+    USDT. Descarta explícitamente TODO el "Standard Futures" de BingX
+    (forex, índices, commodities, acciones sintéticas), que usa los
+    mismos flags swap/linear/USDT que los futuros cripto reales -- ver
+    _looks_like_forex_or_cfd().
+
+    Se consulta siempre en `market_exchange` (mercado real) -- este
+    universo de símbolos es la base de TODO el script (Paso 1 y Pasos
+    2-14 por igual).
     """
-    markets = await exchange.load_markets()
+    markets = await market_exchange.load_markets()
 
     symbols = []
     excluded_non_crypto = []
@@ -192,7 +253,7 @@ async def get_usdt_futures_symbols(exchange: "ccxt.bingx") -> list[str]:
     log.info("Pares de futuros USDT-M cripto detectados: %d", len(symbols))
     if excluded_non_crypto:
         log.warning(
-            "Excluidos %d símbolos no-cripto (forex/CFD/índices/commodities), ej: %s",
+            "Excluidos %d símbolos no-cripto (forex/CFD/índices/commodities/acciones sintéticas), ej: %s",
             len(excluded_non_crypto), excluded_non_crypto[:5],
         )
     return symbols
@@ -202,6 +263,11 @@ async def get_usdt_futures_symbols(exchange: "ccxt.bingx") -> list[str]:
 # PASO 1: gestión de Take Profit en posiciones abiertas
 # ----------------------------------------------------------------------
 async def get_open_positions(exchange: "ccxt.bingx", allowed_symbols: set[str]) -> list[dict]:
+    """
+    Lee posiciones: acción de CUENTA, siempre en `exchange` (demo o
+    real según BINGX_DEMO). `allowed_symbols` viene del universo de
+    mercado real (ver get_usdt_futures_symbols).
+    """
     positions = await exchange.fetch_positions()
 
     open_positions = []
@@ -302,9 +368,16 @@ async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, 
     if await _symbol_has_open_order(exchange, symbol, "TAKE_PROFIT_MARKET", position_side):
         log.info("%s: ya existe un Take Profit abierto para %s, se omite (evita duplicados).", symbol, position_side)
     else:
+        # BUG CORREGIDO: BingX rechazaba TODAS las órdenes de TP/SL con
+        #   {"code":109400,"msg":"In the Hedge mode, the 'ReduceOnly'
+        #   field can not be filled."}
+        # En Hedge Mode, `positionSide` (LONG/SHORT) ya identifica sin
+        # ambigüedad que la orden cierra esa posición (vender contra un
+        # SHORT, comprar contra un LONG) -- BingX no solo no necesita
+        # `reduceOnly` en este modo, sino que lo PROHÍBE explícitamente
+        # si se envía. Se quita el parámetro por completo.
         tp_params = {
             "stopPrice": tp_price,
-            "reduceOnly": True,
             "positionSide": position_side,
             "workingType": "CONTRACT_PRICE",  # precio último, no precio de marca
         }
@@ -328,9 +401,10 @@ async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, 
         log.info("%s: ya existe un Stop Loss abierto para %s, se omite (evita duplicados).", symbol, position_side)
         return
 
+    # BUG CORREGIDO: mismo motivo que el Take Profit -- se quita
+    # `reduceOnly`, prohibido por BingX en Hedge Mode (error 109400).
     sl_params = {
         "stopPrice": float(entry_price),
-        "reduceOnly": True,
         "positionSide": position_side,
         "workingType": "CONTRACT_PRICE",  # precio último, no precio de marca
     }
@@ -347,6 +421,16 @@ async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, 
 
 
 async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
+    """
+    PASO 1: a diferencia de los Pasos 2-14, este paso lee el mercado
+    SEGÚN LA VARIABLE DE ENTORNO BINGX_DEMO -- usa siempre `exchange`
+    (la misma conexión de cuenta con la que se leyó `position` y donde
+    se colocan las órdenes de TP/SL), nunca la conexión de mercado
+    forzada a real. Motivo: el TP/SL se coloca sobre una posición que
+    vive en esa cuenta específica (demo o real), así que el toque de
+    EMA50 y el valor de EMA200 deben calcularse con los mismos precios
+    que esa cuenta está viendo.
+    """
     symbol = position["symbol"]
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_LIMIT_TP)
@@ -416,6 +500,12 @@ async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]
 # ese apalancamiento (nunca se reduce el apalancamiento para poder
 # meter más margen). Ver el comentario de cabecera de execute_entry()
 # para el detalle completo.
+#
+# NOTA sobre demo/real: a partir de aquí (Paso 13-14) es DONDE
+# corresponde usar `exchange` (cuenta demo o real según BINGX_DEMO) en
+# vez de `market_exchange` -- el apalancamiento máximo del par, el
+# balance disponible y la propia orden dependen de la cuenta que va a
+# operar, no del mercado en abstracto.
 # ----------------------------------------------------------------------
 
 
@@ -561,6 +651,12 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     Por eso el apalancamiento no puede calcularse antes (en
     strategy_entries.evaluate_symbol) -- se necesita el precio en vivo
     de este instante para saber cuál de las dos distancias aplica.
+
+    `exchange` aquí es la cuenta demo/real (según BINGX_DEMO): el
+    precio "en vivo" que decide mercado vs. STOP, el apalancamiento
+    máximo del par, el balance y la orden final se consultan/ejecutan
+    todos contra esta misma cuenta, para que el precio de referencia y
+    la ejecución real estén siempre alineados.
     """
     symbol = plan["symbol"]
     max_high_5m = plan["max_high_5m"]
@@ -569,13 +665,14 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     # Defensa en profundidad: aunque get_usdt_futures_symbols() ya
     # filtra el universo de símbolos antes de escanear, se revalida acá
     # justo antes de ejecutar la orden real. Así, si algún día un
-    # símbolo forex/CFD/índice se cuela por otra ruta (caché de
-    # mercados desactualizado, símbolo pasado manualmente, etc.),
-    # nunca se llega a abrir la posición.
+    # símbolo forex/CFD/índice/acción sintética se cuela por otra ruta
+    # (caché de mercados desactualizado, símbolo pasado manualmente,
+    # etc.), nunca se llega a abrir la posición.
     market = exchange.markets.get(symbol, {})
     if _looks_like_forex_or_cfd(market):
         log.error(
-            "%s: BLOQUEADO -- parece ser forex/CFD/índice, no un futuro perpetuo cripto. No se ejecuta la entrada.",
+            "%s: BLOQUEADO -- parece ser forex/CFD/índice/acción sintética, no un futuro perpetuo cripto. "
+            "No se ejecuta la entrada.",
             symbol,
         )
         return
@@ -584,7 +681,9 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         # Un solo fetch del precio en vivo: se usa TANTO para decidir
         # el tipo de entrada (Paso 14) COMO para elegir la distancia
         # correcta en el cálculo de apalancamiento (Paso 13), así
-        # ambos quedan basados exactamente en el mismo precio.
+        # ambos quedan basados exactamente en el mismo precio. Se
+        # consulta en `exchange` (demo/real) porque es el precio al que
+        # esa cuenta específica va a ejecutar la orden.
         ticker = await exchange.fetch_ticker(symbol)
         last_price = ticker.get("last")
         if last_price is None:
@@ -714,18 +813,19 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
 
 async def run_pasos_2_a_14_entradas(
     exchange: "ccxt.bingx",
+    market_exchange: "ccxt.bingx",
     allowed_symbols: set[str],
     symbols_with_position: set[str],
-    volume_exchange: "ccxt.bingx",
 ) -> None:
     """
     Escanea todos los pares permitidos que NO tengan ya una posición
     abierta, evaluando la cascada completa de pasos 2-14.
 
-    `volume_exchange` se pasa hasta el Paso 9 (ver
-    strategy_entries.check_step_9_volume) para que el filtro de volumen
-    24h siempre consulte el mercado REAL, sin importar si `exchange`
-    está en modo demo (sandbox) o real.
+    TODO el escaneo (Pasos 2-12: velas, indicadores, volumen) se hace
+    contra `market_exchange` (mercado SIEMPRE real). Solo al final,
+    para los símbolos que pasaron todos los filtros, `execute_entry()`
+    usa `exchange` (cuenta demo/real) para el precio en vivo, el
+    apalancamiento, el margen y la orden.
     """
     candidatos = [s for s in allowed_symbols if s not in symbols_with_position]
     log.info("[Pasos 2-14] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
@@ -734,7 +834,7 @@ async def run_pasos_2_a_14_entradas(
 
     async def _bounded_eval(symbol):
         async with semaphore:
-            return await strat.evaluate_symbol(exchange, symbol, volume_exchange=volume_exchange)
+            return await strat.evaluate_symbol(market_exchange, symbol)
 
     results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
     plans = [plan for plan, _failed_step in results if plan is not None]
@@ -816,34 +916,49 @@ def _get_bot_mode() -> str:
 async def main() -> None:
     exchange = build_exchange()
     demo_mode = _env_flag("BINGX_DEMO", "false")
-    volume_exchange = build_volume_exchange(exchange, demo_mode)
+    market_exchange = build_market_data_exchange(exchange, demo_mode)
     mode = _get_bot_mode()
     log.info("Modo de ejecución: %s", mode)
     try:
+        # `exchange` también necesita sus propios mercados cargados
+        # (aunque el universo de símbolos válidos salga de
+        # `market_exchange`) porque set_leverage/set_margin_mode/
+        # create_order y la revalidación anti-forex de execute_entry
+        # leen de exchange.markets.
+        await exchange.load_markets()
         await ensure_hedge_mode(exchange)
-        allowed_symbols = set(await get_usdt_futures_symbols(exchange))
+
+        # Universo de símbolos: SIEMPRE contra el mercado real, para
+        # todo el script (Paso 1 y Pasos 2-14 por igual).
+        allowed_symbols = set(await get_usdt_futures_symbols(market_exchange))
+
+        # Posiciones abiertas: acción de cuenta (demo/real).
         open_positions = await get_open_positions(exchange, allowed_symbols)
         symbols_with_position = {p["symbol"] for p in open_positions}
 
         if mode == "tp_only":
             # Solo Paso 1: gestión de TP/SL sobre posiciones ya
-            # abiertas. No toca el escáner de entradas (Pasos 2-14).
+            # abiertas. Lee las velas 1h de `exchange` (demo/real según
+            # BINGX_DEMO) -- ver process_position_tp(). No toca el
+            # escáner de entradas (Pasos 2-14).
             await run_paso1_gestion_tp(exchange, allowed_symbols)
         else:
-            # Modo completo: Paso 1 (gestión de TP) y Pasos 2-14
-            # (búsqueda de nuevas entradas) corren de forma concurrente.
+            # Modo completo: Paso 1 (gestión de TP, lee de `exchange`
+            # -- demo/real) y Pasos 2-14 (búsqueda de nuevas entradas,
+            # leen de `market_exchange` -- siempre real) corren de
+            # forma concurrente.
             await asyncio.gather(
                 run_paso1_gestion_tp(exchange, allowed_symbols),
-                run_pasos_2_a_14_entradas(exchange, allowed_symbols, symbols_with_position, volume_exchange),
+                run_pasos_2_a_14_entradas(exchange, market_exchange, allowed_symbols, symbols_with_position),
             )
 
     finally:
         await exchange.close()
-        # Solo cerrar volume_exchange si es una conexión DISTINTA a
-        # `exchange` (en modo real, build_volume_exchange() devuelve la
-        # misma instancia, que ya se cerró arriba).
-        if volume_exchange is not exchange:
-            await volume_exchange.close()
+        # Solo cerrar market_exchange si es una conexión DISTINTA a
+        # `exchange` (en modo real, build_market_data_exchange()
+        # devuelve la misma instancia, que ya se cerró arriba).
+        if market_exchange is not exchange:
+            await market_exchange.close()
 
 
 if __name__ == "__main__":
