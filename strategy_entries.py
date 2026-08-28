@@ -442,15 +442,21 @@ async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_li
 
 
 # ----------------------------------------------------------------------
-# Paso 10: patrón SMA20/EMA50/EMA200 en TEMPORALIDAD 4H.
+# Paso 10: patrón SMA20/EMA50 en TEMPORALIDAD 4H.
 #
-# PATRÓN EXACTO (confirmado con el usuario a partir de capturas reales
-# del gráfico de BingX en 4h -- MUSDT, SPACEUSDT, EULUSDT):
+# PATRÓN VIGENTE (ajustado a partir de capturas reales del gráfico de
+# BingX en 4h -- ETHFIUSDT y SPACEUSDT, con la EMA50 y/o la SMA20 ya
+# por encima o cruzando la EMA200):
 #   - SMA20(4h) > EMA50(4h)
-#   - Y AMBAS (SMA20 y EMA50) están por DEBAJO de la EMA200(4h)
-# Si la SMA20 está por encima de la EMA50 pero alguna de las dos (o las
-# dos) ya cruzó por encima de la EMA200, el patrón buscado ya no aplica
-# y el símbolo se descarta -- no basta con el cruce SMA20/EMA50 solo.
+# Ya NO se exige ninguna relación de la SMA20/EMA50 con la EMA200(4h)
+# (ni "ambas por debajo" ni ninguna otra condición). El requisito
+# anterior (ambas por debajo de la EMA200) resultó ser demasiado
+# estricto: descartaba rounds alcistas válidos donde el precio ya había
+# recorrido tanto camino en 4h que la EMA50 y/o la SMA20 alcanzaron o
+# superaron la EMA200, aunque el cruce SMA20>EMA50 seguía siendo una
+# señal de tendencia válida. La EMA200(4h) se sigue calculando (queda
+# disponible en el log de diagnóstico) pero ya no participa en la
+# decisión de aprobar o descartar el símbolo.
 #
 # Se pide un histórico fijo de OHLCV_LIMIT_4H (1200 velas de 4h, ~200
 # días) en una sola petición -- el mismo criterio que ya se usa para
@@ -463,11 +469,11 @@ async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
     FUNCIÓN INDEPENDIENTE para el Paso 10: descarta la vela de 4h en
     formación (igual que el resto del bot, solo se evalúan velas
     cerradas) y valida que, en la última vela 4h cerrada:
-      1) SMA20(4h) > EMA50(4h)
-      2) SMA20(4h) < EMA200(4h) y EMA50(4h) < EMA200(4h) (ambas por
-         debajo de la EMA200, no solo una de las dos)
-    Ambas condiciones deben cumplirse a la vez; si falla cualquiera de
-    las dos, se descarta el símbolo.
+      SMA20(4h) > EMA50(4h)
+    Es la ÚNICA condición del paso. La EMA200(4h) se calcula solo para
+    fines de diagnóstico/log -- no participa en la decisión de aprobar
+    o descartar el símbolo (ver el comentario de cabecera de esta
+    sección para el motivo del cambio).
     """
     # Se pide OHLCV_LIMIT_4H + 1 velas CRUDAS (1201): la última siempre
     # está en formación y se descarta más abajo, así que para terminar
@@ -496,7 +502,9 @@ async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
 
     # La EMA200 necesita bastante más "calentamiento" que la SMA20/EMA50
     # para converger de forma estable -- se exige un mínimo más alto que
-    # antes (60) para no evaluar la EMA200 con muy poco historial.
+    # antes (60) para no evaluar la EMA200 con muy poco historial. Se
+    # sigue exigiendo este mínimo aunque la EMA200 ya no decida el paso,
+    # porque se calcula igual para el log de diagnóstico.
     if len(closed_4h) < 210:
         return False, {
             "reason": "[Paso 10] Datos insuficientes en 4h (< 210 velas cerradas) para calcular SMA20/EMA50/EMA200",
@@ -512,15 +520,16 @@ async def check_step_10_sma20_above_ema50_4h(exchange, symbol: str):
     ema50_value = float(ema50_4h.iloc[-1])
     ema200_value = float(ema200_4h.iloc[-1])
 
+    # ÚNICA condición del Paso 10: SMA20(4h) > EMA50(4h). La relación de
+    # cualquiera de las dos con la EMA200(4h) ya NO se evalúa -- ver el
+    # comentario de cabecera de esta sección.
     sma20_above_ema50 = sma20_value > ema50_value
-    both_below_ema200 = sma20_value < ema200_value and ema50_value < ema200_value
 
-    if not (sma20_above_ema50 and both_below_ema200):
+    if not sma20_above_ema50:
         return False, {
             "reason": (
-                f"[Paso 10] Patrón no cumplido en 4h -- SMA20={sma20_value:.8f}, "
-                f"EMA50={ema50_value:.8f}, EMA200={ema200_value:.8f} "
-                f"(SMA20>EMA50={sma20_above_ema50}, ambas<EMA200={both_below_ema200})"
+                f"[Paso 10] Patrón no cumplido en 4h -- SMA20={sma20_value:.8f} no está por encima de "
+                f"EMA50={ema50_value:.8f} (EMA200={ema200_value:.8f}, informativa, no decide el paso)"
             ),
             "failed_step": 10,
         }
@@ -903,7 +912,7 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en %s", symbol, info10["reason"])
             return None, 10
         log.info(
-            "%s aprobó [Paso 10]: SMA20(4h)=%.8f > EMA50(4h)=%.8f, ambas < EMA200(4h)=%.8f",
+            "%s aprobó [Paso 10]: SMA20(4h)=%.8f > EMA50(4h)=%.8f (EMA200(4h)=%.8f, informativa)",
             symbol, info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
         )
 
