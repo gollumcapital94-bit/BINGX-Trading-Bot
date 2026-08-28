@@ -21,7 +21,7 @@ Para cada par SIN posición abierta:
 | 6 | El máximo en 5m debe estar en vela roja y coincidir con el máximo de 1h |
 | 7-8 | W%R6, W%R12, W%R24 de esa vela roja son todos distintos entre sí (15m y 5m) |
 | 9 | Volumen 24h > 2,000,000 USDT (siempre del mercado real, ver más abajo) |
-| 10 | SMA20 por encima de la EMA50, en temporalidad 4h (histórico fijo de 1200 velas, mismo criterio que 1h) |
+| 10 | SMA20 por encima de la EMA50, en temporalidad 4h (histórico fijo de 1200 velas). La EMA200(4h) ya NO participa en este filtro — ver detalle más abajo |
 | 11-12 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 11) y/o 5m (paso 12) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/|r| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
 | 13 | Apalancamiento = 80% ÷ (% de distancia). La distancia usa la SMA20(5m) si la entrada es STOP, o el precio actual si es a mercado (ver detalle más abajo), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
 | 14 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
@@ -34,7 +34,7 @@ Todas las posiciones se abren en margen aislado, en corto (short).
 - "Máximo" del round / de 15m / de 5m = el high (mecha) de la vela, no el cierre.
 - El apalancamiento calculado se limita al máximo que permite BingX para ese par cuando el cálculo da un valor mayor.
 - El margen total de la cuenta (Paso 13) se calcula como margen libre + margen ya usado en otras operaciones abiertas, no solo el saldo libre.
-- El Paso 10 (SMA20 vs EMA50 en 4h) se evalúa solo sobre la última vela 4h ya cerrada, con un histórico fijo de 1200 velas (mismo criterio de "calentamiento" que se usa para la EMA50/EMA200 en 1h).
+- El Paso 10 (SMA20 vs EMA50 en 4h) se evalúa solo sobre la última vela 4h ya cerrada, con un histórico fijo de 1200 velas (mismo criterio de "calentamiento" que se usa para la EMA50/EMA200 en 1h). Su única condición es SMA20(4h) > EMA50(4h); no depende de la relación de ninguna de las dos con la EMA200(4h) — ver el cambio detallado más abajo.
 
 ## Configuración
 
@@ -157,6 +157,20 @@ También se agregaron dos logs que antes no existían:
 - Un log de diagnóstico muestra cuántas velas de 4h devolvió realmente BingX frente a las 1200 solicitadas, para descartar que la API esté truncando el histórico silenciosamente.
 
 Si en algún momento el resumen muestra que el 100% de los candidatos se cae en un mismo paso (por ejemplo, "Paso 10: 400" cuando había 400 candidatos), eso es una señal fuerte de revisar ese paso específico — ya sea porque el filtro es legítimamente muy estricto para las condiciones actuales del mercado, o porque hay un problema real que vale la pena investigar con esos números en la mano.
+
+## 🔧 Cambio de lógica: Paso 10 simplificado (ya no exige relación con la EMA200 en 4h)
+
+**Antes**, el Paso 10 exigía DOS condiciones a la vez en la última vela 4h cerrada:
+1. SMA20(4h) > EMA50(4h)
+2. Y ADEMÁS, ambas (SMA20 y EMA50) por DEBAJO de la EMA200(4h)
+
+En la práctica, ese segundo requisito resultó ser demasiado estricto: se confirmó con capturas reales del gráfico de BingX en 4h (ETHFIUSDT y SPACEUSDT) que, en rounds alcistas donde el precio ya recorrió bastante camino, la EMA50 y/o la SMA20 pueden alcanzar o incluso cruzar por encima de la EMA200 mientras la SMA20 se mantiene por encima de la EMA50 — es decir, la señal de tendencia (SMA20 > EMA50) seguía siendo válida, pero el filtro la descartaba igual solo por la posición relativa con la EMA200.
+
+**Ahora**, el Paso 10 valida una única condición:
+
+- SMA20(4h) > EMA50(4h)
+
+La EMA200(4h) se sigue calculando y se sigue mostrando en los logs de diagnóstico (aprobación y descarte), pero ya **no** participa en la decisión de aprobar o descartar el símbolo. El histórico fijo de 1200 velas de 4h (con el mínimo de 210 velas cerradas para el cálculo) no cambia, porque la EMA200 se sigue necesitando para el log informativo.
 
 ## 🐛 Bug corregido: entradas en pares de forex y acciones sintéticas (NCFX / NCSK)
 
