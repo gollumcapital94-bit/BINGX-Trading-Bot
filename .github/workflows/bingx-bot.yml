@@ -1,5 +1,13 @@
 name: BingX Trading Bot - Pasos 1 a 14
 
+# IMPORTANTE: se necesita permiso de escritura en el repo (contents: write)
+# para que el paso final pueda hacer commit y push de long_candidates.json.
+# El runner de GitHub Actions es efímero -- si este archivo cambia durante
+# la corrida (se agrega o se borra un candidato a largo) y no se guarda de
+# vuelta en el repositorio, esa "memoria" se pierde en la siguiente corrida.
+permissions:
+  contents: write
+
 on:
   repository_dispatch:
     types: [bingx-trigger]
@@ -71,11 +79,31 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|Short STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even colocado" bot_output.log > signals.txt || true
+          grep -E "Market entry executed|Short STOP-LIMIT order placed|STOP-LIMIT buy order placed|Take Profit colocado|Take Profit \(long\) colocado|Stop Loss en break even colocado" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
               --data-urlencode "text=📊 BingX Bot:
           ${MSG}"
+          fi
+
+      - name: Guardar memoria de candidatos a largo (long_candidates.json)
+        if: always()
+        # El runner es efímero: si esta corrida agregó, invalidó o
+        # ejecutó algún candidato a largo, long_candidates.json cambió
+        # en el checkout local pero NO en el repositorio remoto. Este
+        # paso hace commit y push de ese cambio para que la próxima
+        # corrida (sea el cron interno cada hora o el disparador
+        # externo) siga viendo la memoria actualizada. Si no hubo
+        # cambios, "git diff --quiet" evita crear un commit vacío.
+        run: |
+          git config user.name "bingx-bot"
+          git config user.email "bingx-bot@users.noreply.github.com"
+          if ! git diff --quiet -- long_candidates.json; then
+            git add long_candidates.json
+            git commit -m "chore: actualizar memoria de candidatos a largo [skip ci]"
+            git push
+          else
+            echo "long_candidates.json sin cambios, no se hace commit."
           fi
