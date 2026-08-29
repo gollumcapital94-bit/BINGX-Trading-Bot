@@ -43,6 +43,7 @@ Sube estos archivos a tu repositorio manteniendo la estructura:
 - `bingx_bot.py`
 - `strategy_entries.py`
 - `indicators.py`
+- `long_candidates.py`
 - `requirements.txt`
 - `.github/workflows/bingx-bot.yml`
 
@@ -115,7 +116,7 @@ Causa: el bot enviaba el parámetro `reduceOnly: true` junto con `positionSide` 
 
 Además del disparador externo (cronjob.org → `repository_dispatch`, que corre el bot **completo**: Paso 1 + Pasos 2-14), el workflow incluye un cron **interno** de GitHub Actions que corre **cada hora** (`0 * * * *`) usando `schedule`, en sintonía con el timeframe 1h del Paso 1.
 
-Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit / Stop Loss sobre posiciones ya abiertas). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada.
+Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit / Stop Loss sobre posiciones ya abiertas). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14) **ni revisa la memoria de candidatos a largo** (`long_candidates.json`), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada.
 
 El filtro de "solo futuros perpetuos cripto con USDT como referencia" (ver más abajo) es **una única función**, compartida por todo el script — se aplica igual sin importar qué disparador o `BOT_MODE` esté corriendo, tanto al Paso 1 como a los Pasos 2-14.
 
@@ -124,8 +125,10 @@ En resumen:
 | Disparador | `BOT_MODE` | Qué corre |
 |---|---|---|
 | `schedule` (cron interno de GitHub, cada hora) | `tp_only` | Solo Paso 1 (TP/SL) |
-| `repository_dispatch` (cronjob.org) | `full` | Paso 1 + Pasos 2-14 (TP/SL y nuevas entradas) |
-| `workflow_dispatch` (manual) | `full` | Paso 1 + Pasos 2-14 (TP/SL y nuevas entradas) |
+| `repository_dispatch` (cronjob.org) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) + escaneo de candidatos a largo (`long_candidates.json`) |
+| `workflow_dispatch` (manual) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) + escaneo de candidatos a largo (`long_candidates.json`) |
+
+**Nota sobre la rama de largos:** el escaneo de `long_candidates.json` (búsqueda del cruce SMA20/EMA50 en 5m, ver más abajo) corre **solo** en modo `full` — es decir, únicamente con el disparador externo de cronjob.org o de forma manual, nunca con el cron interno de GitHub. Motivo: cronjob.org es extremadamente puntual en sus ejecuciones, y esta estrategia necesita esa puntualidad para no perderse el momento del cruce en 5m.
 
 Si quieres cambiar la frecuencia del cron interno, ajusta la línea `cron: "0 * * * *"` en `.github/workflows/bingx-bot.yml` (formato estándar de cron; GitHub Actions no garantiza precisión exacta al minuto en horarios de alta demanda).
 
@@ -177,6 +180,55 @@ La EMA200(4h) se sigue calculando y se sigue mostrando en los logs de diagnósti
 En producción el bot llegó a incluir en su universo de símbolos pares como `NCFXCAD2JPY/USDT:USDT` y `NCFXEURSGD2USD/USDT:USDT` (CAD/JPY y EUR/SGD, forex), y más adelante también `NCSKAPP2USD/USDT:USDT` y `NCSKBRKB2USD/USDT:USDT` (acciones sintéticas de AppLovin y Berkshire Hathaway B "contra USD") — es decir, en el producto "Standard Futures" de BingX (forex, acciones sintéticas, índices, commodities), no en futuros perpetuos cripto. Causa: ese producto usa exactamente los mismos flags `swap=True` / `linear=True` / `quote=USDT` / `settle=USDT` que ccxt reporta para los futuros cripto reales, así que el filtro original no los distinguía, y el primer fix (que solo buscaba el prefijo `NCFX`) no cubría el nuevo subtipo `NCSK`.
 
 Se corrigió generalizando el filtro con dos señales independientes: (1) el prefijo del id se amplió de `NCFX` a `NC`, cubriendo cualquier subtipo de este producto, actual o futuro; y (2) independientemente del prefijo, se descarta cualquier símbolo cuya moneda base siga el patrón `SUBYACENTE2REFERENCIA` (por ejemplo `EUR2USD`, `APP2USD`, `BRKB2USD`) o sea directamente una divisa fiat (CAD, EUR, JPY, etc.) — ningún futuro perpetuo cripto real usa ese patrón de nombre ni tiene una fiat como base. Esta función (`_looks_like_forex_or_cfd`) es **una sola** y se usa para construir el universo de símbolos del bot completo (Pasos 1 a 14), además de una segunda verificación justo antes de ejecutar la orden como defensa adicional.
+
+## 🆕 Rama de entradas en LARGO (Paso 10-B): patrón espejo del Paso 10
+
+Además de la estrategia en corto ya descrita, el bot detecta también su patrón **espejo** para entradas en **largo**. Los Pasos 2 a 9 son exactamente los mismos para todos los símbolos; el **Paso 10** ahora bifurca en tres caminos posibles:
+
+| Condición en 4h | Dirección |
+|---|---|
+| SMA20(4h) > EMA50(4h) | **SHORT** (patrón original, sin cambios — Pasos 11-14 tal como se describieron arriba) |
+| SMA20(4h) < EMA50(4h) **y** ambas < EMA200(4h) | **LONG** (espejo, Paso 10-B) |
+| Ninguna de las dos anteriores | Se descarta el símbolo por completo |
+
+Si el símbolo cae en el camino LONG, se le calcula la **misma fórmula de singularidad** (S = ln(2k) - 1, Pasos 11-12, sin ningún cambio en el cálculo) usando los mismos datos de 15m/5m. Si aprueba, en vez de ejecutarse de inmediato **se guarda como candidato en `long_candidates.json`** — una lista que actúa como "memoria" persistente del bot, ya que las entradas en largo dependen de un patrón que puede tardar horas en aparecer en 5m.
+
+### Patrón de entrada para los candidatos guardados
+
+**Importante:** a diferencia del Paso 1, esta revisión **NO** corre en el cron interno de GitHub (`schedule`, `BOT_MODE=tp_only`) — corre **únicamente** cuando el bot se dispara en modo `full`, es decir, desde el cron **externo** configurado en cronjob.org (`repository_dispatch`) o de forma manual (`workflow_dispatch`). El cron externo es extremadamente puntual, y esta estrategia depende de esa puntualidad para no perderse el momento exacto del cruce en 5m; el cron interno de GitHub Actions no la garantiza y queda reservado exclusivamente al Paso 1 (TP/SL).
+
+Cada corrida en modo `full` revisa `long_candidates.json` buscando, en temporalidad 5m:
+
+- **SMA20(5m) cruza de ARRIBA hacia ABAJO la EMA50(5m).**
+
+Antes de aceptar ese cruce como válido, se verifica que el precio **no haya roto por encima** el `max_high_5m` original (el mismo máximo del round que dio origen a la singularidad) — si ya lo rompió, la señal se invalida y el candidato se elimina de la memoria sin abrir ninguna orden.
+
+Si el cruce es válido:
+
+- Si el precio en vivo está **por debajo** de la SMA20(5m) del cruce → orden **STOP LIMIT de compra**, esperando a que el precio suba y la cruce.
+- Si el precio en vivo está **por encima** → entrada **a mercado**.
+
+**Apalancamiento** = 80% ÷ distancia%, donde la distancia (en porcentaje, igual que en cualquier gráfico de velas) se mide desde la **SMA20(5m) en el momento exacto del cruce** hasta la **EMA200(5m)** en ese mismo instante. Redondeado a múltiplos de 5 y limitado al máximo de BingX, igual que en el camino short.
+
+**Margen**: mismo criterio que en corto — el 10% del margen total de la cuenta, o el máximo que permite ese apalancamiento, lo que sea menor.
+
+### Take Profit único (sin Stop Loss)
+
+A diferencia del camino en corto, las entradas en largo **solo colocan Take Profit — nunca Stop Loss**. La distancia se mide, en porcentaje, desde el precio de entrada hasta la **EMA200(1h) en vivo** (recalculada en el momento exacto de la ejecución, no un valor congelado de cuando el candidato entró a la memoria):
+
+```
+distancia_pct = (precio_entrada - EMA200(1h)) / precio_entrada × 100
+TP = precio_entrada × (1 + (apalancamiento × distancia_pct) / 100)
+```
+
+### Memoria persistente (`long_candidates.json`) y GitHub Actions
+
+Como el patrón de entrada puede tardar horas en aparecer, los candidatos se guardan en `long_candidates.json` en la raíz del repositorio. Cada candidato se elimina de esa lista en cuanto:
+
+- Se ejecuta su orden de entrada (a mercado o STOP), o
+- Se invalida porque el precio rompió el máximo original.
+
+**Importante:** el runner de GitHub Actions es efímero — cualquier cambio a este archivo durante una corrida (agregar, invalidar o ejecutar un candidato) se pierde a menos que se guarde de vuelta en el repositorio. Por eso el workflow (`.github/workflows/bingx-bot.yml`) incluye un paso final que hace `git commit` y `git push` de `long_candidates.json` si cambió durante la ejecución. Esto requiere el permiso `contents: write`, ya configurado en el workflow.
 
 ## ⚠️ Advertencias importantes
 
