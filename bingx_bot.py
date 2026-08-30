@@ -355,12 +355,13 @@ async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, 
     o en el pasado -- ver _find_first_ema_touch). Coloca DOS órdenes,
     cada una SOLO si todavía no existe una abierta del mismo tipo para
     evitar duplicados en corridas sucesivas del cron:
-      - Take Profit en la EMA200(1h).
-      - Stop Loss en BREAK EVEN (al precio de entrada de la posición),
-        para proteger la operación sin arriesgar pérdida.
-    Ambas órdenes usan precio ÚLTIMO (workingType=CONTRACT_PRICE), no
-    precio de marca, para asegurar que se ejecuten y cierren la
-    operación correctamente.
+      - Take Profit en la EMA200(1h) -- tipo TAKE_PROFIT_MARKET, sin
+        cambios.
+      - Stop Loss en BREAK EVEN EXACTO (al precio de entrada de la
+        posición) -- ver el comentario "BUG CORREGIDO" más abajo sobre
+        por qué usa tipo STOP (límite) y no STOP_MARKET.
+    Ambas usan precio ÚLTIMO como referencia de disparo
+    (workingType=CONTRACT_PRICE), no precio de marca.
     """
     symbol = position["symbol"]
     side = position.get("side")  # 'long' o 'short'
@@ -402,17 +403,34 @@ async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, 
         except Exception as exc:
             log.error("Error colocando Take Profit para %s: %s", symbol, exc)
 
-    # ---- Stop Loss en BREAK EVEN (precio de entrada) ----
+    # ---- Stop Loss en BREAK EVEN EXACTO (precio de entrada) ----
     if entry_price is None:
         log.warning("%s: no se pudo obtener el precio de entrada, se omite el Stop Loss en break even.", symbol)
         return
 
-    if await _symbol_has_open_order(exchange, symbol, "STOP_MARKET", position_side):
+    if await _symbol_has_open_order(exchange, symbol, "STOP", position_side):
         log.info("%s: ya existe un Stop Loss abierto para %s, se omite (evita duplicados).", symbol, position_side)
         return
 
-    # BUG CORREGIDO: mismo motivo que el Take Profit -- se quita
-    # `reduceOnly`, prohibido por BingX en Hedge Mode (error 109400).
+    # BUG CORREGIDO: visto en producción -- con STOP_MARKET (tipo usado
+    # antes), una vez que el precio ÚLTIMO toca stopPrice=entry_price
+    # (el disparo), la orden se convierte en una orden A MERCADO, cuya
+    # ejecución NO está garantizada exactamente en ese precio. En un
+    # caso real (TAUSDT, 45x) el precio se movió apenas ~0.9% de más
+    # entre el disparo y el llenado real -- pero con 45x de
+    # apalancamiento, ese pequeño slippage se amplificó a una pérdida
+    # de -40.67% sobre el margen, muy lejos de "break even".
+    #
+    # Se corrige usando el tipo "STOP" (límite) en vez de "STOP_MARKET":
+    # se dispara igual con stopPrice=entry_price (workingType=
+    # CONTRACT_PRICE, precio último), pero el `price` límite de la
+    # orden TAMBIÉN se fija en entry_price -- BingX solo puede llenarla
+    # exactamente ahí, nunca peor. Trade-off aceptado (confirmado con
+    # el usuario): si el precio salta de golpe más allá de entry_price
+    # en una sola vela (gap), esta orden puede quedar sin ejecutarse y
+    # la posición sigue abierta sin protección hasta que el precio
+    # regrese a ese nivel exacto -- se prioriza "nunca peor que break
+    # even" sobre "siempre se cierra".
     sl_params = {
         "stopPrice": float(entry_price),
         "positionSide": position_side,
@@ -420,10 +438,10 @@ async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, 
     }
     try:
         sl_order = await exchange.create_order(
-            symbol, "STOP_MARKET", close_order_side, amount, None, sl_params,
+            symbol, "STOP", close_order_side, amount, float(entry_price), sl_params,
         )
         log.info(
-            "Stop Loss en break even colocado: %s | lado posición=%s | SL=%.6f | orden_id=%s",
+            "Stop Loss en break even EXACTO colocado: %s | lado posición=%s | SL=%.6f (límite, sin slippage) | orden_id=%s",
             symbol, side, float(entry_price), sl_order.get("id"),
         )
     except Exception as exc:
