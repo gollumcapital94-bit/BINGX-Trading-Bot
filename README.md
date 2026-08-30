@@ -112,6 +112,16 @@ bingx {"code":109400,"msg":"In the Hedge mode, the 'ReduceOnly' field can not be
 
 Causa: el bot enviaba el parámetro `reduceOnly: true` junto con `positionSide` en las órdenes de cierre. En Hedge Mode, `positionSide` (LONG/SHORT) ya identifica sin ambigüedad que la orden cierra esa posición — BingX no solo no necesita `reduceOnly` en este modo, sino que **lo prohíbe explícitamente** si se envía. Se corrigió quitando `reduceOnly` de los parámetros de ambas órdenes (Take Profit y Stop Loss); el resto de la lógica (verificación de duplicados, break even, `workingType=CONTRACT_PRICE`) no cambia.
 
+## 🐛 Bug corregido: el Stop Loss en break even cerraba con pérdida por slippage (STOP_MARKET → STOP)
+
+En producción se detectó un caso real (TAUSDT, 45x) donde el Stop Loss en break even se ejecutó con **-40.67% de pérdida sobre el margen**, en vez de cerrar en cero como se esperaba.
+
+Causa: el SL usaba el tipo de orden `STOP_MARKET`. Este tipo se dispara correctamente cuando el precio último toca `stopPrice=entry_price`, pero **una vez disparado se convierte en una orden A MERCADO**, cuya ejecución no está garantizada exactamente en ese precio — se llena al primer precio disponible, con el slippage que haya en ese instante. En el caso real, el precio solo se movió ~0.9% de más entre el disparo y el llenado (-40.67% ÷ 45x ≈ 0.9%) — pero con 45x de apalancamiento, ese pequeño slippage se amplificó a una pérdida grande sobre el margen.
+
+Se corrigió cambiando el tipo de orden de `STOP_MARKET` a **`STOP`** (límite): se sigue disparando con `stopPrice=entry_price` (`workingType=CONTRACT_PRICE`, precio último), pero ahora el **precio límite de la orden también se fija en `entry_price`** — BingX solo puede llenarla exactamente ahí, nunca peor.
+
+**Trade-off aceptado (confirmado con el usuario):** si el precio salta de golpe más allá del precio de entrada en una sola vela (gap fuerte, típico de pares con poca liquidez), esta orden puede quedar **sin ejecutarse**, y la posición seguiría abierta sin protección hasta que el precio regrese exactamente a ese nivel. Se prioriza "nunca cerrar peor que break even" sobre "siempre garantizar el cierre" — lo opuesto exacto del comportamiento anterior con `STOP_MARKET`.
+
 ## ⏱️ Cron interno de GitHub dedicado solo a TP/SL (evita entradas duplicadas)
 
 Además del disparador externo (cronjob.org → `repository_dispatch`, que corre el bot **completo**: Paso 1 + Pasos 2-14), el workflow incluye un cron **interno** de GitHub Actions que corre **cada hora** (`0 * * * *`) usando `schedule`, en sintonía con el timeframe 1h del Paso 1.
