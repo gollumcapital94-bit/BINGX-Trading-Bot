@@ -1,8 +1,15 @@
 """
 Bot de trading para BingX
 --------------------------
-PASO 1  -> Gestión de posiciones abiertas: coloca Take Profit en EMA200(1h)
-           cuando el precio ya tocó la EMA50(1h).
+PASO 1  -> Gestión de posiciones abiertas con DOS gatillos INDEPENDIENTES
+           en temporalidad 1h:
+             - Toque de SMA20(1h) -> coloca el Take Profit en la EMA200(1h).
+             - Toque de EMA50(1h) -> coloca el Stop Loss en break even
+               (precio de entrada exacto).
+           Cada gatillo se evalúa y se dispara por separado; uno puede
+           activarse sin que el otro lo haya hecho todavía (por ejemplo,
+           puede existir ya un Take Profit sin que exista aún el Stop
+           Loss, si el precio tocó la SMA20 pero todavía no la EMA50).
 PASOS 2-14 -> Escáner de nuevas entradas en corto, siguiendo la cascada
            completa de condiciones (round alcista, RSI6, W%R6/12/24,
            singularidad matemática, apalancamiento dinámico, etc.)
@@ -15,7 +22,9 @@ PASO 10-B / LARGOS -> Patrón espejo del Paso 10: cuando en 4h la SMA20
            archivo buscando el patrón de entrada espejo en 5m (SMA20
            cruzando de arriba hacia abajo la EMA50) -- ver
            run_long_candidates_scan() y strategy_entries.
-           scan_long_candidate_for_entry().
+           scan_long_candidate_for_entry(). Esta rama de LARGOS no fue
+           tocada por el ajuste del Paso 10 explicado abajo (ver
+           strategy_entries.py).
 
 LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO Y QUÉ NO:
     - Universo de símbolos válidos (crypto perpetuo USDT-M) y TODO el
@@ -60,15 +69,41 @@ logging.basicConfig(
 log = logging.getLogger("bingx_bot")
 
 # ----------------------------------------------------------------------
-# Configuración PASO 1 (gestión de TP)
+# Configuración PASO 1 (gestión de TP/SL)
 # ----------------------------------------------------------------------
 TIMEFRAME_TP = "1h"
-EMA_FAST = 50
-EMA_SLOW = 200
-# Se pide mucho más historial que EMA_SLOW+10 para que la EMA50/EMA200
-# converjan de forma similar a como las calcula BingX en su gráfico
-# (que usa todo el historial disponible del par desde su listado).
+SMA_TP_TRIGGER = 20   # toque de esta SMA(1h) dispara el Take Profit
+EMA_FAST = 50         # toque de esta EMA(1h) dispara el Stop Loss en break even
+EMA_SLOW = 200        # precio donde se coloca el Take Profit
+
+# Se pide mucho más historial que EMA_SLOW+10 para que la SMA20/EMA50/
+# EMA200 converjan de forma similar a como las calcula BingX en su
+# gráfico (que usa todo el historial disponible del par desde su
+# listado). OHLCV_LIMIT_TP es la cantidad de velas DENTRO de las que
+# de verdad se busca un toque (la "ventana de búsqueda").
 OHLCV_LIMIT_TP = 1000
+
+# BUG CORREGIDO (visto en producción: SXTUSDT). Antes se pedían
+# exactamente OHLCV_LIMIT_TP velas y se buscaba un toque en TODAS
+# ellas, desde la primera. El problema: la EMA de pandas
+# (series.ewm(...).mean()) se "siembra" con el primer cierre de la
+# ventana pedida y tarda varias decenas/centenas de velas en CONVERGER
+# al valor real (el que muestra el gráfico de BingX, calculado con
+# todo el historial del par desde su listado). Mientras no converge,
+# la EMA50/SMA20 calculadas pueden estar visiblemente "torcidas"
+# respecto al valor real -- y como _find_first_ema_touch() revisaba
+# TODO el historial pedido, un toque FALSO dentro de esas primeras
+# velas mal calentadas podía disparar el Take Profit o el Stop Loss
+# sin que el precio hubiera tocado de verdad la línea que se ve en el
+# gráfico de BingX.
+#
+# Se corrige pidiendo EMA_WARMUP_CANDLES velas EXTRA, ANTES de la
+# ventana de búsqueda: esas velas se usan para calcular la SMA20/EMA50/
+# EMA200 (así llegan ya convergidas al inicio de la ventana de
+# búsqueda), pero se DESCARTAN a la hora de buscar un toque -- nunca
+# cuentan como posible señal.
+EMA_WARMUP_CANDLES = 400
+OHLCV_FETCH_LIMIT_TP = OHLCV_LIMIT_TP + EMA_WARMUP_CANDLES  # 1400, bajo el máximo de 1440 por petición de BingX
 
 
 def _env_flag(name: str, default: str = "false") -> bool:
@@ -270,7 +305,7 @@ async def get_usdt_futures_symbols(market_exchange: "ccxt.bingx") -> list[str]:
 
 
 # ----------------------------------------------------------------------
-# PASO 1: gestión de Take Profit en posiciones abiertas
+# PASO 1: gestión de Take Profit y Stop Loss en posiciones abiertas
 # ----------------------------------------------------------------------
 async def get_open_positions(exchange: "ccxt.bingx", allowed_symbols: set[str]) -> list[dict]:
     """
@@ -295,26 +330,16 @@ async def get_open_positions(exchange: "ccxt.bingx", allowed_symbols: set[str]) 
     return open_positions
 
 
-# BUG CORREGIDO: antes solo se comparaba el high/low de la ÚLTIMA vela
-# contra el valor ACTUAL de la EMA50. Si el precio ya había tocado la
-# EMA50 en una vela cerrada anterior y luego se alejó, el bot nunca lo
-# detectaba en la siguiente ejecución -- la señal se "perdía". Que el
-# precio haya tocado la EMA50 es una confirmación que NO caduca: no
-# importa que después se aleje, sigue siendo válida para colocar TP/SL.
-#
-# Ahora se revisa CADA vela cerrada del historial contra el valor que
-# tenía la EMA50 exactamente EN ESA vela (la línea se mueve vela a
-# vela, igual que se ve en el gráfico de BingX), y basta con que haya
-# tocado UNA sola vez en todo el historial consultado.
-def _find_first_ema_touch(highs: list[float], lows: list[float], ema_series: pd.Series):
-    """
-    Devuelve el índice de la vela más antigua (dentro del historial
-    consultado) donde el rango high/low tocó el valor de la EMA50 que
-    tenía esa misma vela, o None si nunca se tocó.
-    """
+# Detección de toque genérica: revisa CADA vela cerrada de la ventana
+# consultada contra el valor que tenía la línea (SMA20, EMA50, etc.)
+# EXACTAMENTE en esa vela (la línea se mueve vela a vela, igual que se
+# ve en el gráfico de BingX), y basta con que haya tocado UNA sola vez
+# en toda la ventana. Devuelve el índice (relativo a la ventana pasada)
+# de la vela más antigua donde ocurrió el toque, o None si nunca se tocó.
+def _find_first_ema_touch(highs: list[float], lows: list[float], line_series: pd.Series):
     for i in range(len(highs)):
-        ema_value = float(ema_series.iloc[i])
-        if lows[i] <= ema_value <= highs[i]:
+        line_value = float(line_series.iloc[i])
+        if lows[i] <= line_value <= highs[i]:
             return i
     return None
 
@@ -322,13 +347,13 @@ def _find_first_ema_touch(highs: list[float], lows: list[float], ema_series: pd.
 async def _symbol_has_open_order(exchange: "ccxt.bingx", symbol: str, raw_order_type: str, position_side: str) -> bool:
     """
     Revisa si ya existe una orden ABIERTA de tipo `raw_order_type` (ej.
-    "TAKE_PROFIT_MARKET" o "STOP_MARKET") para el `position_side` dado.
+    "TAKE_PROFIT_MARKET" o "STOP") para el `position_side` dado.
 
-    Necesario porque la detección de "tocó la EMA50" ahora mira TODO el
-    historial de velas (ver _find_first_ema_touch), así que sin este
-    chequeo se volvería a intentar crear el mismo TP/SL en cada
-    ejecución del cron mientras la posición siga abierta, generando
-    órdenes duplicadas.
+    Necesario porque la detección de "tocó la línea" mira TODO el
+    historial de velas de la ventana de búsqueda (ver
+    _find_first_ema_touch), así que sin este chequeo se volvería a
+    intentar crear la misma orden en cada ejecución del cron mientras
+    la posición siga abierta, generando duplicados.
     """
     try:
         open_orders = await exchange.fetch_open_orders(symbol)
@@ -349,88 +374,104 @@ async def _symbol_has_open_order(exchange: "ccxt.bingx", symbol: str, raw_order_
     return False
 
 
-async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, tp_price: float) -> None:
+async def set_take_profit(exchange: "ccxt.bingx", position: dict, tp_price: float) -> None:
     """
-    Se llama cuando el precio tocó la EMA50(1h) en algún momento (ahora
-    o en el pasado -- ver _find_first_ema_touch). Coloca DOS órdenes,
-    cada una SOLO si todavía no existe una abierta del mismo tipo para
-    evitar duplicados en corridas sucesivas del cron:
-      - Take Profit en la EMA200(1h) -- tipo TAKE_PROFIT_MARKET, sin
-        cambios.
-      - Stop Loss en BREAK EVEN EXACTO (al precio de entrada de la
-        posición) -- ver el comentario "BUG CORREGIDO" más abajo sobre
-        por qué usa tipo STOP (límite) y no STOP_MARKET.
-    Ambas usan precio ÚLTIMO como referencia de disparo
+    GATILLO INDEPENDIENTE: se llama cuando el precio tocó la
+    SMA20(1h) (ahora o en el pasado). Coloca el Take Profit en la
+    EMA200(1h) -- tipo TAKE_PROFIT_MARKET -- solo si todavía no existe
+    uno abierto, para evitar duplicados en corridas sucesivas del cron.
+    Ya NO depende de que también se haya tocado la EMA50 -- ver
+    set_stop_loss_breakeven() para ese gatillo, ahora separado.
+    Usa precio ÚLTIMO como referencia de disparo
     (workingType=CONTRACT_PRICE), no precio de marca.
     """
     symbol = position["symbol"]
     side = position.get("side")  # 'long' o 'short'
     amount = abs(float(position.get("contracts") or 0))
-    entry_price = position.get("entryPrice")
 
     if amount <= 0:
-        log.warning("Cantidad de contratos inválida para %s, se omite.", symbol)
+        log.warning("Cantidad de contratos inválida para %s, se omite Take Profit.", symbol)
         return
 
     close_order_side = "sell" if side == "long" else "buy"
     position_side = "LONG" if side == "long" else "SHORT"
 
-    # ---- Take Profit en EMA200(1h) ----
     if await _symbol_has_open_order(exchange, symbol, "TAKE_PROFIT_MARKET", position_side):
         log.info("%s: ya existe un Take Profit abierto para %s, se omite (evita duplicados).", symbol, position_side)
-    else:
-        # BUG CORREGIDO: BingX rechazaba TODAS las órdenes de TP/SL con
-        #   {"code":109400,"msg":"In the Hedge mode, the 'ReduceOnly'
-        #   field can not be filled."}
-        # En Hedge Mode, `positionSide` (LONG/SHORT) ya identifica sin
-        # ambigüedad que la orden cierra esa posición (vender contra un
-        # SHORT, comprar contra un LONG) -- BingX no solo no necesita
-        # `reduceOnly` en este modo, sino que lo PROHÍBE explícitamente
-        # si se envía. Se quita el parámetro por completo.
-        tp_params = {
-            "stopPrice": tp_price,
-            "positionSide": position_side,
-            "workingType": "CONTRACT_PRICE",  # precio último, no precio de marca
-        }
-        try:
-            tp_order = await exchange.create_order(
-                symbol, "TAKE_PROFIT_MARKET", close_order_side, amount, None, tp_params,
-            )
-            log.info(
-                "Take Profit colocado: %s | lado posición=%s | TP=%.6f | orden_id=%s",
-                symbol, side, tp_price, tp_order.get("id"),
-            )
-        except Exception as exc:
-            log.error("Error colocando Take Profit para %s: %s", symbol, exc)
+        return
 
-    # ---- Stop Loss en BREAK EVEN EXACTO (precio de entrada) ----
+    # BUG CORREGIDO: BingX rechazaba las órdenes de TP/SL con
+    #   {"code":109400,"msg":"In the Hedge mode, the 'ReduceOnly'
+    #   field can not be filled."}
+    # En Hedge Mode, `positionSide` (LONG/SHORT) ya identifica sin
+    # ambigüedad que la orden cierra esa posición -- BingX no solo no
+    # necesita `reduceOnly` en este modo, sino que lo PROHÍBE
+    # explícitamente si se envía. Se omite el parámetro por completo.
+    tp_params = {
+        "stopPrice": tp_price,
+        "positionSide": position_side,
+        "workingType": "CONTRACT_PRICE",  # precio último, no precio de marca
+    }
+    try:
+        tp_order = await exchange.create_order(
+            symbol, "TAKE_PROFIT_MARKET", close_order_side, amount, None, tp_params,
+        )
+        log.info(
+            "Take Profit colocado (gatillo: toque de SMA20(1h)): %s | lado posición=%s | TP=%.6f | orden_id=%s",
+            symbol, side, tp_price, tp_order.get("id"),
+        )
+    except Exception as exc:
+        log.error("Error colocando Take Profit para %s: %s", symbol, exc)
+
+
+async def set_stop_loss_breakeven(exchange: "ccxt.bingx", position: dict) -> None:
+    """
+    GATILLO INDEPENDIENTE: se llama cuando el precio tocó la
+    EMA50(1h) (ahora o en el pasado) -- SIN importar si el Take Profit
+    (gatillo de la SMA20) ya se colocó o no. Coloca el Stop Loss en
+    BREAK EVEN EXACTO (precio de entrada de la posición), solo si
+    todavía no existe uno abierto.
+
+    BUG CORREGIDO: visto en producción -- con STOP_MARKET (tipo usado
+    antes), una vez que el precio ÚLTIMO toca stopPrice=entry_price
+    (el disparo), la orden se convierte en una orden A MERCADO, cuya
+    ejecución NO está garantizada exactamente en ese precio. En un
+    caso real (TAUSDT, 45x) el precio se movió apenas ~0.9% de más
+    entre el disparo y el llenado real -- pero con 45x de
+    apalancamiento, ese pequeño slippage se amplificó a una pérdida de
+    -40.67% sobre el margen, muy lejos de "break even".
+
+    Se corrige usando el tipo "STOP" (límite) en vez de "STOP_MARKET":
+    se dispara igual con stopPrice=entry_price (workingType=
+    CONTRACT_PRICE, precio último), pero el `price` límite de la orden
+    TAMBIÉN se fija en entry_price -- BingX solo puede llenarla
+    exactamente ahí, nunca peor. Trade-off aceptado (confirmado con el
+    usuario): si el precio salta de golpe más allá de entry_price en
+    una sola vela (gap), esta orden puede quedar sin ejecutarse y la
+    posición sigue abierta sin protección hasta que el precio regrese
+    a ese nivel exacto -- se prioriza "nunca peor que break even" sobre
+    "siempre se cierra".
+    """
+    symbol = position["symbol"]
+    side = position.get("side")
+    amount = abs(float(position.get("contracts") or 0))
+    entry_price = position.get("entryPrice")
+
+    if amount <= 0:
+        log.warning("Cantidad de contratos inválida para %s, se omite Stop Loss.", symbol)
+        return
+
     if entry_price is None:
         log.warning("%s: no se pudo obtener el precio de entrada, se omite el Stop Loss en break even.", symbol)
         return
+
+    close_order_side = "sell" if side == "long" else "buy"
+    position_side = "LONG" if side == "long" else "SHORT"
 
     if await _symbol_has_open_order(exchange, symbol, "STOP", position_side):
         log.info("%s: ya existe un Stop Loss abierto para %s, se omite (evita duplicados).", symbol, position_side)
         return
 
-    # BUG CORREGIDO: visto en producción -- con STOP_MARKET (tipo usado
-    # antes), una vez que el precio ÚLTIMO toca stopPrice=entry_price
-    # (el disparo), la orden se convierte en una orden A MERCADO, cuya
-    # ejecución NO está garantizada exactamente en ese precio. En un
-    # caso real (TAUSDT, 45x) el precio se movió apenas ~0.9% de más
-    # entre el disparo y el llenado real -- pero con 45x de
-    # apalancamiento, ese pequeño slippage se amplificó a una pérdida
-    # de -40.67% sobre el margen, muy lejos de "break even".
-    #
-    # Se corrige usando el tipo "STOP" (límite) en vez de "STOP_MARKET":
-    # se dispara igual con stopPrice=entry_price (workingType=
-    # CONTRACT_PRICE, precio último), pero el `price` límite de la
-    # orden TAMBIÉN se fija en entry_price -- BingX solo puede llenarla
-    # exactamente ahí, nunca peor. Trade-off aceptado (confirmado con
-    # el usuario): si el precio salta de golpe más allá de entry_price
-    # en una sola vela (gap), esta orden puede quedar sin ejecutarse y
-    # la posición sigue abierta sin protección hasta que el precio
-    # regrese a ese nivel exacto -- se prioriza "nunca peor que break
-    # even" sobre "siempre se cierra".
     sl_params = {
         "stopPrice": float(entry_price),
         "positionSide": position_side,
@@ -441,7 +482,8 @@ async def set_take_profit_and_stop_loss(exchange: "ccxt.bingx", position: dict, 
             symbol, "STOP", close_order_side, amount, float(entry_price), sl_params,
         )
         log.info(
-            "Stop Loss en break even EXACTO colocado: %s | lado posición=%s | SL=%.6f (límite, sin slippage) | orden_id=%s",
+            "Stop Loss en break even EXACTO colocado (gatillo: toque de EMA50(1h)): "
+            "%s | lado posición=%s | SL=%.6f (límite, sin slippage) | orden_id=%s",
             symbol, side, float(entry_price), sl_order.get("id"),
         )
     except Exception as exc:
@@ -455,19 +497,30 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
     (la misma conexión de cuenta con la que se leyó `position` y donde
     se colocan las órdenes de TP/SL), nunca la conexión de mercado
     forzada a real. Motivo: el TP/SL se coloca sobre una posición que
-    vive en esa cuenta específica (demo o real), así que el toque de
-    EMA50 y el valor de EMA200 deben calcularse con los mismos precios
-    que esa cuenta está viendo.
+    vive en esa cuenta específica (demo o real), así que los toques de
+    SMA20/EMA50 y el valor de EMA200 deben calcularse con los mismos
+    precios que esa cuenta está viendo.
+
+    Evalúa DOS gatillos INDEPENDIENTES entre sí:
+      - Toque de SMA20(1h) -> set_take_profit() (TP en la EMA200(1h)).
+      - Toque de EMA50(1h) -> set_stop_loss_breakeven() (SL en break
+        even exacto).
+    Cada uno se revisa y se dispara por separado, sin depender del
+    resultado del otro.
     """
     symbol = position["symbol"]
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_LIMIT_TP)
+        # BUG CORREGIDO (SXTUSDT): se piden OHLCV_FETCH_LIMIT_TP velas
+        # (OHLCV_LIMIT_TP + EMA_WARMUP_CANDLES) para que la SMA20/EMA50/
+        # EMA200 tengan tiempo de CONVERGER antes de empezar a buscar un
+        # toque -- ver el comentario de cabecera de EMA_WARMUP_CANDLES.
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_FETCH_LIMIT_TP)
 
         # Se descarta la última vela (sigue en formación), igual que en
         # el resto del bot -- comparamos solo contra velas ya cerradas.
         closed = ohlcv[:-1]
-        if len(closed) < EMA_SLOW:
-            log.warning("Datos insuficientes de OHLCV para %s, se omite (TP).", symbol)
+        if len(closed) < EMA_SLOW + EMA_WARMUP_CANDLES:
+            log.warning("Datos insuficientes de OHLCV para %s, se omite (TP/SL).", symbol)
             return
 
         closes = [c[4] for c in closed]
@@ -475,25 +528,55 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
         lows = [c[3] for c in closed]
 
         close_series = pd.Series(closes, dtype="float64")
+        sma20_series = sma(close_series, SMA_TP_TRIGGER)
         ema50_series = ema(close_series, EMA_FAST)
         ema200_series = ema(close_series, EMA_SLOW)
         ema200_now = float(ema200_series.iloc[-1])
 
-        # BUG CORREGIDO: se busca el toque de la EMA50 en TODO el
-        # historial de velas cerradas, no solo en la última -- ver
-        # _find_first_ema_touch(). Una vez tocada, la señal es válida
-        # sin importar que el precio se haya alejado después.
-        touched_idx = _find_first_ema_touch(highs, lows, ema50_series)
+        # Se descartan las primeras EMA_WARMUP_CANDLES velas SOLO para
+        # buscar el toque -- sí se usaron para calentar el cálculo de
+        # SMA20/EMA50/EMA200, pero no cuentan como posible señal (ver
+        # el bug corregido de SXTUSDT en la cabecera del archivo).
+        search_start_idx = len(closed) - OHLCV_LIMIT_TP
+        search_highs = highs[search_start_idx:]
+        search_lows = lows[search_start_idx:]
 
-        if touched_idx is not None:
-            touch_ts = int(closed[touched_idx][0])
+        # ---- Gatillo 1 (independiente): toque de SMA20(1h) -> Take Profit ----
+        touched_sma20_idx = _find_first_ema_touch(
+            search_highs, search_lows,
+            sma20_series.iloc[search_start_idx:].reset_index(drop=True),
+        )
+        if touched_sma20_idx is not None:
+            touch_idx_full = search_start_idx + touched_sma20_idx
+            touch_ts = int(closed[touch_idx_full][0])
+            log.info(
+                "%s tocó SMA20(1h) en la vela ts=%d (%s UTC) [SMA20 en ese momento=%.6f]. "
+                "EMA200 actual=%.6f. Verificando/colocando Take Profit...",
+                symbol, touch_ts, pd.to_datetime(touch_ts, unit="ms", utc=True),
+                float(sma20_series.iloc[touch_idx_full]), ema200_now,
+            )
+            await set_take_profit(exchange, position, ema200_now)
+        else:
+            log.info(
+                "%s aún no ha tocado la SMA20(1h) en el historial revisado [SMA20 actual=%.6f]",
+                symbol, float(sma20_series.iloc[-1]),
+            )
+
+        # ---- Gatillo 2 (independiente del anterior): toque de EMA50(1h) -> Stop Loss en break even ----
+        touched_ema50_idx = _find_first_ema_touch(
+            search_highs, search_lows,
+            ema50_series.iloc[search_start_idx:].reset_index(drop=True),
+        )
+        if touched_ema50_idx is not None:
+            touch_idx_full = search_start_idx + touched_ema50_idx
+            touch_ts = int(closed[touch_idx_full][0])
             log.info(
                 "%s tocó EMA50(1h) en la vela ts=%d (%s UTC) [EMA50 en ese momento=%.6f]. "
-                "EMA200 actual=%.6f. Verificando/colocando TP y SL...",
+                "Verificando/colocando Stop Loss en break even...",
                 symbol, touch_ts, pd.to_datetime(touch_ts, unit="ms", utc=True),
-                float(ema50_series.iloc[touched_idx]), ema200_now,
+                float(ema50_series.iloc[touch_idx_full]),
             )
-            await set_take_profit_and_stop_loss(exchange, position, ema200_now)
+            await set_stop_loss_breakeven(exchange, position)
         else:
             log.info(
                 "%s aún no ha tocado la EMA50(1h) en el historial revisado [EMA50 actual=%.6f]",
@@ -501,7 +584,7 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
             )
 
     except Exception as exc:
-        log.error("Error procesando TP de %s: %s", symbol, exc)
+        log.error("Error procesando TP/SL de %s: %s", symbol, exc)
 
 
 async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]) -> None:
@@ -848,17 +931,19 @@ async def _get_live_ema200_1h(exchange: "ccxt.bingx", symbol: str) -> float | No
     """
     EMA200(1h) EN VIVO, recalculada en el momento exacto de la llamada
     -- usada para el Take Profit de las entradas en largo (ver
-    strategy_entries.calculate_take_profit_long()). Mismo timeframe e
-    histórico que usa process_position_tp() para el Paso 1 (TIMEFRAME_TP,
-    OHLCV_LIMIT_TP, EMA_SLOW), y se consulta contra `exchange` (cuenta
-    demo/real) porque es el mismo precio con el que se va a operar esa
-    cuenta. Devuelve None si no se pudo calcular (datos insuficientes o
-    error de red) -- el llamador decide cómo proceder sin TP.
+    strategy_entries.calculate_take_profit_long()). Mismo timeframe que
+    usa process_position_tp() para el Paso 1, pidiendo el mismo total
+    de velas de calentamiento + búsqueda (OHLCV_FETCH_LIMIT_TP) para
+    que la EMA200 converja igual de bien, y se consulta contra
+    `exchange` (cuenta demo/real) porque es el mismo precio con el que
+    se va a operar esa cuenta. Devuelve None si no se pudo calcular
+    (datos insuficientes o error de red) -- el llamador decide cómo
+    proceder sin TP.
     """
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_LIMIT_TP)
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_FETCH_LIMIT_TP)
         closed = ohlcv[:-1]
-        if len(closed) < EMA_SLOW:
+        if len(closed) < EMA_SLOW + EMA_WARMUP_CANDLES:
             log.warning("%s: datos insuficientes de 1h para calcular la EMA200 en vivo (TP long).", symbol)
             return None
         closes = [c[4] for c in closed]
@@ -883,6 +968,11 @@ async def execute_long_entry(exchange: "ccxt.bingx", candidate: dict, trigger_in
         vivo respecto de esa misma SMA20(5m) del cruce.
       - Solo se coloca Take Profit -- NUNCA Stop Loss -- calculado con
         calculate_take_profit_long() usando la EMA200(1h) EN VIVO.
+
+    Esta rama de LARGOS no fue tocada por los cambios recientes del
+    Paso 1 (gatillos separados) ni del Paso 10 (chequeo de retroceso) --
+    ambos ajustes son exclusivos de la rama SHORT, confirmado con el
+    usuario.
 
     Devuelve True si el candidato debe eliminarse del JSON (la orden se
     ejecutó, o se descartó de forma definitiva por un motivo que no va
@@ -1166,8 +1256,8 @@ def _get_bot_mode() -> str:
         ni abrir nuevas entradas. Pensado para el cron interno de
         GitHub Actions (schedule), que corre con más frecuencia solo
         para no perder el momento exacto en que el precio toca la
-        EMA50 -- sin este modo, ese cron también intentaría abrir
-        entradas nuevas y podría duplicar una posición que el
+        SMA20 o la EMA50 -- sin este modo, ese cron también intentaría
+        abrir entradas nuevas y podría duplicar una posición que el
         disparador externo ya haya abierto.
     """
     mode = os.environ.get("BOT_MODE", "full").strip().lower()
@@ -1215,7 +1305,7 @@ async def main() -> None:
             )
         else:
             # Modo completo (repository_dispatch desde cronjob.org, o
-            # workflow_dispatch manual): Paso 1 (gestión de TP), el
+            # workflow_dispatch manual): Paso 1 (gestión de TP/SL), el
             # escaneo de candidatos a largo en memoria -- SOLO aquí,
             # ver comentario de arriba -- y Pasos 2-14 (búsqueda de
             # nuevas entradas, leen de `market_exchange` -- siempre
