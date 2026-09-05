@@ -79,7 +79,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|Short STOP-LIMIT order placed|STOP-LIMIT buy order placed|Take Profit colocado|Take Profit \(long\) colocado|Stop Loss en break even colocado" bot_output.log > signals.txt || true
+          # NOTA: el patrón de "Stop Loss" usa ".*" entre "break even" y
+          # "colocado" porque el log real dice "Stop Loss en break even
+          # EXACTO colocado (gatillo: ...)" -- un patrón literal sin el
+          # ".*" nunca hubiera hecho match y esa notificación de Telegram
+          # jamás se habría disparado.
+          grep -E "Market entry executed|Short STOP-LIMIT order placed|STOP-LIMIT buy order placed|Take Profit colocado|Take Profit \(long\) colocado|Stop Loss en break even.*colocado" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
