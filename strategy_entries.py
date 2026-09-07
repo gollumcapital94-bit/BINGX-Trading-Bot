@@ -22,7 +22,7 @@ IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
   - "Máximo" (round, 15m, 5m) -> se toma el HIGH (mecha) de la vela, no el cierre
   - El apalancamiento calculado se limita (clip) al máximo permitido por BingX
     para ese par cuando el calculado lo supera
-  - Paso 10 (rama SHORT), chequeo de retroceso (ver evaluate_step_10_direction):
+  - Paso 10, chequeo de retroceso (ver check_step_10):
     si dentro de la ventana de 1200 velas de 4h consultada nunca se
     encuentra el cruce de la SMA20 sobre la EMA200 (por ejemplo, la
     SMA20 ya empezaba por encima de la EMA200 desde el inicio del
@@ -448,39 +448,67 @@ async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_li
 
 
 # ----------------------------------------------------------------------
-# Paso 10 (bifurcado): SMA20/EMA50/EMA200 en TEMPORALIDAD 4H.
+# Paso 10: SMA20/EMA50/EMA200 en TEMPORALIDAD 4H.
 #
-# RAMA SHORT (patrón original + chequeo de retroceso nuevo):
-#   Condición base, sin cambios: SMA20(4h) > EMA50(4h).
+# Condición base, sin cambios: SMA20(4h) > EMA50(4h).
 #
-#   CHEQUEO ADICIONAL (confirmado con el usuario): si además, en la
-#   vela actual, AMBAS medias están por encima de la EMA200(4h)
-#   (SMA20 > EMA200 Y EMA50 > EMA200), se exige una condición extra:
-#   desde el momento en que la SMA20 cruzó de abajo hacia arriba la
-#   EMA200 y hasta la vela actual, la SMA20 NUNCA debe haber estado
-#   por debajo de la EMA50 en ese tramo -- ni un solo "retroceso" por
-#   debajo, aunque después haya vuelto a subir. Si se detecta un
-#   retroceso así, el símbolo se descarta POR COMPLETO (ni short ni
-#   long), porque la señal de tendencia ya no se considera "limpia".
+# DEFINICIÓN DE "CICLO ALCISTA" (confirmada con el usuario) -- es la
+# base de todo el chequeo de retroceso de este paso:
+#   - El ciclo alcista EMPIEZA en el instante en que la SMA20(4h) cruza
+#     de abajo hacia arriba la EMA50(4h). En ese momento, AMBAS pueden
+#     estar todavía por debajo de la EMA200(4h) -- de hecho, lo normal
+#     es que empiece así.
+#   - El ciclo se EXTIENDE mientras la SMA20 se mantenga por encima de
+#     la EMA50 SIN NINGUNA interrupción, e incluye el momento (si
+#     llega a ocurrir dentro de ese mismo tramo) en que la SMA20
+#     también cruza por encima de la EMA200.
+#   - El ciclo TERMINA en el instante EXACTO en que la SMA20 vuelve a
+#     caer por debajo de la EMA50 -- este es el "retroceso". No
+#     importa si para ese momento la SMA20 ya estaba o no por encima
+#     de la EMA200: el retroceso siempre termina el ciclo alcista.
 #
-#   Si NO se cumple que ambas estén por encima de la EMA200 (por
-#   ejemplo, SMA20 > EMA50 pero todavía por debajo de la EMA200), el
-#   Paso 10 se comporta exactamente igual que antes de este cambio,
-#   sin aplicar el chequeo extra.
+# CHEQUEO ADICIONAL (confirmado con el usuario): si en la vela actual
+# AMBAS medias están por encima de la EMA200(4h) (SMA20 > EMA200 Y
+# EMA50 > EMA200), se exige que el cruce de la SMA20 sobre la EMA200
+# haya ocurrido DENTRO del ciclo alcista ACTUAL -- es decir, en o
+# después del último cruce de la SMA20 sobre la EMA50 -- y no en un
+# ciclo alcista anterior que ya haya terminado por un retroceso.
 #
-#   Caso borde (SUPUESTO ADOPTADO, confirmado con el usuario): si
-#   dentro de las 1200 velas de 4h consultadas nunca se encuentra el
-#   cruce de la SMA20 sobre la EMA200 (por ejemplo, la SMA20 ya
-#   empezaba por encima de la EMA200 desde la primera vela de la
-#   ventana disponible), no hay forma de confirmar ni negar un
-#   retroceso -- se aprueba el short con normalidad en ese caso.
+# BUG CORREGIDO (visto en producción: LITUSDT): la versión anterior de
+# este chequeo buscaba el retroceso SOLO desde el cruce de la SMA20
+# sobre la EMA200 en adelante, usando ese cruce como punto de partida
+# de la ventana de búsqueda. El problema: si la SMA20 cruzó la EMA200
+# hace mucho tiempo (o incluso varias veces, oscilando alrededor de
+# ella) y en el camino tuvo un retroceso por debajo de la EMA50 que
+# reinició el ciclo alcista -- pero luego la SMA20 volvió a estar por
+# encima de la EMA200 SIN necesitar "re-cruzarla" (porque nunca había
+# caído por debajo de ella, solo de la EMA50) -- el chequeo anterior no
+# encontraba ningún cruce NUEVO de la EMA200 para usar como punto de
+# partida, y terminaba aplicando el supuesto de "sin evidencia,
+# aprobado" incluso cuando el retroceso SÍ era visible dentro de la
+# ventana de datos consultada.
 #
-# RAMA LONG (espejo, Paso 10-B) -- SIN CAMBIOS, confirmado con el
-# usuario que esta rama de la estrategia de largos no se toca:
-#   SMA20(4h) < EMA50(4h) Y AMBAS < EMA200(4h).
+# Se corrige calculando el chequeo al revés: primero se ubica el
+# INICIO del ciclo alcista actual (el cruce más reciente de la SMA20
+# sobre la EMA50), y luego se compara ese punto contra el cruce de la
+# SMA20 sobre la EMA200. Si el cruce sobre la EMA200 ocurrió en o
+# después del inicio del ciclo actual, el ciclo es limpio y se aprueba.
+# Si el cruce sobre la EMA200 quedó ANTES del inicio del ciclo actual
+# (o no se encuentra en absoluto dentro de la ventana, lo que implica
+# que ya estaba por encima desde antes del historial disponible, y por
+# lo tanto también antes del ciclo actual), significa que el ciclo en
+# el que la SMA20 cruzó limpiamente la EMA200 ya terminó por un
+# retroceso -- se descarta por completo.
 #
-# Si no se cumple ninguno de los dos patrones, se descarta el símbolo
-# por completo (ni short ni long) -- sin cambios respecto a antes.
+# Caso borde (SUPUESTO ADOPTADO, confirmado con el usuario): si dentro
+# de las 1200 velas de 4h consultadas la SMA20 se mantuvo SIEMPRE por
+# encima de la EMA50 (no se encuentra ningún cruce de la SMA20 sobre la
+# EMA50 dentro de la ventana), no hay evidencia de ningún retroceso
+# -- se aprueba el short con normalidad, sin importar dónde quede el
+# cruce sobre la EMA200.
+#
+# Si SMA20(4h) <= EMA50(4h), o se detecta el retroceso, se descarta el
+# símbolo por completo.
 # ----------------------------------------------------------------------
 def _find_last_cross_up_index(fast: pd.Series, slow: pd.Series, idx_max: int):
     """
@@ -504,78 +532,106 @@ def _find_last_cross_up_index(fast: pd.Series, slow: pd.Series, idx_max: int):
     return None
 
 
-def _check_sma20_no_dip_below_ema50_since_ema200_cross(
+def _check_retroceso_ciclo_alcista(
     sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h: pd.Series,
 ):
     """
-    Chequeo adicional del Paso 10 (rama SHORT) -- ver el comentario de
-    cabecera de esta sección para el criterio completo confirmado con
-    el usuario.
+    Chequeo de retroceso del Paso 10, basado en la definición exacta de
+    "ciclo alcista" confirmada con el usuario -- ver el comentario de
+    cabecera de esta sección para el criterio completo y el bug que
+    corrige (visto en producción con LITUSDT).
 
     Devuelve (ok, info):
-      ok = True  -> no se detectó ningún retroceso (o no se pudo
-                    ubicar el cruce de la SMA20 sobre la EMA200 dentro
-                    de la ventana consultada, ver el supuesto
-                    adoptado); el símbolo puede aprobar el Paso 10
-                    como short con normalidad.
-      ok = False -> se detectó que la SMA20 estuvo por debajo de la
-                    EMA50 en algún punto desde el cruce sobre la
-                    EMA200 hasta la vela actual -- el símbolo debe
-                    descartarse POR COMPLETO (ni short ni long).
+      ok = True  -> el cruce de la SMA20 sobre la EMA200 ocurrió DENTRO
+                    del ciclo alcista actual (en o después del último
+                    cruce de la SMA20 sobre la EMA50), o no hay
+                    evidencia de que la SMA20 haya estado alguna vez
+                    por debajo de la EMA50 dentro de la ventana
+                    consultada -- el símbolo puede aprobar el Paso 10.
+      ok = False -> el ciclo alcista actual empezó DESPUÉS de que la
+                    SMA20 ya había cruzado la EMA200 en un ciclo
+                    anterior -- es decir, hubo un retroceso (SMA20 por
+                    debajo de la EMA50) posterior a ese cruce que
+                    terminó aquel ciclo, y el ciclo alcista actual
+                    todavía no ha confirmado un cruce limpio y propio
+                    de la SMA20 sobre la EMA200. Se descarta POR
+                    COMPLETO.
     """
     last_idx = len(sma20_4h) - 1
-    cross_idx = _find_last_cross_up_index(sma20_4h, ema200_4h, last_idx)
 
-    if cross_idx is None:
-        # No se encontró el cruce dentro del historial disponible --
-        # SUPUESTO ADOPTADO: se trata como "sin evidencia de
-        # retroceso" y se aprueba.
+    # Inicio del ciclo alcista ACTUAL: el cruce más reciente de la
+    # SMA20 sobre la EMA50. Si no se encuentra ninguno dentro de la
+    # ventana, la SMA20 se mantuvo por encima de la EMA50 de forma
+    # ininterrumpida durante todo el historial disponible -- sin
+    # evidencia de ningún retroceso, se aprueba directamente.
+    cycle_start_idx = _find_last_cross_up_index(sma20_4h, ema50_4h, last_idx)
+
+    if cycle_start_idx is None:
         return True, {
-            "cross_found": False,
+            "cycle_start_found": False,
             "note": (
-                "No se encontró el cruce de la SMA20 sobre la EMA200(4h) dentro de la "
-                "ventana consultada (posiblemente ya estaba por encima desde el inicio "
-                "del historial) -- se asume sin retroceso, por defecto"
+                "La SMA20(4h) se mantuvo por encima de la EMA50(4h) de forma "
+                "ininterrumpida durante toda la ventana consultada -- sin evidencia "
+                "de ningún retroceso, se aprueba por defecto"
             ),
         }
 
-    segment_sma20 = sma20_4h.iloc[cross_idx: last_idx + 1]
-    segment_ema50 = ema50_4h.iloc[cross_idx: last_idx + 1]
-    had_dip = bool((segment_sma20 < segment_ema50).any())
+    # Cruce de la SMA20 sobre la EMA200 más reciente dentro de la
+    # ventana (puede quedar antes, dentro, o no encontrarse en
+    # absoluto respecto al inicio del ciclo actual).
+    ema200_cross_idx = _find_last_cross_up_index(sma20_4h, ema200_4h, last_idx)
 
-    if had_dip:
-        return False, {
-            "cross_found": True,
-            "cross_idx": cross_idx,
-            "reason": (
-                f"[Paso 10] Retroceso detectado -- desde que la SMA20(4h) cruzó sobre la "
-                f"EMA200(4h) (vela idx={cross_idx}) hasta la vela actual, la SMA20 estuvo "
-                f"por debajo de la EMA50(4h) en algún punto del recorrido -- se descarta "
-                f"por completo (ni short ni long)"
-            ),
+    if ema200_cross_idx is not None and ema200_cross_idx >= cycle_start_idx:
+        # El cruce sobre la EMA200 ocurrió DENTRO del ciclo alcista
+        # actual (en o después de que la SMA20 cruzó sobre la EMA50).
+        # Por construcción, desde el inicio del ciclo hasta ahora la
+        # SMA20 no pudo haber caído por debajo de la EMA50 sin que eso
+        # terminara el ciclo -- no hay retroceso posible en este tramo.
+        return True, {
+            "cycle_start_found": True,
+            "cycle_start_idx": cycle_start_idx,
+            "ema200_cross_idx": ema200_cross_idx,
         }
 
-    return True, {"cross_found": True, "cross_idx": cross_idx}
+    # El cruce sobre la EMA200 (si se encontró) quedó ANTES del inicio
+    # del ciclo alcista actual -- o no se encontró en absoluto dentro
+    # de la ventana, lo que implica que la SMA20 ya estaba por encima
+    # de la EMA200 desde antes del historial disponible, y por lo
+    # tanto también antes del ciclo actual. En ambos casos: el ciclo en
+    # el que la SMA20 cruzó limpiamente la EMA200 ya terminó por un
+    # retroceso -- la SMA20 cayó por debajo de la EMA50 justo antes de
+    # la vela idx=cycle_start_idx, reiniciando el ciclo alcista DESPUÉS
+    # de que ya estaba por encima de la EMA200. Ese es exactamente el
+    # retroceso que se debe descartar.
+    return False, {
+        "cycle_start_found": True,
+        "cycle_start_idx": cycle_start_idx,
+        "ema200_cross_idx": ema200_cross_idx,
+        "reason": (
+            f"[Paso 10] Retroceso detectado -- la SMA20(4h) cayó por debajo de la "
+            f"EMA50(4h) justo antes de la vela idx={cycle_start_idx} (dando inicio a "
+            f"un nuevo ciclo alcista), después de que ya había cruzado sobre la "
+            f"EMA200(4h) en un ciclo anterior. El ciclo alcista actual todavía no ha "
+            f"confirmado un cruce propio y limpio de la SMA20 sobre la EMA200(4h) "
+            f"-- se descarta"
+        ),
+    }
 
 
-async def evaluate_step_10_direction(exchange, symbol: str):
+async def check_step_10(exchange, symbol: str):
     """
-    Devuelve (direction, info):
-      direction = "short" -> SMA20(4h) > EMA50(4h) (patrón original), y
-                              -si ambas están por encima de la EMA200-
-                              sin ningún retroceso de la SMA20 por
-                              debajo de la EMA50 desde que cruzó la
-                              EMA200 (ver chequeo adicional arriba).
-      direction = "long"  -> SMA20(4h) < EMA50(4h) y AMBAS < EMA200(4h)
-                              (patrón espejo, candidato a entrada en
-                              largo). SIN CAMBIOS.
-      direction = None    -> ninguno de los dos patrones se cumple, O
-                              se cumplía el patrón short pero se
-                              descartó por el chequeo de retroceso --
-                              en ambos casos se descarta el símbolo
-                              por completo.
+    Devuelve (passed, info):
+      passed = True  -> SMA20(4h) > EMA50(4h) (patrón alcista), y -si
+                         ambas están por encima de la EMA200- sin
+                         ningún retroceso de la SMA20 por debajo de la
+                         EMA50 desde que cruzó la EMA200 (ver chequeo
+                         adicional arriba).
+      passed = False -> SMA20(4h) <= EMA50(4h), o se cumplía el patrón
+                         pero se descartó por el chequeo de retroceso --
+                         en ambos casos se descarta el símbolo por
+                         completo.
     `info` siempre incluye sma20_4h/ema50_4h/ema200_4h para diagnóstico
-    y, en caso de direction=None, también "reason" y "failed_step".
+    y, en caso de passed=False, también "reason" y "failed_step".
     """
     raw_4h = await _fetch_ohlcv_paginated(exchange, symbol, "4h", OHLCV_LIMIT_4H + 1)
     closed_4h = raw_4h[:-1]  # se descarta la vela en formación
@@ -586,7 +642,7 @@ async def evaluate_step_10_direction(exchange, symbol: str):
     )
 
     if len(closed_4h) < 210:
-        return None, {
+        return False, {
             "reason": "[Paso 10] Datos insuficientes en 4h (< 210 velas cerradas) para calcular SMA20/EMA50/EMA200",
             "failed_step": 10,
         }
@@ -602,45 +658,44 @@ async def evaluate_step_10_direction(exchange, symbol: str):
 
     base_info = {"sma20_4h": sma20_value, "ema50_4h": ema50_value, "ema200_4h": ema200_value}
 
-    if sma20_value > ema50_value:
-        both_above_ema200 = sma20_value > ema200_value and ema50_value > ema200_value
+    if sma20_value <= ema50_value:
+        return False, {
+            "reason": (
+                f"[Paso 10] SMA20(4h)={sma20_value:.8f} no está por encima de la "
+                f"EMA50(4h)={ema50_value:.8f}"
+            ),
+            "failed_step": 10,
+            **base_info,
+        }
 
-        if both_above_ema200:
-            # CHEQUEO ADICIONAL: ambas medias ya superaron la EMA200 --
-            # se exige que la SMA20 nunca haya retrocedido por debajo
-            # de la EMA50 desde que cruzó sobre la EMA200.
-            ok_no_dip, dip_info = _check_sma20_no_dip_below_ema50_since_ema200_cross(
-                sma20_4h, ema50_4h, ema200_4h,
+    both_above_ema200 = sma20_value > ema200_value and ema50_value > ema200_value
+
+    if both_above_ema200:
+        # CHEQUEO ADICIONAL: ambas medias ya superaron la EMA200 --
+        # se exige que el cruce de la SMA20 sobre la EMA200 haya
+        # ocurrido DENTRO del ciclo alcista actual (ver definición de
+        # "ciclo alcista" en el comentario de cabecera de esta sección).
+        ok_no_dip, dip_info = _check_retroceso_ciclo_alcista(
+            sma20_4h, ema50_4h, ema200_4h,
+        )
+        if not ok_no_dip:
+            log.info("%s descartado en %s", symbol, dip_info["reason"])
+            return False, {
+                "reason": dip_info["reason"],
+                "failed_step": 10,
+                **base_info,
+            }
+        if dip_info.get("cycle_start_found"):
+            log.info(
+                "%s [Paso 10] Chequeo de retroceso OK: el ciclo alcista actual empezó en la "
+                "vela idx=%d y el cruce de la SMA20(4h) sobre la EMA200(4h) (vela idx=%s) "
+                "ocurrió dentro de ese mismo ciclo -- sin retroceso.",
+                symbol, dip_info["cycle_start_idx"], dip_info.get("ema200_cross_idx"),
             )
-            if not ok_no_dip:
-                log.info("%s descartado en %s", symbol, dip_info["reason"])
-                return None, {
-                    "reason": dip_info["reason"],
-                    "failed_step": 10,
-                    **base_info,
-                }
-            if dip_info.get("cross_found"):
-                log.info(
-                    "%s [Paso 10] Chequeo de retroceso OK: la SMA20(4h) se mantuvo siempre por encima "
-                    "de la EMA50(4h) desde que cruzó la EMA200(4h) (vela idx=%d)",
-                    symbol, dip_info["cross_idx"],
-                )
-            else:
-                log.info("%s [Paso 10] Chequeo de retroceso: %s", symbol, dip_info["note"])
+        else:
+            log.info("%s [Paso 10] Chequeo de retroceso: %s", symbol, dip_info["note"])
 
-        return "short", base_info
-
-    if sma20_value < ema50_value and sma20_value < ema200_value and ema50_value < ema200_value:
-        return "long", base_info
-
-    return None, {
-        "reason": (
-            f"[Paso 10] Ni patrón SHORT ni patrón LONG -- SMA20={sma20_value:.8f}, "
-            f"EMA50={ema50_value:.8f}, EMA200={ema200_value:.8f}"
-        ),
-        "failed_step": 10,
-        **base_info,
-    }
+    return True, base_info
 
 
 # ----------------------------------------------------------------------
@@ -745,9 +800,9 @@ def check_step_12_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
 # ----------------------------------------------------------------------
 # Paso 13: apalancamiento y tamaño de posición
 #
-# La fórmula (80% ÷ distancia%) es la misma en ambos casos, pero la
-# DISTANCIA usa un precio de referencia distinto según el tipo de
-# entrada del Paso 14 -- por eso `calculate_leverage()` recibe un
+# La fórmula (80% ÷ distancia%) es la misma en ambos tipos de entrada,
+# pero la DISTANCIA usa un precio de referencia distinto según el tipo
+# de entrada del Paso 14 -- por eso `calculate_leverage()` recibe un
 # `reference_price` genérico en vez de asumir siempre la SMA20(5m):
 #   - Orden STOP (precio aún no tocó la SMA20): reference_price =
 #     SMA20(5m) -- fórmula original, sin cambios.
@@ -779,62 +834,6 @@ def calculate_leverage(max_high_5m: float, reference_price: float) -> float:
     leverage = LEVERAGE_BASE / distancia_pct
     leverage_rounded = math.floor(leverage / LEVERAGE_ROUND_STEP) * LEVERAGE_ROUND_STEP
     return max(leverage_rounded, LEVERAGE_ROUND_STEP)
-
-
-def calculate_leverage_long(sma20_5m_at_cross: float, ema200_5m_at_cross: float) -> float:
-    """
-    Espejo de calculate_leverage() para entradas en LARGO (ver
-    scan_long_candidate_for_entry() y bingx_bot.execute_long_entry()).
-    SIN CAMBIOS -- la rama de largos no fue tocada por los ajustes
-    recientes del Paso 10 (retroceso) ni del Paso 1 (gatillos
-    separados), confirmado con el usuario.
-
-    La distancia se mide igual que en cualquier gráfico de velas: como
-    un porcentaje respecto del punto SUPERIOR del rango. Aquí, el punto
-    superior es la SMA20(5m) en el momento exacto del cruce bajista
-    sobre la EMA50(5m) (el patrón de entrada, ver el comentario de
-    scan_long_candidate_for_entry), y el punto inferior es la EMA200(5m)
-    en ese mismo instante, que debe haber quedado por debajo de la
-    SMA20 justo después del cruce.
-    """
-    if sma20_5m_at_cross <= 0:
-        raise ValueError("sma20_5m_at_cross inválido")
-
-    distancia_pct = (sma20_5m_at_cross - ema200_5m_at_cross) / sma20_5m_at_cross * 100
-    if distancia_pct <= 0:
-        raise ValueError("La EMA200(5m) no está por debajo de la SMA20(5m), distancia inválida")
-
-    leverage = LEVERAGE_BASE / distancia_pct
-    leverage_rounded = math.floor(leverage / LEVERAGE_ROUND_STEP) * LEVERAGE_ROUND_STEP
-    return max(leverage_rounded, LEVERAGE_ROUND_STEP)
-
-
-def calculate_take_profit_long(entry_price: float, ema200_1h_live: float, leverage: int) -> float:
-    """
-    Take Profit ÚNICO para entradas en largo (NO se coloca Stop Loss en
-    este camino -- confirmado con el usuario). SIN CAMBIOS. Se mide la
-    distancia en PORCENTAJE desde el precio de entrada hasta la
-    EMA200(1h) EN VIVO (recalculada en el momento exacto de la
-    ejecución de la orden, no un valor congelado de cuando el candidato
-    entró a la memoria), tomando el precio de entrada como punto
-    superior de referencia -- misma convención de "distancia en %
-    respecto del punto de arriba" que usa cualquier gráfico de velas y
-    que ya usa calculate_leverage().
-
-    Esa distancia, multiplicada por el apalancamiento de la posición,
-    se proyecta hacia ARRIBA desde el precio de entrada para fijar el
-    Take Profit:
-        distancia_pct = (entry_price - EMA200(1h)) / entry_price * 100
-        TP = entry_price * (1 + (leverage * distancia_pct) / 100)
-    """
-    if entry_price <= 0:
-        raise ValueError("entry_price inválido")
-
-    distancia_pct = (entry_price - ema200_1h_live) / entry_price * 100
-    if distancia_pct <= 0:
-        raise ValueError("La EMA200(1h) no está por debajo del precio de entrada, distancia inválida para el TP")
-
-    return entry_price * (1 + (leverage * distancia_pct) / 100)
 
 
 async def get_max_leverage_for_symbol(exchange, symbol: str):
@@ -947,106 +946,6 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
     max_margin_by_leverage = max_notional / leverage if leverage else max_notional
 
     return min(margin_20pct, max_margin_by_leverage)
-
-
-# ----------------------------------------------------------------------
-# Escaneo de candidatos a LARGO guardados en memoria (long_candidates.json)
-# -- patrón de entrada espejo del Paso 14, en temporalidad 5m.
-# SIN CAMBIOS -- la rama de largos no fue tocada por los ajustes
-# recientes (confirmado con el usuario).
-#
-# Cada corrida del bot (independiente de BOT_MODE, igual que el Paso 1)
-# revisa cada candidato guardado buscando:
-#   1) INVALIDACIÓN: si el precio ya rompió por encima el `max_high_5m`
-#      original (el máximo del round que dio origen a la singularidad),
-#      la señal se perdió -- se descarta el candidato sin abrir orden.
-#   2) PATRÓN DE ENTRADA: la SMA20(5m) cruza de ARRIBA hacia ABAJO la
-#      EMA50(5m). Se revisa TODO el historial de velas 5m consultado
-#      (no solo la última), por si el bot se "durmió" más de una hora
-#      y el cruce ya ocurrió entre corridas.
-# El tipo de orden final (mercado o STOP) se decide en bingx_bot.
-# execute_long_entry() con el precio EN VIVO en el momento de ejecutar,
-# no aquí -- esta función solo confirma que el patrón ya ocurrió y
-# entrega los valores de SMA20(5m)/EMA200(5m) del momento del cruce,
-# necesarios para el cálculo de apalancamiento (calculate_leverage_long).
-# ----------------------------------------------------------------------
-LONG_SCAN_OHLCV_LIMIT_5M = 500  # suficiente calentamiento para SMA20/EMA50/EMA200 en 5m
-
-
-async def scan_long_candidate_for_entry(market_exchange, candidate: dict):
-    """
-    Devuelve (status, info):
-      status = "invalidated" -> el máximo se rompió, se debe borrar el
-                candidato del JSON sin abrir ninguna orden.
-      status = "waiting"     -> el patrón aún no ocurre, se mantiene el
-                candidato en el JSON para la próxima corrida.
-      status = "triggered"   -> el cruce SMA20/EMA50 (5m) ya ocurrió y
-                sigue siendo válido (no rompió el máximo); `info` trae
-                sma20_5m_at_cross / ema200_5m_at_cross / cross_ts, listos
-                para bingx_bot.execute_long_entry().
-    `market_exchange`: SIEMPRE la conexión de mercado (real) -- el
-    patrón de 5m se lee igual que el resto del análisis del bot, sin
-    importar BINGX_DEMO.
-    """
-    symbol = candidate["symbol"]
-    max_high_5m = candidate["max_high_5m"]
-
-    raw_5m = await market_exchange.fetch_ohlcv(symbol, timeframe="5m", limit=LONG_SCAN_OHLCV_LIMIT_5M)
-    df_5m = _drop_unclosed_candle(_to_dataframe(raw_5m))
-
-    if len(df_5m) < 210:
-        return "waiting", {"reason": "Datos insuficientes de 5m para evaluar el patrón de entrada long"}
-
-    # ---- 1) Invalidación: ¿el precio ya rompió el máximo original? ----
-    max_high_seen = float(df_5m["high"].max())
-    if max_high_seen > max_high_5m:
-        return "invalidated", {
-            "reason": (
-                f"El precio rompió el máximo original ({max_high_5m:.8f}) con un high de "
-                f"{max_high_seen:.8f} -- la singularidad ya no es válida"
-            )
-        }
-
-    # ---- 2) Buscar el cruce SMA20(5m) de ARRIBA hacia ABAJO de la EMA50(5m) ----
-    close_5m = df_5m["close"]
-    sma20_5m = sma(close_5m, 20)
-    ema50_5m = ema(close_5m, 50)
-    ema200_5m = ema(close_5m, 200)
-
-    n = len(df_5m)
-    cross_idx = None
-    for i in range(1, n):
-        crossed_down = sma20_5m.iloc[i] < ema50_5m.iloc[i] and sma20_5m.iloc[i - 1] >= ema50_5m.iloc[i - 1]
-        if crossed_down:
-            # Se conserva el cruce MÁS RECIENTE dentro del historial, por
-            # si hubo varios cruces sucesivos desde la última corrida.
-            cross_idx = i
-
-    if cross_idx is None:
-        return "waiting", {"reason": "Aún no ocurre el cruce SMA20/EMA50 (5m)"}
-
-    sma20_at_cross = float(sma20_5m.iloc[cross_idx])
-    ema200_at_cross = float(ema200_5m.iloc[cross_idx])
-    cross_ts = int(df_5m["ts"].iloc[cross_idx])
-
-    if ema200_at_cross >= sma20_at_cross:
-        # Caso borde: justo tras el cruce bajista de la SMA20 sobre la
-        # EMA50, se espera que la EMA200(5m) quede por debajo de la
-        # SMA20 (necesario para medir la distancia del apalancamiento).
-        # Si no es así, no se invalida el candidato -- se sigue
-        # esperando, ya que un cruce posterior sí podría cumplirlo.
-        log.warning(
-            "%s: cruce SMA20/EMA50 (5m) detectado pero EMA200(5m)=%.8f no está por debajo de "
-            "SMA20(5m)=%.8f -- se sigue esperando un cruce válido.",
-            symbol, ema200_at_cross, sma20_at_cross,
-        )
-        return "waiting", {"reason": "Cruce detectado pero la EMA200(5m) no quedó por debajo de la SMA20(5m)"}
-
-    return "triggered", {
-        "cross_ts": cross_ts,
-        "sma20_5m_at_cross": sma20_at_cross,
-        "ema200_5m_at_cross": ema200_at_cross,
-    }
 
 
 # ----------------------------------------------------------------------
@@ -1163,24 +1062,17 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en %s", symbol, info9_vol["reason"])
             return None, 9
 
-        # ---- Paso 10: dirección SHORT (patrón original + chequeo de
-        #      retroceso) o LONG (espejo, sin cambios) ----
-        direction, info10 = await evaluate_step_10_direction(exchange, symbol)
-        if direction is None:
+        # ---- Paso 10: SMA20(4h) > EMA50(4h), con chequeo de retroceso
+        #      cuando ambas ya están por encima de la EMA200(4h) ----
+        ok10, info10 = await check_step_10(exchange, symbol)
+        if not ok10:
             log.info("%s descartado en %s", symbol, info10["reason"])
             return None, 10
 
-        if direction == "short":
-            log.info(
-                "%s aprobó [Paso 10] dirección SHORT: SMA20(4h)=%.8f > EMA50(4h)=%.8f (EMA200(4h)=%.8f)",
-                symbol, info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
-            )
-        else:
-            log.info(
-                "%s aprobó [Paso 10-B] dirección LONG (espejo): SMA20(4h)=%.8f < EMA50(4h)=%.8f, "
-                "ambas < EMA200(4h)=%.8f",
-                symbol, info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
-            )
+        log.info(
+            "%s aprobó [Paso 10]: SMA20(4h)=%.8f > EMA50(4h)=%.8f (EMA200(4h)=%.8f)",
+            symbol, info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
+        )
 
         # RSI6/RSI12 en la vela roja del máximo (15m y 5m), necesarios
         # para el cálculo de la singularidad de los Pasos 11 y 12.
@@ -1226,78 +1118,46 @@ async def evaluate_symbol(exchange, symbol: str):
         else:
             singularidad_5m = False
 
-        # ---- Máximo de 5m (común a ambas ramas: short y long) ----
+        # ---- Paso 13 (datos crudos): máximo de 5m y SMA20(5m) ----
+        # Solo se llega aquí si existe singularidad en AL MENOS una de
+        # las dos temporalidades (15m -> Paso 11, o 5m -> Paso 12). Si
+        # existe en ambas, se trata igual que si fuera una sola.
+        #
+        # IMPORTANTE: el cálculo de apalancamiento/margen del Paso 13
+        # (80% ÷ distancia%) NO se hace aquí. La distancia usada en la
+        # fórmula depende de si la entrada terminará siendo a MERCADO o
+        # con orden STOP (Paso 14) -- eso solo se sabe con el precio en
+        # vivo justo antes de ejecutar la orden, así que el cálculo
+        # completo del Paso 13 se hace en bingx_bot.execute_entry(),
+        # justo antes del Paso 14, usando el mismo precio en vivo con
+        # el que se decide el tipo de entrada:
+        #   - Entrada a MERCADO: distancia = máximo -> precio actual
+        #     (el punto exacto donde se abriría la orden a mercado).
+        #   - Orden STOP: distancia = máximo -> SMA20(5m) (sin cambios,
+        #     fórmula original).
         max_idx_5m = info_5m["idx"]
         max_high_5m = float(df_5m["high"].iloc[max_idx_5m])
 
-        if direction == "short":
-            # ---- Paso 13 (datos crudos, rama SHORT): máximo de 5m y SMA20(5m) ----
-            # Solo se llega aquí si existe singularidad en AL MENOS una de
-            # las dos temporalidades (15m -> Paso 11, o 5m -> Paso 12). Si
-            # existe en ambas, se trata igual que si fuera una sola.
-            #
-            # IMPORTANTE: el cálculo de apalancamiento/margen del Paso 13
-            # (80% ÷ distancia%) NO se hace aquí. La distancia usada en la
-            # fórmula depende de si la entrada terminará siendo a MERCADO o
-            # con orden STOP (Paso 14) -- eso solo se sabe con el precio en
-            # vivo justo antes de ejecutar la orden, así que el cálculo
-            # completo del Paso 13 se hace en bingx_bot.execute_entry(),
-            # justo antes del Paso 14, usando el mismo precio en vivo con
-            # el que se decide el tipo de entrada:
-            #   - Entrada a MERCADO: distancia = máximo -> precio actual
-            #     (el punto exacto donde se abriría la orden a mercado).
-            #   - Orden STOP: distancia = máximo -> SMA20(5m) (sin cambios,
-            #     fórmula original).
-            close_5m = df_5m["close"]
-            ma20_5m = sma(close_5m, 20)
-            ma20_5m_value = float(ma20_5m.iloc[max_idx_5m])
+        close_5m = df_5m["close"]
+        ma20_5m = sma(close_5m, 20)
+        ma20_5m_value = float(ma20_5m.iloc[max_idx_5m])
 
-            log.info(
-                "%s [Paso 13] Datos preparados para calcular apalancamiento en la ejecución: "
-                "max_high_5m=%.8f | ma20_5m_value=%.8f",
-                symbol, max_high_5m, ma20_5m_value,
-            )
+        log.info(
+            "%s [Paso 13] Datos preparados para calcular apalancamiento en la ejecución: "
+            "max_high_5m=%.8f | ma20_5m_value=%.8f",
+            symbol, max_high_5m, ma20_5m_value,
+        )
 
-            plan = {
-                "symbol": symbol,
-                "direction": "short",
-                "ma20_5m_value": ma20_5m_value,
-                "max_high_5m": max_high_5m,
-                "round_start_ts": round_start_ts,
-                "es_verde_1h": es_verde_1h,
-                "singularidad_15m": singularidad_15m,
-                "singularidad_5m": singularidad_5m,
-            }
-            return plan, None
-
-        else:  # direction == "long"
-            # Patrón espejo (Paso 10-B): en vez de ejecutar de inmediato,
-            # se guarda el candidato en memoria (long_candidates.json) a
-            # la espera del patrón de entrada en 5m (cruce SMA20/EMA50) --
-            # ver bingx_bot.run_long_candidates_scan() y
-            # scan_long_candidate_for_entry() más abajo en este módulo.
-            # `max_high_5m` se conserva como el nivel que, si se rompe
-            # antes de que ocurra el cruce, invalida la singularidad y
-            # descarta el candidato sin llegar a abrir la posición.
-            log.info(
-                "%s [Paso 10-B] Candidato a LONG preparado: max_high_5m=%.8f (invalida la señal si se rompe) "
-                "-- se guarda en memoria a la espera del cruce SMA20/EMA50 en 5m.",
-                symbol, max_high_5m,
-            )
-
-            candidate = {
-                "symbol": symbol,
-                "direction": "long",
-                "max_high_5m": max_high_5m,
-                "round_start_ts": round_start_ts,
-                "es_verde_1h": es_verde_1h,
-                "singularidad_15m": singularidad_15m,
-                "singularidad_5m": singularidad_5m,
-                "sma20_4h": info10["sma20_4h"],
-                "ema50_4h": info10["ema50_4h"],
-                "ema200_4h": info10["ema200_4h"],
-            }
-            return candidate, None
+        plan = {
+            "symbol": symbol,
+            "ma20_5m_value": ma20_5m_value,
+            "max_high_5m": max_high_5m,
+            "round_start_ts": round_start_ts,
+            "es_verde_1h": es_verde_1h,
+            "singularidad_15m": singularidad_15m,
+            "singularidad_5m": singularidad_5m,
+        }
+        return plan, None
 
     except Exception as exc:
         log.error("Error evaluando %s en el pipeline de entrada: %s", symbol, exc)
