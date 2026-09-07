@@ -14,25 +14,14 @@ PASOS 2-14 -> Escáner de nuevas entradas en corto, siguiendo la cascada
            completa de condiciones (round alcista, RSI6, W%R6/12/24,
            singularidad matemática, apalancamiento dinámico, etc.)
            Ver strategy_entries.py para el detalle de cada paso.
-PASO 10-B / LARGOS -> Patrón espejo del Paso 10: cuando en 4h la SMA20
-           está por debajo de la EMA50 y ambas por debajo de la EMA200,
-           el símbolo (si además tiene singularidad, Pasos 11-12) se
-           guarda como candidato a LARGO en long_candidates.json en vez
-           de ejecutarse de inmediato. Cada corrida del bot revisa ese
-           archivo buscando el patrón de entrada espejo en 5m (SMA20
-           cruzando de arriba hacia abajo la EMA50) -- ver
-           run_long_candidates_scan() y strategy_entries.
-           scan_long_candidate_for_entry(). Esta rama de LARGOS no fue
-           tocada por el ajuste del Paso 10 explicado abajo (ver
-           strategy_entries.py).
 
 LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO Y QUÉ NO:
     - Universo de símbolos válidos (crypto perpetuo USDT-M) y TODO el
       escaneo de nuevas entradas (Pasos 2-14: velas 1h/15m/5m/4h,
       indicadores, volumen 24h del Paso 9) se leen SIEMPRE del mercado
       REAL de BingX, sin importar BINGX_DEMO -- un patrón técnico o un
-      volumen real no cambian porque el bot opere con dinero virtual.
-      Ver build_market_data_exchange().
+      volumen real no cambian porque el bot esté operando con dinero
+      virtual. Ver build_market_data_exchange().
     - El Paso 1 (gestión de Take Profit/Stop Loss) SÍ sigue la
       variable BINGX_DEMO: lee sus velas 1h de la MISMA cuenta (demo o
       real) donde vive la posición y donde se van a colocar las
@@ -59,7 +48,6 @@ import pandas as pd
 import ccxt.async_support as ccxt
 
 import strategy_entries as strat
-import long_candidates as long_store
 from indicators import sma, ema
 
 logging.basicConfig(
@@ -722,11 +710,6 @@ async def _set_leverage_with_cap_retry(exchange: "ccxt.bingx", symbol: str, leve
     Devuelve el apalancamiento que quedó realmente configurado, o None
     si no se pudo configurar ninguno (en cuyo caso la entrada se omite
     en vez de asumir un valor adivinado).
-
-    `side`: "SHORT" para las entradas en corto (Paso 14, sin cambios) o
-    "LONG" para las entradas en largo (patrón espejo, Paso 10-B) -- BingX
-    exige este parámetro en Hedge Mode y depende del lado de la posición
-    que se está por abrir.
     """
     try:
         await exchange.set_leverage(leverage, symbol, params={"side": side})
@@ -927,225 +910,6 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         log.error("Error ejecutando entrada para %s: %s", symbol, exc)
 
 
-async def _get_live_ema200_1h(exchange: "ccxt.bingx", symbol: str) -> float | None:
-    """
-    EMA200(1h) EN VIVO, recalculada en el momento exacto de la llamada
-    -- usada para el Take Profit de las entradas en largo (ver
-    strategy_entries.calculate_take_profit_long()). Mismo timeframe que
-    usa process_position_tp() para el Paso 1, pidiendo el mismo total
-    de velas de calentamiento + búsqueda (OHLCV_FETCH_LIMIT_TP) para
-    que la EMA200 converja igual de bien, y se consulta contra
-    `exchange` (cuenta demo/real) porque es el mismo precio con el que
-    se va a operar esa cuenta. Devuelve None si no se pudo calcular
-    (datos insuficientes o error de red) -- el llamador decide cómo
-    proceder sin TP.
-    """
-    try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_FETCH_LIMIT_TP)
-        closed = ohlcv[:-1]
-        if len(closed) < EMA_SLOW + EMA_WARMUP_CANDLES:
-            log.warning("%s: datos insuficientes de 1h para calcular la EMA200 en vivo (TP long).", symbol)
-            return None
-        closes = [c[4] for c in closed]
-        ema200_series = ema(pd.Series(closes, dtype="float64"), EMA_SLOW)
-        return float(ema200_series.iloc[-1])
-    except Exception as exc:
-        log.warning("%s: error calculando la EMA200(1h) en vivo para el TP long: %s", symbol, exc)
-        return None
-
-
-async def execute_long_entry(exchange: "ccxt.bingx", candidate: dict, trigger_info: dict) -> bool:
-    """
-    Ejecuta la entrada en LARGO para un candidato del JSON cuyo patrón
-    de entrada (cruce SMA20/EMA50 en 5m) ya se confirmó -- ver
-    strategy_entries.scan_long_candidate_for_entry(). Espejo de
-    execute_entry(), con tres diferencias clave (confirmadas con el
-    usuario):
-      - El apalancamiento usa calculate_leverage_long(): distancia entre
-        la SMA20(5m) y la EMA200(5m) EN EL MOMENTO DEL CRUCE (no del
-        precio en vivo, a diferencia del camino short).
-      - El tipo de orden (mercado vs STOP) se decide con el precio en
-        vivo respecto de esa misma SMA20(5m) del cruce.
-      - Solo se coloca Take Profit -- NUNCA Stop Loss -- calculado con
-        calculate_take_profit_long() usando la EMA200(1h) EN VIVO.
-
-    Esta rama de LARGOS no fue tocada por los cambios recientes del
-    Paso 1 (gatillos separados) ni del Paso 10 (chequeo de retroceso) --
-    ambos ajustes son exclusivos de la rama SHORT, confirmado con el
-    usuario.
-
-    Devuelve True si el candidato debe eliminarse del JSON (la orden se
-    ejecutó, o se descartó de forma definitiva por un motivo que no va
-    a cambiar en la próxima corrida); False si debe conservarse para
-    reintentar (p. ej. un error transitorio de red).
-    """
-    symbol = candidate["symbol"]
-    sma20_5m_cross = trigger_info["sma20_5m_at_cross"]
-    ema200_5m_cross = trigger_info["ema200_5m_at_cross"]
-
-    # Defensa en profundidad, igual que en execute_entry().
-    market = exchange.markets.get(symbol, {})
-    if _looks_like_forex_or_cfd(market):
-        log.error(
-            "%s: BLOQUEADO (long) -- parece ser forex/CFD/índice/acción sintética, no un futuro perpetuo cripto. "
-            "No se ejecuta la entrada.",
-            symbol,
-        )
-        return True
-
-    try:
-        ticker = await exchange.fetch_ticker(symbol)
-        last_price = ticker.get("last")
-        if last_price is None:
-            log.error("%s: no se pudo obtener el precio actual (long), se reintentará en la próxima corrida.", symbol)
-            return False
-        last_price = float(last_price)
-
-        try:
-            leverage_calc = strat.calculate_leverage_long(sma20_5m_cross, ema200_5m_cross)
-        except ValueError as exc:
-            log.info("%s descartado (long) al calcular el apalancamiento: %s", symbol, exc)
-            return True
-
-        log.info(
-            "%s [Long] Datos del cruce: SMA20(5m)=%.8f | EMA200(5m)=%.8f | leverage_calc=%.1fx",
-            symbol, sma20_5m_cross, ema200_5m_cross, leverage_calc,
-        )
-
-        max_leverage_exchange = await strat.get_max_leverage_for_symbol(exchange, symbol)
-        if max_leverage_exchange is not None:
-            leverage_wanted = min(int(leverage_calc), max_leverage_exchange)
-        else:
-            leverage_wanted = int(leverage_calc)
-            log.warning(
-                "%s: no se pudo confirmar el apalancamiento máximo real del exchange (long); "
-                "se usará el calculado (%dx) sin capar.",
-                symbol, leverage_wanted,
-            )
-
-        await exchange.set_margin_mode("isolated", symbol)
-
-        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage_wanted, side="LONG")
-        if leverage is None:
-            log.error("%s: no se pudo configurar el apalancamiento en BingX (long), se omite la entrada.", symbol)
-            return True
-
-        margin_usdt = await strat.calculate_position_size(exchange, symbol, leverage)
-        if margin_usdt <= 0:
-            log.info("%s descartado (long): margen calculado <= 0", symbol)
-            return True
-
-        notional = margin_usdt * leverage
-        amount = notional / last_price
-
-        # Igual que en el Paso 14 (short), pero en sentido inverso: si
-        # el precio en vivo ya está POR ENCIMA de la SMA20(5m) del
-        # cruce, la entrada es a MERCADO; si aún está por debajo, se
-        # coloca una orden STOP de compra esperando a que el precio
-        # suba y cruce la SMA20.
-        touched = last_price >= sma20_5m_cross
-
-        if touched:
-            entry_price_for_tp = last_price
-            order = await _create_order_with_notional_cap_retry(
-                exchange, symbol, "market", "buy", amount, None,
-                {"positionSide": "LONG"}, last_price,
-            )
-            log.info(
-                "[Long] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
-                symbol, margin_usdt, leverage, order.get("id"),
-            )
-        else:
-            entry_price_for_tp = sma20_5m_cross
-            order = await _create_order_with_notional_cap_retry(
-                exchange, symbol, "STOP", "buy", amount, sma20_5m_cross,
-                {"stopPrice": sma20_5m_cross, "positionSide": "LONG"}, last_price,
-            )
-            log.info(
-                "[Long] STOP-LIMIT buy order placed at SMA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
-                sma20_5m_cross, symbol, margin_usdt, leverage, order.get("id"),
-            )
-
-        # ---- Take Profit ÚNICO (sin Stop Loss) ----
-        ema200_1h_live = await _get_live_ema200_1h(exchange, symbol)
-        if ema200_1h_live is None:
-            log.warning(
-                "%s: no se pudo calcular la EMA200(1h) en vivo, se omite el Take Profit -- "
-                "revisar manualmente la posición recién abierta.",
-                symbol,
-            )
-        else:
-            try:
-                tp_price = strat.calculate_take_profit_long(entry_price_for_tp, ema200_1h_live, leverage)
-                tp_order = await exchange.create_order(
-                    symbol, "TAKE_PROFIT_MARKET", "sell", amount, None,
-                    {"stopPrice": tp_price, "positionSide": "LONG", "workingType": "CONTRACT_PRICE"},
-                )
-                log.info(
-                    "%s: Take Profit (long) colocado en %.6f | orden_id=%s",
-                    symbol, tp_price, tp_order.get("id"),
-                )
-            except ValueError as exc:
-                log.warning("%s: no se pudo calcular el Take Profit (long): %s", symbol, exc)
-            except Exception as exc:
-                log.error("%s: error colocando el Take Profit (long): %s", symbol, exc)
-
-        return True
-
-    except Exception as exc:
-        log.error("Error ejecutando entrada long para %s: %s", symbol, exc)
-        return False
-
-
-async def run_long_candidates_scan(exchange: "ccxt.bingx", market_exchange: "ccxt.bingx") -> None:
-    """
-    Revisa los candidatos a LARGO guardados en long_candidates.json (ver
-    long_candidates.py), buscando en cada uno el patrón de entrada
-    espejo del Paso 14 -- ver strategy_entries.scan_long_candidate_for_entry().
-
-    IMPORTANTE (confirmado con el usuario): esta función SOLO se llama
-    en modo "full", es decir, disparada por el cron EXTERNO configurado
-    en cronjob.org (repository_dispatch) o por workflow_dispatch manual
-    -- nunca por el cron INTERNO de GitHub Actions (schedule, cada
-    hora), que queda reservado exclusivamente al Paso 1 (TP/SL). Motivo:
-    cronjob.org es extremadamente puntual en sus ejecuciones, y la
-    lectura de esta estrategia (y de su memoria en .json) necesita esa
-    puntualidad -- el cron interno de GitHub no la garantiza.
-
-    `market_exchange` (siempre real) se usa para leer el patrón de 5m
-    -- toda la ESTRATEGIA (tanto short como long) se aplica siempre
-    sobre el mercado real, sin importar BINGX_DEMO; lo único que cambia
-    según esa variable es DÓNDE se abre la orden final. Por eso
-    `exchange` (demo/real según BINGX_DEMO) se usa dentro de
-    execute_long_entry() para el precio en vivo, el apalancamiento, el
-    margen, la orden y el Take Profit.
-    """
-    candidates = long_store.load_long_candidates()
-    if not candidates:
-        log.info("[Long] No hay candidatos a largo en memoria.")
-        return
-
-    log.info("[Long] Revisando %d candidato(s) a largo guardados en memoria...", len(candidates))
-    for candidate in candidates:
-        symbol = candidate["symbol"]
-        try:
-            status, info = await strat.scan_long_candidate_for_entry(market_exchange, candidate)
-        except Exception as exc:
-            log.error("%s: error escaneando el candidato a largo: %s", symbol, exc)
-            continue
-
-        if status == "invalidated":
-            log.info("%s: candidato a largo INVALIDADO (%s) -- se elimina de la memoria.", symbol, info.get("reason"))
-            long_store.remove_long_candidate(symbol)
-        elif status == "waiting":
-            log.info("%s: candidato a largo sigue esperando el patrón de entrada (%s).", symbol, info.get("reason"))
-        elif status == "triggered":
-            log.info("%s: patrón de entrada LONG detectado (cruce SMA20/EMA50 en 5m), ejecutando...", symbol)
-            done = await execute_long_entry(exchange, candidate, info)
-            if done:
-                long_store.remove_long_candidate(symbol)
-
-
 async def run_pasos_2_a_14_entradas(
     exchange: "ccxt.bingx",
     market_exchange: "ccxt.bingx",
@@ -1173,23 +937,15 @@ async def run_pasos_2_a_14_entradas(
 
     results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
 
-    # Se separan los resultados según el campo "direction" que ahora
-    # devuelve evaluate_symbol() (ver Paso 10-B en strategy_entries.py):
-    #   - "short": plan listo para ejecutar de inmediato, sin cambios
-    #     respecto al comportamiento original del bot.
-    #   - "long": candidato que NO se ejecuta ahora -- se guarda en
-    #     long_candidates.json a la espera del patrón de entrada espejo
-    #     en 5m (ver run_long_candidates_scan()).
-    short_plans = [plan for plan, _fs in results if plan is not None and plan.get("direction") == "short"]
-    long_candidates_new = [plan for plan, _fs in results if plan is not None and plan.get("direction") == "long"]
+    plans = [plan for plan, _fs in results if plan is not None]
 
     # RESUMEN POR PASO: cuenta en qué paso se descartó cada símbolo que
-    # NO llegó a ningún resultado (ni short ni long). Esto permite ver
-    # de un vistazo, sin leer el log completo símbolo por símbolo, si
-    # TODOS los candidatos se están cayendo en un mismo paso (posible
-    # señal de un bug o de un filtro demasiado estricto para las
-    # condiciones actuales del mercado) o si la caída está repartida de
-    # forma normal a lo largo de la cascada.
+    # NO llegó a ningún resultado. Esto permite ver de un vistazo, sin
+    # leer el log completo símbolo por símbolo, si TODOS los candidatos
+    # se están cayendo en un mismo paso (posible señal de un bug o de un
+    # filtro demasiado estricto para las condiciones actuales del
+    # mercado) o si la caída está repartida de forma normal a lo largo
+    # de la cascada.
     rejection_counts: dict = {}
     for _plan, failed_step in results:
         if failed_step is not None:
@@ -1202,25 +958,15 @@ async def run_pasos_2_a_14_entradas(
         )
         log.info("[Pasos 2-14] Resumen de descartes por paso -> %s", resumen)
 
-    log.info(
-        "[Pasos 2-14] Pares que cumplen TODAS las condiciones: %d en SHORT, %d nuevos candidatos a LONG",
-        len(short_plans), len(long_candidates_new),
-    )
-    for plan in short_plans:
+    log.info("[Pasos 2-14] Pares que cumplen TODAS las condiciones: %d en SHORT", len(plans))
+    for plan in plans:
         # El apalancamiento y el margen (Paso 13) ya no están en el
         # plan -- se calculan justo antes de ejecutar la orden (ver
         # execute_entry), porque dependen del precio en vivo en ese
         # momento para saber qué distancia usar en la fórmula.
         log.info("  -> SHORT %s | máximo(5m)=%.8f | SMA20(5m)=%.8f", plan["symbol"], plan["max_high_5m"], plan["ma20_5m_value"])
 
-    for candidate in long_candidates_new:
-        added = long_store.add_long_candidate(candidate)
-        if added:
-            log.info("  -> LONG %s | nuevo candidato guardado en memoria (max_high_5m=%.8f)", candidate["symbol"], candidate["max_high_5m"])
-        else:
-            log.info("  -> LONG %s | ya existía como candidato en memoria, se omite duplicado", candidate["symbol"])
-
-    for plan in short_plans:
+    for plan in plans:
         await execute_entry(exchange, plan)
 
 
@@ -1249,7 +995,7 @@ async def ensure_hedge_mode(exchange: "ccxt.bingx") -> None:
 def _get_bot_mode() -> str:
     """
     "full" (por defecto) -> corre Paso 1 (gestión de TP/SL) y Pasos
-        2-13 (búsqueda de nuevas entradas). Se usa para el disparador
+        2-14 (búsqueda de nuevas entradas). Se usa para el disparador
         externo (cronjob.org -> repository_dispatch) y para
         workflow_dispatch manual.
     "tp_only" -> corre SOLO el Paso 1 (gestión de TP/SL), sin escanear
@@ -1291,28 +1037,20 @@ async def main() -> None:
         symbols_with_position = {p["symbol"] for p in open_positions}
 
         if mode == "tp_only":
-            # Solo Paso 1 (gestión de TP/SL). IMPORTANTE (confirmado con
-            # el usuario): el escaneo de candidatos a largo guardados en
-            # memoria (long_candidates.json) NO corre aquí -- el cron
-            # INTERNO de GitHub (schedule, cada hora) queda reservado
-            # exclusivamente a TP/SL, igual que antes. La lectura de la
-            # estrategia long y del .json debe hacerla SOLO el
-            # disparador EXTERNO (cronjob.org -> repository_dispatch),
-            # que es extremadamente puntual, para no depender de la
-            # precisión del cron interno de GitHub Actions.
+            # Solo Paso 1 (gestión de TP/SL). El cron INTERNO de GitHub
+            # (schedule, cada hora) queda reservado exclusivamente a
+            # TP/SL.
             await asyncio.gather(
                 run_paso1_gestion_tp(exchange, allowed_symbols),
             )
         else:
             # Modo completo (repository_dispatch desde cronjob.org, o
-            # workflow_dispatch manual): Paso 1 (gestión de TP/SL), el
-            # escaneo de candidatos a largo en memoria -- SOLO aquí,
-            # ver comentario de arriba -- y Pasos 2-14 (búsqueda de
-            # nuevas entradas, leen de `market_exchange` -- siempre
-            # real) corren de forma concurrente.
+            # workflow_dispatch manual): Paso 1 (gestión de TP/SL) y
+            # Pasos 2-14 (búsqueda de nuevas entradas, leen de
+            # `market_exchange` -- siempre real) corren de forma
+            # concurrente.
             await asyncio.gather(
                 run_paso1_gestion_tp(exchange, allowed_symbols),
-                run_long_candidates_scan(exchange, market_exchange),
                 run_pasos_2_a_14_entradas(exchange, market_exchange, allowed_symbols, symbols_with_position),
             )
 
