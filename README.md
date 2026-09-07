@@ -24,7 +24,7 @@ Para cada par SIN posición abierta:
 | 6 | El máximo en 5m debe estar en vela roja y coincidir con el máximo de 1h |
 | 7-8 | W%R6, W%R12, W%R24 de esa vela roja son todos distintos entre sí (15m y 5m) |
 | 9 | Volumen 24h > 2,000,000 USDT (siempre del mercado real, ver más abajo) |
-| 10 | SMA20 por encima de la EMA50, en temporalidad 4h. Si además ambas están por encima de la EMA200(4h), se exige que la SMA20 nunca haya retrocedido por debajo de la EMA50 desde que cruzó la EMA200 — ver el detalle completo más abajo |
+| 10 | SMA20 por encima de la EMA50, en temporalidad 4h. Si además ambas están por encima de la EMA200(4h), se exige que la SMA20 nunca haya retrocedido por debajo de la EMA50 desde que cruzó la EMA200 — ver el detalle completo más abajo. Si SMA20 no está por encima de la EMA50, se descarta el símbolo por completo |
 | 11-12 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 11) y/o 5m (paso 12) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/|r| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
 | 13 | Apalancamiento = 80% ÷ (% de distancia). La distancia usa la SMA20(5m) si la entrada es STOP, o el precio actual si es a mercado (ver detalle más abajo), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
 | 14 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
@@ -47,7 +47,6 @@ Sube estos archivos a tu repositorio manteniendo la estructura:
 - `bingx_bot.py`
 - `strategy_entries.py`
 - `indicators.py`
-- `long_candidates.py`
 - `requirements.txt`
 - `.github/workflows/bingx-bot.yml`
 
@@ -139,7 +138,7 @@ Se corrigió cambiando el tipo de orden de `STOP_MARKET` a **`STOP`** (límite):
 
 Además del disparador externo (cronjob.org → `repository_dispatch`, que corre el bot **completo**: Paso 1 + Pasos 2-14), el workflow incluye un cron **interno** de GitHub Actions que corre **cada hora** (`0 * * * *`) usando `schedule`, en sintonía con el timeframe 1h del Paso 1.
 
-Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit / Stop Loss sobre posiciones ya abiertas, con sus dos gatillos independientes). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14) **ni revisa la memoria de candidatos a largo** (`long_candidates.json`), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada.
+Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit / Stop Loss sobre posiciones ya abiertas, con sus dos gatillos independientes). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada.
 
 El filtro de "solo futuros perpetuos cripto con USDT como referencia" (ver más abajo) es **una única función**, compartida por todo el script — se aplica igual sin importar qué disparador o `BOT_MODE` esté corriendo, tanto al Paso 1 como a los Pasos 2-14.
 
@@ -148,10 +147,8 @@ En resumen:
 | Disparador | `BOT_MODE` | Qué corre |
 |---|---|---|
 | `schedule` (cron interno de GitHub, cada hora) | `tp_only` | Solo Paso 1 (TP/SL) |
-| `repository_dispatch` (cronjob.org) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) + escaneo de candidatos a largo (`long_candidates.json`) |
-| `workflow_dispatch` (manual) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) + escaneo de candidatos a largo (`long_candidates.json`) |
-
-**Nota sobre la rama de largos:** el escaneo de `long_candidates.json` (búsqueda del cruce SMA20/EMA50 en 5m, ver más abajo) corre **solo** en modo `full` — es decir, únicamente con el disparador externo de cronjob.org o de forma manual, nunca con el cron interno de GitHub. Motivo: cronjob.org es extremadamente puntual en sus ejecuciones, y esta estrategia necesita esa puntualidad para no perderse el momento del cruce en 5m.
+| `repository_dispatch` (cronjob.org) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) |
+| `workflow_dispatch` (manual) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) |
 
 Si quieres cambiar la frecuencia del cron interno, ajusta la línea `cron: "0 * * * *"` en `.github/workflows/bingx-bot.yml` (formato estándar de cron; GitHub Actions no garantiza precisión exacta al minuto en horarios de alta demanda).
 
@@ -184,73 +181,24 @@ En producción el bot llegó a incluir en su universo de símbolos pares del pro
 
 Se corrigió generalizando el filtro con dos señales independientes: (1) el prefijo del id se amplió a `NC`, cubriendo cualquier subtipo de este producto; y (2) se descarta cualquier símbolo cuya moneda base siga el patrón `SUBYACENTE2REFERENCIA` (ej. `EUR2USD`, `APP2USD`) o sea directamente una divisa fiat. Esta función (`_looks_like_forex_or_cfd`) es **una sola** y se usa para construir el universo de símbolos del bot completo, además de una segunda verificación justo antes de ejecutar la orden.
 
-## 🔧 Cambio de lógica: Paso 10 — chequeo de retroceso (rama SHORT únicamente)
+## 🔧 Paso 10 — SMA20 vs EMA50 (4h) y chequeo de retroceso
 
 **Historial del paso:** originalmente el Paso 10 exigía SMA20(4h) > EMA50(4h) **y** ambas por debajo de la EMA200(4h). Ese segundo requisito resultó demasiado estricto (confirmado con capturas reales de ETHFIUSDT y SPACEUSDT) y se eliminó: desde entonces, la única condición era SMA20(4h) > EMA50(4h), sin importar su relación con la EMA200(4h).
 
 **Ahora**, se reincorpora una condición relacionada con la EMA200, pero de forma distinta y más específica — **solo aplica en un caso particular**:
 
 - Si SMA20(4h) > EMA50(4h) **pero no** están ambas por encima de la EMA200(4h): el Paso 10 funciona exactamente igual que antes de este cambio, sin ningún chequeo extra.
-- Si SMA20(4h) > EMA50(4h) **y además** ambas están por encima de la EMA200(4h): se agrega un chequeo extra. Se busca el punto donde la SMA20 cruzó de abajo hacia arriba la EMA200, y se revisa **todo el tramo** desde ese cruce hasta la vela actual: la SMA20 debe haberse mantenido **siempre** por encima de la EMA50 en ese tramo, sin ningún retroceso por debajo (aunque después haya vuelto a subir). Si se detecta un retroceso así, **el símbolo se descarta por completo — ni short ni long** — porque la señal de tendencia ya no se considera "limpia".
+- Si SMA20(4h) > EMA50(4h) **y además** ambas están por encima de la EMA200(4h): se agrega un chequeo extra. Se busca el punto donde la SMA20 cruzó de abajo hacia arriba la EMA200, y se revisa **todo el tramo** desde ese cruce hasta la vela actual: la SMA20 debe haberse mantenido **siempre** por encima de la EMA50 en ese tramo, sin ningún retroceso por debajo (aunque después haya vuelto a subir). Si se detecta un retroceso así, **el símbolo se descarta por completo**, porque la señal de tendencia ya no se considera "limpia".
 - **Caso borde (supuesto adoptado, confirmado con el usuario):** si dentro de las 1200 velas de 4h consultadas nunca se encuentra el cruce de la SMA20 sobre la EMA200 (por ejemplo, porque la SMA20 ya empezaba por encima desde el inicio del historial disponible), no hay forma de confirmar ni negar un retroceso — se aprueba el short con normalidad en ese caso.
 
-**Importante:** este chequeo aplica únicamente a la rama SHORT del Paso 10. La rama LONG (Paso 10-B, patrón espejo) **no fue modificada** — sigue exigiendo SMA20(4h) < EMA50(4h) y ambas por debajo de la EMA200(4h), sin ningún chequeo adicional.
-
-## 🆕 Rama de entradas en LARGO (Paso 10-B): patrón espejo del Paso 10 — SIN CAMBIOS
-
-Además de la estrategia en corto ya descrita, el bot detecta también su patrón **espejo** para entradas en **largo**. Los Pasos 2 a 9 son exactamente los mismos para todos los símbolos; el **Paso 10** bifurca en tres caminos posibles:
-
-| Condición en 4h | Dirección |
-|---|---|
-| SMA20(4h) > EMA50(4h) | **SHORT** (Pasos 11-14 tal como se describieron arriba, con el chequeo de retroceso cuando aplica) |
-| SMA20(4h) < EMA50(4h) **y** ambas < EMA200(4h) | **LONG** (espejo, Paso 10-B) |
-| Ninguna de las dos anteriores, o retroceso detectado en la rama short | Se descarta el símbolo por completo |
-
-Si el símbolo cae en el camino LONG, se le calcula la **misma fórmula de singularidad** (S = ln(2k) - 1, Pasos 11-12, sin ningún cambio en el cálculo) usando los mismos datos de 15m/5m. Si aprueba, en vez de ejecutarse de inmediato **se guarda como candidato en `long_candidates.json`** — una lista que actúa como "memoria" persistente del bot, ya que las entradas en largo dependen de un patrón que puede tardar horas en aparecer en 5m.
-
-### Patrón de entrada para los candidatos guardados
-
-**Importante:** a diferencia del Paso 1, esta revisión **NO** corre en el cron interno de GitHub (`schedule`, `BOT_MODE=tp_only`) — corre **únicamente** cuando el bot se dispara en modo `full`, es decir, desde el cron **externo** configurado en cronjob.org (`repository_dispatch`) o de forma manual (`workflow_dispatch`).
-
-Cada corrida en modo `full` revisa `long_candidates.json` buscando, en temporalidad 5m:
-
-- **SMA20(5m) cruza de ARRIBA hacia ABAJO la EMA50(5m).**
-
-Antes de aceptar ese cruce como válido, se verifica que el precio **no haya roto por encima** el `max_high_5m` original (el mismo máximo del round que dio origen a la singularidad) — si ya lo rompió, la señal se invalida y el candidato se elimina de la memoria sin abrir ninguna orden.
-
-Si el cruce es válido:
-
-- Si el precio en vivo está **por debajo** de la SMA20(5m) del cruce → orden **STOP LIMIT de compra**, esperando a que el precio suba y la cruce.
-- Si el precio en vivo está **por encima** → entrada **a mercado**.
-
-**Apalancamiento** = 80% ÷ distancia%, donde la distancia (en porcentaje, igual que en cualquier gráfico de velas) se mide desde la **SMA20(5m) en el momento exacto del cruce** hasta la **EMA200(5m)** en ese mismo instante. Redondeado a múltiplos de 5 y limitado al máximo de BingX, igual que en el camino short.
-
-**Margen**: mismo criterio que en corto — el 10% del margen total de la cuenta, o el máximo que permite ese apalancamiento, lo que sea menor.
-
-### Take Profit único (sin Stop Loss)
-
-A diferencia del camino en corto, las entradas en largo **solo colocan Take Profit — nunca Stop Loss**. La distancia se mide, en porcentaje, desde el precio de entrada hasta la **EMA200(1h) en vivo** (recalculada en el momento exacto de la ejecución, no un valor congelado de cuando el candidato entró a la memoria):
-
-```
-distancia_pct = (precio_entrada - EMA200(1h)) / precio_entrada × 100
-TP = precio_entrada × (1 + (apalancamiento × distancia_pct) / 100)
-```
-
-### Memoria persistente (`long_candidates.json`) y GitHub Actions
-
-Como el patrón de entrada puede tardar horas en aparecer, los candidatos se guardan en `long_candidates.json` en la raíz del repositorio. Cada candidato se elimina de esa lista en cuanto:
-
-- Se ejecuta su orden de entrada (a mercado o STOP), o
-- Se invalida porque el precio rompió el máximo original.
-
-**Importante:** el runner de GitHub Actions es efímero — cualquier cambio a este archivo durante una corrida se pierde a menos que se guarde de vuelta en el repositorio. Por eso el workflow (`.github/workflows/bingx-bot.yml`) incluye un paso final que hace `git commit` y `git push` de `long_candidates.json` si cambió durante la ejecución. Esto requiere el permiso `contents: write`, ya configurado en el workflow.
+Si SMA20(4h) no está por encima de la EMA50(4h), o se detecta el retroceso, el símbolo se descarta por completo.
 
 ## ⚠️ Advertencias importantes
 
 - Este bot abre posiciones apalancadas en corto de forma 100% automática, sin confirmación manual. Revisa cuidadosamente la lógica antes de usarlo con capital real.
 - El API key debe tener permisos de lectura y trading de futuros (nunca de retiro de fondos).
 - El bot fuerza automáticamente el **Hedge Mode** en la cuenta al arrancar (necesario porque todo el código usa `positionSide` LONG/SHORT). Si tienes posiciones abiertas al momento de correrlo por primera vez, ese cambio puede no aplicarse hasta que las cierres.
-- BingX exige el parámetro `side` (LONG/SHORT/BOTH) en `set_leverage()`; el bot ya lo envía como `"SHORT"` (o `"LONG"` en la rama de largos).
+- BingX exige el parámetro `side` (LONG/SHORT/BOTH) en `set_leverage()`; el bot ya lo envía como `"SHORT"`.
 - El tipo de orden correcto para la entrada condicional (Paso 14, cuando el precio aún no tocó la SMA20) es `"STOP"` en la API de BingX (no `"STOP_LIMIT"`, que el exchange rechaza).
 - En Hedge Mode, BingX rechaza el campo `reduceOnly` en las órdenes de cierre (error 109400) — no debe enviarse; `positionSide` ya es suficiente para identificar que la orden cierra la posición.
 - Prueba primero en cuenta demo/testnet o con montos pequeños, y revisa tanto "Posiciones" como el "Historial de órdenes" en BingX — una orden STOP puede quedar "colocada" en el log sin llegar a ejecutarse si el precio nunca la cruza.
