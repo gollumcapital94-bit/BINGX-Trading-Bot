@@ -29,7 +29,6 @@ def rsi(series: pd.Series, period: int) -> pd.Series:
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi_val = 100 - (100 / (1 + rs))
-    # Cuando avg_loss es 0 (solo subidas), RSI = 100
     rsi_val = rsi_val.fillna(100)
     return rsi_val
 
