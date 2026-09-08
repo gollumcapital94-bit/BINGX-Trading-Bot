@@ -14,6 +14,13 @@ PASOS 2-14 -> Escáner de nuevas entradas en corto, siguiendo la cascada
            completa de condiciones (round alcista, RSI6, W%R6/12/24,
            singularidad matemática, apalancamiento dinámico, etc.)
            Ver strategy_entries.py para el detalle de cada paso.
+BARRIDO DE BALANCE (solo mercado real, solo disparador externo) -> al
+           terminar de leer el mercado y evaluar la estrategia (Pasos
+           2-14), sin importar si se abrió o no una operación nueva, se
+           revisa el balance de la cuenta de FUTUROS PERPETUOS. Si supera
+           FUTURES_BALANCE_CAP_USDT, se transfiere el excedente a la
+           cuenta de FONDOS. Ver check_and_sweep_futures_balance() y la
+           variable de entorno RUN_BALANCE_CHECK más abajo.
 
 LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO Y QUÉ NO:
     - Universo de símbolos válidos (crypto perpetuo USDT-M) y TODO el
@@ -30,6 +37,9 @@ LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO Y QUÉ NO:
       balance, colocar TP/SL (Paso 1), configurar apalancamiento/
       margen y abrir la orden de entrada (Pasos 13-14) -- siempre van
       contra `exchange` (VST/sandbox en demo, producción en real).
+    - El barrido de balance (ver arriba) SOLO aplica en modo real: la
+      cuenta demo (VST) tiene su propio balance virtual, transferirlo
+      no tiene ningún sentido -- ver check_and_sweep_futures_balance().
 
 Requiere las variables de entorno:
     BINGX_API_KEY
@@ -990,6 +1000,185 @@ async def ensure_hedge_mode(exchange: "ccxt.bingx") -> None:
 
 
 # ----------------------------------------------------------------------
+# BARRIDO DE BALANCE EXCEDENTE: cuenta de futuros -> cuenta de fondos
+#
+# Al terminar de leer el mercado y evaluar la estrategia (Pasos 2-14),
+# sin importar si se abrió o no una operación nueva, se revisa el
+# balance TOTAL de la cuenta de FUTUROS PERPETUOS. Si supera
+# FUTURES_BALANCE_CAP_USDT (10,000 USDT), se transfiere el EXCEDENTE a
+# la cuenta de FONDOS.
+#
+# DEFINICIÓN DE "BALANCE TOTAL" (confirmada con el usuario, con
+# ejemplo numérico): NO es el campo 'used' genérico que devuelve
+# exchange.fetch_balance() -- en margen AISLADO, ese campo puede no
+# reflejar con precisión el margen ya movido a cada posición. En vez
+# de eso, se construye explícitamente sumando:
+#
+#     balance total = margen LIBRE (fetch_balance)
+#                    + margen retenido en CADA posición abierta (aislado)
+#
+# Ejemplo del usuario: 1,000 USDT de margen aislado en un par + 500
+# USDT de margen aislado en otro par (1,500 USDT retenidos en
+# posiciones) + 12,000 USDT libres = 13,500 USDT de balance total.
+# Con el tope de 10,000 USDT, el excedente a transferir es 3,500 USDT.
+#
+# SOLO MERCADO REAL: nunca se ejecuta en modo demo -- la cuenta VST
+# tiene su propio balance virtual, transferirlo no tiene sentido ni
+# afecta fondos reales. Ver el chequeo de `demo_mode` en main().
+#
+# SOLO DISPARADOR EXTERNO: este chequeo se activa ÚNICAMENTE cuando la
+# corrida fue disparada por el disparador externo configurado en
+# cronjob.org (repository_dispatch) -- nunca desde el cron interno de
+# GitHub (schedule, modo tp_only, que de todos modos nunca llega a
+# leer el mercado completo) ni desde una ejecución manual
+# (workflow_dispatch). Ver la variable de entorno RUN_BALANCE_CHECK,
+# controlada desde .github/workflows/bingx-bot.yml.
+# ----------------------------------------------------------------------
+FUTURES_BALANCE_CAP_USDT = 10_000.0  # tope de balance en la cuenta de futuros perpetuos
+FUND_TRANSFER_FROM_ACCOUNT = "swap"      # cuenta de futuros perpetuos (USDT-M) en ccxt
+FUND_TRANSFER_TO_ACCOUNT = "funding"     # cuenta de fondos en ccxt
+
+
+def _get_usdt_free_balance(balance: dict) -> float:
+    """
+    Devuelve el margen LIBRE de USDT en la cuenta de futuros (lo único
+    que de verdad se puede transferir). Se usa SOLO en modo real (nunca
+    demo/VST -- ver el chequeo de `demo_mode` antes de llamar a
+    check_and_sweep_futures_balance), así que no hace falta revisar la
+    clave 'VST' aquí, a diferencia de _get_available_balance() en
+    strategy_entries.py.
+    """
+    entry = balance.get("USDT") or {}
+    free = entry.get("free")
+    if free is not None:
+        return float(free)
+
+    # Fallback si el exchange no separa free/used: total - used.
+    total = entry.get("total")
+    used = entry.get("used")
+    if total is not None:
+        return max(float(total) - float(used or 0), 0.0)
+
+    return 0.0
+
+
+def _sum_positions_margin_usdt(positions: list[dict]) -> float:
+    """
+    Suma el margen AISLADO retenido en cada posición abierta (una por
+    cada par con posición, ej.: 1,000 USDT en un par + 500 USDT en
+    otro = 1,500 USDT). Esto es lo que el balance TOTAL de la cuenta
+    NO refleja de forma confiable a través del campo genérico 'used'
+    de fetch_balance() cuando se opera en margen aislado -- cada
+    posición mueve su propio margen "hacia adentro" de la posición.
+
+    Se usa el campo 'collateral' de la posición unificada de ccxt (el
+    margen real asignado a esa posición), con 'initialMargin' como
+    respaldo, y como último recurso los campos crudos que BingX
+    devuelve en 'info' (positionMargin / isolatedMargin / margin).
+    """
+    total_margin = 0.0
+    for pos in positions:
+        margin = pos.get("collateral")
+        if margin is None:
+            margin = pos.get("initialMargin")
+        if margin is None:
+            info = pos.get("info", {}) or {}
+            margin = info.get("positionMargin") or info.get("isolatedMargin") or info.get("margin")
+
+        try:
+            total_margin += abs(float(margin or 0))
+        except (TypeError, ValueError):
+            log.warning(
+                "[Barrido de balance] No se pudo leer el margen de la posición %s, se omite del cálculo.",
+                pos.get("symbol"),
+            )
+    return total_margin
+
+
+async def check_and_sweep_futures_balance(exchange: "ccxt.bingx", allowed_symbols: set[str]) -> None:
+    """
+    Revisa el balance TOTAL (USDT) de la cuenta de futuros perpetuos --
+    margen LIBRE + margen retenido en CADA posición abierta (ver el
+    comentario de cabecera de esta sección para la definición exacta,
+    confirmada con el usuario) -- y, si supera FUTURES_BALANCE_CAP_USDT,
+    transfiere el excedente a la cuenta de fondos.
+
+    Las posiciones abiertas se vuelven a consultar AQUÍ (no se reutiliza
+    la lista obtenida al inicio de main()), porque en esta misma corrida
+    el escáner de entradas (Pasos 2-14) puede haber abierto una posición
+    nueva justo antes de este chequeo -- se necesita el estado más
+    reciente posible de la cuenta.
+
+    SOLO se puede transferir de verdad el margen LIBRE -- el margen
+    retenido en posiciones abiertas está comprometido y la API no
+    permite moverlo. Si el margen libre disponible en este momento es
+    menor que el excedente calculado, se transfiere como máximo el
+    margen libre, y el resto queda pendiente para una corrida futura
+    (por ejemplo, cuando se libere margen al cerrarse una posición).
+
+    Se llama con `exchange` (la conexión de CUENTA), y únicamente
+    cuando el llamador ya confirmó que el bot corre en modo REAL y que
+    la corrida fue disparada externamente (ver main()).
+    """
+    try:
+        positions = await get_open_positions(exchange, allowed_symbols)
+        balance = await exchange.fetch_balance()
+    except Exception as exc:
+        log.error("[Barrido de balance] No se pudo obtener el balance/posiciones de la cuenta de futuros: %s", exc)
+        return
+
+    free = _get_usdt_free_balance(balance)
+    margin_in_positions = _sum_positions_margin_usdt(positions)
+    total = free + margin_in_positions
+
+    log.info(
+        "[Barrido de balance] Margen libre=%.2f USDT | margen retenido en %d posición(es)=%.2f USDT | total=%.2f USDT",
+        free, len(positions), margin_in_positions, total,
+    )
+
+    if total <= FUTURES_BALANCE_CAP_USDT:
+        log.info(
+            "[Barrido de balance] Balance total (%.2f USDT) no supera el tope de %.2f USDT, no se transfiere nada.",
+            total, FUTURES_BALANCE_CAP_USDT,
+        )
+        return
+
+    excess = total - FUTURES_BALANCE_CAP_USDT
+    transfer_amount = min(excess, free)
+
+    if transfer_amount <= 0:
+        log.warning(
+            "[Barrido de balance] El balance total (%.2f USDT) supera el tope de %.2f USDT "
+            "(excedente=%.2f USDT), pero no hay margen libre disponible para transferir "
+            "-- está comprometido en posiciones abiertas. Se reintentará en la próxima corrida externa.",
+            total, FUTURES_BALANCE_CAP_USDT, excess,
+        )
+        return
+
+    if transfer_amount < excess:
+        log.warning(
+            "[Barrido de balance] Excedente calculado=%.2f USDT, pero solo hay %.2f USDT libres. "
+            "Se transfiere el máximo disponible; el resto queda pendiente para una futura corrida.",
+            excess, free,
+        )
+
+    try:
+        transfer = await exchange.transfer(
+            "USDT", transfer_amount, FUND_TRANSFER_FROM_ACCOUNT, FUND_TRANSFER_TO_ACCOUNT,
+        )
+        log.info(
+            "[Barrido de balance] Transferencia ejecutada: %.2f USDT de futuros -> fondos "
+            "(libre=%.2f USDT + retenido en posiciones=%.2f USDT = total %.2f USDT, tope=%.2f USDT) | transfer_id=%s",
+            transfer_amount, free, margin_in_positions, total, FUTURES_BALANCE_CAP_USDT, transfer.get("id"),
+        )
+    except Exception as exc:
+        log.error(
+            "[Barrido de balance] Error transfiriendo %.2f USDT de futuros a fondos: %s",
+            transfer_amount, exc,
+        )
+
+
+# ----------------------------------------------------------------------
 # Orquestación general
 # ----------------------------------------------------------------------
 def _get_bot_mode() -> str:
@@ -1018,6 +1207,12 @@ async def main() -> None:
     demo_mode = _env_flag("BINGX_DEMO", "false")
     market_exchange = build_market_data_exchange(exchange, demo_mode)
     mode = _get_bot_mode()
+    # Controla el barrido de balance (futuros -> fondos, ver
+    # check_and_sweep_futures_balance): SOLO se activa cuando el
+    # workflow lo marca como disparado por el disparador EXTERNO
+    # (cronjob.org -> repository_dispatch) -- ver
+    # .github/workflows/bingx-bot.yml.
+    run_balance_check = _env_flag("RUN_BALANCE_CHECK", "false")
     log.info("Modo de ejecución: %s", mode)
     try:
         # `exchange` también necesita sus propios mercados cargados
@@ -1039,7 +1234,10 @@ async def main() -> None:
         if mode == "tp_only":
             # Solo Paso 1 (gestión de TP/SL). El cron INTERNO de GitHub
             # (schedule, cada hora) queda reservado exclusivamente a
-            # TP/SL.
+            # TP/SL. Nunca corre el barrido de balance (RUN_BALANCE_CHECK
+            # siempre viene en 'false' para este disparador, ver el
+            # workflow), porque nunca termina de leer el mercado
+            # completo (Pasos 2-14).
             await asyncio.gather(
                 run_paso1_gestion_tp(exchange, allowed_symbols),
             )
@@ -1053,6 +1251,20 @@ async def main() -> None:
                 run_paso1_gestion_tp(exchange, allowed_symbols),
                 run_pasos_2_a_14_entradas(exchange, market_exchange, allowed_symbols, symbols_with_position),
             )
+
+            # BARRIDO DE BALANCE (futuros -> fondos): se ejecuta AQUÍ,
+            # justo después de terminar de leer el mercado y evaluar la
+            # estrategia completa (Paso 1 + Pasos 2-14), sin importar
+            # si se abrió o no una operación nueva en esta corrida.
+            # SOLO en mercado real (nunca demo/VST) y SOLO cuando el
+            # disparador externo (cronjob.org) lo activó.
+            if run_balance_check and not demo_mode:
+                await check_and_sweep_futures_balance(exchange, allowed_symbols)
+            elif run_balance_check and demo_mode:
+                log.info(
+                    "[Barrido de balance] Se omite: el bot está en modo DEMO (VST). "
+                    "El barrido de balance solo aplica a la cuenta de futuros REAL."
+                )
 
     finally:
         await exchange.close()
