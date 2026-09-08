@@ -1,6 +1,6 @@
-# BingX Trading Bot — Pasos 1 a 14
+# BingX Trading Bot — Pasos 1 a 14 + Barrido de balance
 
-Bot asincrónico para futuros perpetuos USDT-M en BingX, compuesto por dos módulos que corren en paralelo en cada ejecución:
+Bot asincrónico para futuros perpetuos USDT-M en BingX, compuesto por dos módulos que corren en paralelo en cada ejecución, más un chequeo final de balance:
 
 ## Paso 1 — Gestión de Take Profit y Stop Loss (DOS gatillos independientes)
 
@@ -31,6 +31,30 @@ Para cada par SIN posición abierta:
 
 Todas las posiciones se abren en margen aislado, en corto (short).
 
+## 🏦 Barrido de balance excedente: futuros → fondos (solo mercado real, solo disparador externo)
+
+Al terminar de leer el mercado y evaluar la estrategia (Paso 1 + Pasos 2-14), **sin importar si se abrió o no una operación nueva**, el bot calcula el balance TOTAL de tu cuenta de **futuros perpetuos**. Si ese balance supera **10,000 USDT**, transfiere automáticamente el **excedente** a tu cuenta de **fondos**.
+
+**Cómo se calcula el balance total (confirmado con el usuario):**
+
+```
+balance total = margen LIBRE + margen retenido en CADA posición abierta (aislado)
+```
+
+**Ejemplo del usuario:** 1,000 USDT de margen aislado en un par + 500 USDT de margen aislado en otro par (1,500 USDT retenidos en posiciones) + 12,000 USDT libres = **13,500 USDT** de balance total. Con el tope de 10,000 USDT, el bot transfiere **3,500 USDT** a la cuenta de fondos.
+
+No se usa el campo `used` genérico que devuelve la API de balance de BingX: en margen AISLADO ese campo puede no reflejar con precisión el margen ya movido a cada posición. En vez de eso, el bot suma explícitamente el margen de cada posición abierta (`collateral`/`initialMargin` de ccxt, con respaldo en los campos crudos de BingX) al margen libre — ver `_sum_positions_margin_usdt()` en `bingx_bot.py`.
+
+Reglas importantes:
+
+- **Solo mercado real:** este chequeo nunca se ejecuta en modo demo (`BINGX_DEMO=true`) — la cuenta VST tiene su propio balance virtual, y transferirlo no tiene ningún efecto sobre fondos reales.
+- **Solo el disparador externo (cronjob.org):** el chequeo se activa únicamente cuando la corrida fue disparada por tu disparador externo configurado en cronjob.org (`repository_dispatch`). El cron interno de GitHub (`schedule`, dedicado solo a TP/SL) y las ejecuciones manuales (`workflow_dispatch`) NUNCA disparan este barrido — ver la variable `RUN_BALANCE_CHECK` en `.github/workflows/bingx-bot.yml`.
+- Las posiciones abiertas se vuelven a consultar en este punto (no se reutiliza la lista de antes de escanear), porque el propio bot pudo haber abierto una posición nueva en esta misma corrida (Pasos 2-14) justo antes del chequeo.
+- **Solo se puede transferir de verdad el margen LIBRE** — el margen retenido en posiciones abiertas está comprometido y la API no permite moverlo. Si en el momento del chequeo el margen libre disponible es menor que el excedente calculado, el bot transfiere como máximo lo que esté libre, deja un log de advertencia, y el resto queda pendiente para la siguiente corrida externa (por ejemplo, cuando se libere margen al cerrarse una posición).
+- Cada transferencia exitosa se notifica por Telegram, igual que las entradas y el TP/SL.
+
+Ver `check_and_sweep_futures_balance()` en `bingx_bot.py` para el detalle de la implementación.
+
 ## Supuestos adoptados (confirmados con el usuario)
 
 - MA20 = SMA20 (media simple).
@@ -39,6 +63,7 @@ Todas las posiciones se abren en margen aislado, en corto (short).
 - El margen total de la cuenta (Paso 13) se calcula como margen libre + margen ya usado en otras operaciones abiertas, no solo el saldo libre.
 - El Paso 10 (SMA20 vs EMA50 en 4h) se evalúa solo sobre la última vela 4h ya cerrada, con un histórico fijo de 1200 velas.
 - Chequeo de retroceso del Paso 10 (ver detalle más abajo): si dentro de las 1200 velas de 4h consultadas nunca se encuentra el cruce de la SMA20 sobre la EMA200 (por ejemplo, la SMA20 ya empezaba por encima desde el inicio del historial disponible), se asume que no hay evidencia de un retroceso y se aprueba el short con normalidad.
+- El barrido de balance (ver arriba) usa un tope fijo de 10,000 USDT y transfiere el excedente calculado sobre el balance total, limitado al margen libre realmente disponible en ese momento.
 
 ## Configuración
 
@@ -57,7 +82,7 @@ En **Settings → Secrets and variables → Actions**, agrega:
 - `TELEGRAM_BOT_TOKEN` (token de tu bot de Telegram)
 - `TELEGRAM_CHAT_ID` (chat_id de tu conversación PRIVADA con el bot — no de un grupo)
 
-La Action corre cada 15 minutos por defecto (ajustable en el cron), se puede disparar manualmente desde **Actions → Run workflow**, o de forma externa vía `repository_dispatch` (por ejemplo, usando cronjob.org para mayor puntualidad). Cada entrada exitosa (a mercado o STOP) se notifica automáticamente por Telegram.
+La Action corre cada 15 minutos por defecto (ajustable en el cron), se puede disparar manualmente desde **Actions → Run workflow**, o de forma externa vía `repository_dispatch` (por ejemplo, usando cronjob.org para mayor puntualidad). Cada entrada exitosa (a mercado o STOP) se notifica automáticamente por Telegram, igual que cada transferencia del barrido de balance.
 
 ## 📡 El bot SIEMPRE analiza el mercado REAL — el modo demo/real solo afecta a la cuenta
 
@@ -68,13 +93,14 @@ La variable `BINGX_DEMO` decide **únicamente** dónde ocurren las acciones que 
 - Leer posiciones abiertas y balance.
 - Colocar el Take Profit y el Stop Loss (Paso 1).
 - Configurar apalancamiento y margen, y ejecutar la orden de entrada (Pasos 13-14).
+- Ejecutar el barrido de balance (futuros → fondos) — este último, además, nunca corre en modo demo (ver la sección de arriba).
 
 Motivo: un round alcista, un patrón técnico o el volumen real de un par no cambian porque el bot esté operando con dinero virtual. La cuenta VST (demo) tiene su propio historial y volumen simulados, que no reflejan el mercado real — usarlos para el análisis daría señales distintas a las que se generarían en producción, justo lo contrario de lo que se busca al probar en demo antes de ir a real.
 
 En la práctica, esto se resuelve con dos conexiones a BingX cuando el bot corre en modo demo:
 
 - **Conexión de mercado** (`market_exchange` en el código): siempre SIN sandbox, apunta a producción. Se usa para todo el escaneo y análisis (Pasos 1 a 14).
-- **Conexión de cuenta** (`exchange` en el código): con sandbox activado si `BINGX_DEMO=true`. Se usa solo para posiciones, balance, TP/SL y la ejecución final de la orden.
+- **Conexión de cuenta** (`exchange` en el código): con sandbox activado si `BINGX_DEMO=true`. Se usa solo para posiciones, balance, TP/SL, la ejecución final de la orden, y el barrido de balance (que, además, se salta por completo en modo demo).
 
 En modo real, ambas conexiones son la misma instancia (no hace falta abrir una segunda).
 
@@ -136,19 +162,19 @@ Se corrigió cambiando el tipo de orden de `STOP_MARKET` a **`STOP`** (límite):
 
 ## ⏱️ Cron interno de GitHub dedicado solo a TP/SL (evita entradas duplicadas)
 
-Además del disparador externo (cronjob.org → `repository_dispatch`, que corre el bot **completo**: Paso 1 + Pasos 2-14), el workflow incluye un cron **interno** de GitHub Actions que corre **cada hora** (`0 * * * *`) usando `schedule`, en sintonía con el timeframe 1h del Paso 1.
+Además del disparador externo (cronjob.org → `repository_dispatch`, que corre el bot **completo**: Paso 1 + Pasos 2-14, y además dispara el barrido de balance), el workflow incluye un cron **interno** de GitHub Actions que corre **cada hora** (`0 * * * *`) usando `schedule`, en sintonía con el timeframe 1h del Paso 1.
 
-Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit / Stop Loss sobre posiciones ya abiertas, con sus dos gatillos independientes). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada.
+Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit / Stop Loss sobre posiciones ya abiertas, con sus dos gatillos independientes). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada. Por el mismo motivo, **nunca** dispara el barrido de balance (`RUN_BALANCE_CHECK` siempre viene en `false` para este disparador).
 
 El filtro de "solo futuros perpetuos cripto con USDT como referencia" (ver más abajo) es **una única función**, compartida por todo el script — se aplica igual sin importar qué disparador o `BOT_MODE` esté corriendo, tanto al Paso 1 como a los Pasos 2-14.
 
 En resumen:
 
-| Disparador | `BOT_MODE` | Qué corre |
-|---|---|---|
-| `schedule` (cron interno de GitHub, cada hora) | `tp_only` | Solo Paso 1 (TP/SL) |
-| `repository_dispatch` (cronjob.org) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) |
-| `workflow_dispatch` (manual) | `full` | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) |
+| Disparador | `BOT_MODE` | `RUN_BALANCE_CHECK` | Qué corre |
+|---|---|---|---|
+| `schedule` (cron interno de GitHub, cada hora) | `tp_only` | `false` (nunca) | Solo Paso 1 (TP/SL) |
+| `repository_dispatch` (cronjob.org) | `full` | `true` (solo si además `BINGX_DEMO=false`) | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) + barrido de balance |
+| `workflow_dispatch` (manual) | `full` | `false` (nunca) | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) |
 
 Si quieres cambiar la frecuencia del cron interno, ajusta la línea `cron: "0 * * * *"` en `.github/workflows/bingx-bot.yml` (formato estándar de cron; GitHub Actions no garantiza precisión exacta al minuto en horarios de alta demanda).
 
@@ -196,11 +222,12 @@ Si SMA20(4h) no está por encima de la EMA50(4h), o se detecta el retroceso, el 
 ## ⚠️ Advertencias importantes
 
 - Este bot abre posiciones apalancadas en corto de forma 100% automática, sin confirmación manual. Revisa cuidadosamente la lógica antes de usarlo con capital real.
-- El API key debe tener permisos de lectura y trading de futuros (nunca de retiro de fondos).
+- El API key debe tener permisos de lectura, trading de futuros, y **transferencia entre cuentas** (necesario para el barrido de balance), pero nunca de retiro de fondos (withdraw) hacia fuera de BingX.
 - El bot fuerza automáticamente el **Hedge Mode** en la cuenta al arrancar (necesario porque todo el código usa `positionSide` LONG/SHORT). Si tienes posiciones abiertas al momento de correrlo por primera vez, ese cambio puede no aplicarse hasta que las cierres.
 - BingX exige el parámetro `side` (LONG/SHORT/BOTH) en `set_leverage()`; el bot ya lo envía como `"SHORT"`.
 - El tipo de orden correcto para la entrada condicional (Paso 14, cuando el precio aún no tocó la SMA20) es `"STOP"` en la API de BingX (no `"STOP_LIMIT"`, que el exchange rechaza).
 - En Hedge Mode, BingX rechaza el campo `reduceOnly` en las órdenes de cierre (error 109400) — no debe enviarse; `positionSide` ya es suficiente para identificar que la orden cierra la posición.
+- El barrido de balance transfiere fondos DENTRO de tu propia cuenta de BingX (de futuros a fondos) — nunca retira dinero fuera del exchange. Aun así, revisa el historial de transferencias en BingX después de las primeras corridas para confirmar que el monto y el destino son los esperados.
 - Prueba primero en cuenta demo/testnet o con montos pequeños, y revisa tanto "Posiciones" como el "Historial de órdenes" en BingX — una orden STOP puede quedar "colocada" en el log sin llegar a ejecutarse si el precio nunca la cruza.
 - El trading con apalancamiento conlleva riesgo real de pérdida total del capital, especialmente con una estrategia con tantas variables y ejecución automática.
 - La interpretación de "máximo en 15m/5m" se hizo tomando como ventana de búsqueda la hora exacta de la vela 1h que se confirmó como máximo del round (Paso 3).
