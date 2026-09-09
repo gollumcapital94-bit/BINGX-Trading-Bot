@@ -488,7 +488,7 @@ async def set_stop_loss_breakeven(exchange: "ccxt.bingx", position: dict) -> Non
         log.error("Error colocando Stop Loss (break even) para %s: %s", symbol, exc)
 
 
-async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
+async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_loss_check: bool = True) -> None:
     """
     PASO 1: a diferencia de los Pasos 2-14, este paso lee el mercado
     SEGÚN LA VARIABLE DE ENTORNO BINGX_DEMO -- usa siempre `exchange`
@@ -501,10 +501,24 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
 
     Evalúa DOS gatillos INDEPENDIENTES entre sí:
       - Toque de SMA20(1h) -> set_take_profit() (TP en la EMA200(1h)).
+        Se evalúa SIEMPRE, sin importar qué disparador corrió el bot
+        (cron interno de GitHub, disparador externo de cronjob.org, o
+        ejecución manual) -- este gatillo no cambió.
       - Toque de EMA50(1h) -> set_stop_loss_breakeven() (SL en break
-        even exacto).
-    Cada uno se revisa y se dispara por separado, sin depender del
-    resultado del otro.
+        even exacto). Se evalúa SOLO si `run_stop_loss_check` es True.
+
+    `run_stop_loss_check`: controla el gatillo del Stop Loss (no el del
+    Take Profit). Se decide en main()/run_paso1_gestion_tp() a partir de
+    la variable de entorno RUN_STOP_LOSS_CHECK, que el workflow de
+    GitHub Actions solo pone en 'true' cuando la corrida fue disparada
+    por el disparador EXTERNO (cronjob.org -> repository_dispatch) --
+    ver la sección "Disparador del Stop Loss" más abajo en este archivo
+    y .github/workflows/bingx-bot.yml. El cron INTERNO de GitHub
+    (schedule, cada hora) y las ejecuciones manuales (workflow_dispatch)
+    nunca colocan el Stop Loss, precisamente para que solo lo dispare
+    cronjob.org, más puntual. Cada gatillo tiene su propio chequeo
+    anti-duplicados (uno para `TAKE_PROFIT_MARKET`, otro para `STOP`),
+    así que uno puede existir sin el otro sin generar conflictos.
     """
     symbol = position["symbol"]
     try:
@@ -540,6 +554,7 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
         search_lows = lows[search_start_idx:]
 
         # ---- Gatillo 1 (independiente): toque de SMA20(1h) -> Take Profit ----
+        # Sin cambios: se evalúa siempre, sin importar el disparador.
         touched_sma20_idx = _find_first_ema_touch(
             search_highs, search_lows,
             sma20_series.iloc[search_start_idx:].reset_index(drop=True),
@@ -561,36 +576,47 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict) -> None:
             )
 
         # ---- Gatillo 2 (independiente del anterior): toque de EMA50(1h) -> Stop Loss en break even ----
-        touched_ema50_idx = _find_first_ema_touch(
-            search_highs, search_lows,
-            ema50_series.iloc[search_start_idx:].reset_index(drop=True),
-        )
-        if touched_ema50_idx is not None:
-            touch_idx_full = search_start_idx + touched_ema50_idx
-            touch_ts = int(closed[touch_idx_full][0])
+        # Ahora solo se evalúa cuando la corrida vino del disparador
+        # EXTERNO (cronjob.org), para que el Stop Loss no se dispare
+        # también desde el cron interno de GitHub -- ver
+        # `run_stop_loss_check` en el docstring de esta función.
+        if not run_stop_loss_check:
             log.info(
-                "%s tocó EMA50(1h) en la vela ts=%d (%s UTC) [EMA50 en ese momento=%.6f]. "
-                "Verificando/colocando Stop Loss en break even...",
-                symbol, touch_ts, pd.to_datetime(touch_ts, unit="ms", utc=True),
-                float(ema50_series.iloc[touch_idx_full]),
+                "%s: chequeo de Stop Loss (toque de EMA50(1h)) omitido -- esta corrida no vino del "
+                "disparador externo de cronjob.org (RUN_STOP_LOSS_CHECK=false).",
+                symbol,
             )
-            await set_stop_loss_breakeven(exchange, position)
         else:
-            log.info(
-                "%s aún no ha tocado la EMA50(1h) en el historial revisado [EMA50 actual=%.6f]",
-                symbol, float(ema50_series.iloc[-1]),
+            touched_ema50_idx = _find_first_ema_touch(
+                search_highs, search_lows,
+                ema50_series.iloc[search_start_idx:].reset_index(drop=True),
             )
+            if touched_ema50_idx is not None:
+                touch_idx_full = search_start_idx + touched_ema50_idx
+                touch_ts = int(closed[touch_idx_full][0])
+                log.info(
+                    "%s tocó EMA50(1h) en la vela ts=%d (%s UTC) [EMA50 en ese momento=%.6f]. "
+                    "Verificando/colocando Stop Loss en break even...",
+                    symbol, touch_ts, pd.to_datetime(touch_ts, unit="ms", utc=True),
+                    float(ema50_series.iloc[touch_idx_full]),
+                )
+                await set_stop_loss_breakeven(exchange, position)
+            else:
+                log.info(
+                    "%s aún no ha tocado la EMA50(1h) en el historial revisado [EMA50 actual=%.6f]",
+                    symbol, float(ema50_series.iloc[-1]),
+                )
 
     except Exception as exc:
         log.error("Error procesando TP/SL de %s: %s", symbol, exc)
 
 
-async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]) -> None:
+async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str], run_stop_loss_check: bool = True) -> None:
     open_positions = await get_open_positions(exchange, allowed_symbols)
     if not open_positions:
         log.info("[Paso 1] No hay posiciones abiertas en pares de futuros USDT.")
         return
-    tasks = [process_position_tp(exchange, pos) for pos in open_positions]
+    tasks = [process_position_tp(exchange, pos, run_stop_loss_check) for pos in open_positions]
     await asyncio.gather(*tasks)
 
 
@@ -1213,7 +1239,23 @@ async def main() -> None:
     # (cronjob.org -> repository_dispatch) -- ver
     # .github/workflows/bingx-bot.yml.
     run_balance_check = _env_flag("RUN_BALANCE_CHECK", "false")
+    # DISPARADOR DEL STOP LOSS (Gatillo 2 del Paso 1, toque de la
+    # EMA50(1h)): ahora SOLO se coloca cuando la corrida vino del
+    # disparador EXTERNO (cronjob.org -> repository_dispatch), por ser
+    # más puntual que el cron interno de GitHub. El Take Profit
+    # (Gatillo 1, toque de la SMA20(1h)) NO cambió -- sigue
+    # evaluándose en cualquier corrida que ejecute el Paso 1 (cron
+    # interno, disparador externo o manual). Ver el workflow en
+    # .github/workflows/bingx-bot.yml para cómo se fija
+    # RUN_STOP_LOSS_CHECK según el disparador.
+    run_stop_loss_check = _env_flag("RUN_STOP_LOSS_CHECK", "false")
     log.info("Modo de ejecución: %s", mode)
+    log.info(
+        "Gatillo de Stop Loss (toque de EMA50(1h)) %s en esta corrida (RUN_STOP_LOSS_CHECK=%s). "
+        "El Take Profit (toque de SMA20(1h)) se evalúa siempre, sin cambios.",
+        "ACTIVADO" if run_stop_loss_check else "DESACTIVADO",
+        run_stop_loss_check,
+    )
     try:
         # `exchange` también necesita sus propios mercados cargados
         # (aunque el universo de símbolos válidos salga de
@@ -1234,21 +1276,30 @@ async def main() -> None:
         if mode == "tp_only":
             # Solo Paso 1 (gestión de TP/SL). El cron INTERNO de GitHub
             # (schedule, cada hora) queda reservado exclusivamente a
-            # TP/SL. Nunca corre el barrido de balance (RUN_BALANCE_CHECK
-            # siempre viene en 'false' para este disparador, ver el
-            # workflow), porque nunca termina de leer el mercado
-            # completo (Pasos 2-14).
+            # TP/SL -- pero, dentro del Paso 1, el Stop Loss (Gatillo 2)
+            # solo se coloca si run_stop_loss_check es True, y el
+            # workflow nunca lo activa para este disparador (ver
+            # RUN_STOP_LOSS_CHECK en .github/workflows/bingx-bot.yml).
+            # El Take Profit (Gatillo 1) sí se sigue evaluando aquí,
+            # sin cambios. Nunca corre el barrido de balance
+            # (RUN_BALANCE_CHECK siempre viene en 'false' para este
+            # disparador, ver el workflow), porque nunca termina de
+            # leer el mercado completo (Pasos 2-14).
             await asyncio.gather(
-                run_paso1_gestion_tp(exchange, allowed_symbols),
+                run_paso1_gestion_tp(exchange, allowed_symbols, run_stop_loss_check),
             )
         else:
             # Modo completo (repository_dispatch desde cronjob.org, o
             # workflow_dispatch manual): Paso 1 (gestión de TP/SL) y
             # Pasos 2-14 (búsqueda de nuevas entradas, leen de
             # `market_exchange` -- siempre real) corren de forma
-            # concurrente.
+            # concurrente. Dentro del Paso 1, el Stop Loss (Gatillo 2)
+            # solo se coloca si run_stop_loss_check es True -- el
+            # workflow solo lo activa para repository_dispatch, no para
+            # workflow_dispatch manual (ver
+            # .github/workflows/bingx-bot.yml).
             await asyncio.gather(
-                run_paso1_gestion_tp(exchange, allowed_symbols),
+                run_paso1_gestion_tp(exchange, allowed_symbols, run_stop_loss_check),
                 run_pasos_2_a_14_entradas(exchange, market_exchange, allowed_symbols, symbols_with_position),
             )
 
