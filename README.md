@@ -44,7 +44,7 @@ Para cada par SIN posición abierta:
 | 6 | El máximo en 5m debe estar en vela roja y coincidir con el máximo de 1h |
 | 7-8 | W%R6, W%R12, W%R24 de la vela roja del máximo, Y de la última vela verde que la antecede, son todos distintos entre sí (15m y 5m) — ver el detalle completo más abajo |
 | 9 | Volumen 24h > 2,000,000 USDT (siempre del mercado real, ver más abajo) |
-| 10 | SMA20 por encima de la EMA50, en temporalidad 4h. Si además ambas están por encima de la EMA200(4h), se exige que la SMA20 nunca haya retrocedido por debajo de la EMA50 desde el inicio del ciclo alcista actual — ver el detalle completo más abajo. Si SMA20 no está por encima de la EMA50, se descarta el símbolo por completo |
+| 10 | **El mercado debe estar DENTRO de un ciclo alcista activo (4h):** SMA20 por encima de la EMA50. Si además ambas están por encima de la EMA200(4h), se exige que la SMA20 nunca haya retrocedido por debajo de la EMA50 desde el inicio del ciclo alcista actual — ver el detalle completo más abajo. Si el mercado está FUERA de un ciclo alcista (SMA20 no está por encima de la EMA50, por cualquiera de los dos patrones de fin de ciclo, ver más abajo), se descarta el símbolo por completo y **no se entra en ninguna operación** para ese par en esta corrida |
 | 11-12 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 11) y/o 5m (paso 12) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/|r| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
 | 13 | Apalancamiento = 80% ÷ (% de distancia). La distancia usa la SMA20(5m) si la entrada es STOP, o el precio actual si es a mercado (ver detalle más abajo), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
 | 14 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
@@ -66,7 +66,7 @@ En total, un símbolo debe aprobar **4 chequeos de W%R** para no ser descartado 
 
 Basta con que **uno solo** de estos 4 chequeos falle (algún par de W%R6/12/24 coincide) para que el símbolo quede descartado en ese paso. Los valores de W%R usados después para la singularidad (Pasos 11-12) siguen siendo los de la vela ROJA del máximo — el chequeo de la vela verde es un filtro adicional, no reemplaza esos valores. Ver `check_wr_all_distinct_red_and_green()` y `_find_preceding_green_candle_idx()` en `strategy_entries.py`.
 
-## 🔧 Paso 10 — SMA20 vs EMA50 (4h) y chequeo de retroceso
+## 🔧 Paso 10 — SMA20 vs EMA50 (4h): el mercado debe estar DENTRO de un ciclo alcista
 
 **Historial del paso:** originalmente el Paso 10 exigía SMA20(4h) > EMA50(4h) **y** ambas por debajo de la EMA200(4h). Ese segundo requisito resultó demasiado estricto (confirmado con capturas reales de ETHFIUSDT y SPACEUSDT) y se eliminó: desde entonces, la única condición era SMA20(4h) > EMA50(4h), sin importar su relación con la EMA200(4h).
 
@@ -75,22 +75,35 @@ Basta con que **uno solo** de estos 4 chequeos falle (algún par de W%R6/12/24 c
 - Si SMA20(4h) > EMA50(4h) **pero no** están ambas por encima de la EMA200(4h) — como en SPACEUSDT —: el Paso 10 funciona exactamente igual que antes de este cambio, sin ningún chequeo extra.
 - Si SMA20(4h) > EMA50(4h) **y además** ambas están por encima de la EMA200(4h) — como en ETHFIUSDT —: se agrega un chequeo extra, basado en la definición de "ciclo alcista" (ver más abajo).
 
-### Definición de "ciclo alcista" (con el nuevo patrón de inicio, visto en OPUSDT)
+**Regla general (confirmada con el usuario): si el mercado está FUERA de un ciclo alcista, no se entra en ninguna operación** para ese par en esa corrida — el símbolo se descarta por completo en el Paso 10 y no llega a evaluarse en los pasos siguientes (11 a 14).
 
-- El ciclo alcista **EMPIEZA** en el instante más reciente en que ocurre **cualquiera de estos dos patrones**:
-  1. La SMA20(4h) cruza de abajo hacia arriba la EMA50(4h) (patrón original, visto en SPACEUSDT). En ese momento, ambas pueden estar todavía por debajo de la EMA200(4h).
-  2. La EMA50(4h) cruza de arriba hacia abajo la EMA200(4h) y **luego vuelve a cruzarla de abajo hacia arriba**, es decir, la EMA50 **recupera** la EMA200 después de haber estado por debajo — visto en **OPUSDT**. Aunque el cruce de la SMA20 sobre la EMA50 haya ocurrido mucho antes (incluso durante una fase todavía por debajo de la EMA200), lo que de verdad reinicia el ciclo alcista es este segundo cruce: la EMA50 recuperando la EMA200.
+### Definición de "ciclo alcista" (con los dos patrones de inicio y los dos patrones de fin)
 
-  Se usa el que haya ocurrido **más reciente** de los dos.
+**Inicio del ciclo alcista** — el ciclo **EMPIEZA** en el instante más reciente en que ocurre **cualquiera de estos dos patrones**:
 
-- El ciclo se **EXTIENDE** mientras la SMA20 se mantenga por encima de la EMA50 sin ninguna interrupción, e incluye el momento (si llega a ocurrir dentro de ese mismo tramo) en que la SMA20 también cruza por encima de la EMA200.
-- El ciclo **TERMINA** en el instante exacto en que la SMA20 vuelve a caer por debajo de la EMA50 mientras ambas siguen por encima de la EMA200 (sin siquiera tocarla) — este es el "retroceso". Este criterio de fin de ciclo **no cambió**: ya se descarta directamente en la condición base del Paso 10 (SMA20(4h) ≤ EMA50(4h)).
+1. **Patrón de inicio 1** (original, visto en SPACEUSDT): la SMA20(4h) cruza de abajo hacia arriba la EMA50(4h). En ese momento, ambas pueden estar todavía por debajo de la EMA200(4h).
+2. **Patrón de inicio 2** (visto en OPUSDT): la EMA50(4h) cruza de arriba hacia abajo la EMA200(4h) y **luego vuelve a cruzarla de abajo hacia arriba**, es decir, la EMA50 **recupera** la EMA200 después de haber estado por debajo. Aunque el cruce de la SMA20 sobre la EMA50 haya ocurrido mucho antes (incluso durante una fase todavía por debajo de la EMA200), lo que de verdad reinicia el ciclo alcista es este segundo cruce: la EMA50 recuperando la EMA200.
 
-**Chequeo adicional:** cuando ambas medias ya están por encima de la EMA200, se exige que el cruce de la SMA20 sobre la EMA200 haya ocurrido **dentro** del ciclo alcista actual (en o después de su inicio, según la definición de arriba) — y no en un ciclo alcista anterior que ya haya terminado por un retroceso. Si se detecta un retroceso así, **el símbolo se descarta por completo**, porque la señal de tendencia ya no se considera "limpia".
+Se usa el que haya ocurrido **más reciente** de los dos.
+
+**Nota importante (confirmada con el usuario):** el Patrón de inicio 2 también cubre la recuperación tras el nuevo Patrón B de fin (ver abajo) — no se agrega un tercer patrón de inicio. Si la EMA50 (más lenta) llega a cruzar la EMA200 de abajo hacia arriba, eso implica que la SMA20 (más rápida, más reactiva) ya la cruzó antes; no hace falta detectar ese cruce de la SMA20 por separado.
+
+El ciclo se **EXTIENDE** mientras la SMA20 se mantenga por encima de la EMA50 sin ninguna interrupción, e incluye el momento (si llega a ocurrir dentro de ese mismo tramo) en que la SMA20 también cruza por encima de la EMA200.
+
+**Fin del ciclo alcista** — el ciclo **TERMINA** en el instante exacto en que ocurre **cualquiera de estos dos patrones** (esto es lo que el bot llama "retroceso"):
+
+1. **Patrón A de fin, en 4h** (original): la SMA20(4h) cae por debajo de la EMA50(4h) mientras **AMBAS siguen por encima de la EMA200(4h)** (sin siquiera tocarla). Es un retroceso "superficial": la SMA20(4h) pierde la EMA50(4h), pero se mantiene por encima de la EMA200(4h).
+2. **Patrón B de fin, en 4h** (nuevo, confirmado con el usuario, visto en mercado real): la SMA20(4h) cae por debajo de la EMA50(4h) **Y ADEMÁS** cae por debajo de la EMA200(4h), **mientras la EMA50(4h) se mantiene por encima de la EMA200(4h)**. Es un retroceso más profundo: solo la SMA20(4h) (más rápida) llega a perforar la EMA200(4h); la EMA50(4h) (más lenta) nunca la pierde.
+
+Ambos patrones (A y B) se evalúan **exclusivamente con velas de 4h** — nunca se mezclan datos de otras temporalidades (1h, 15m, 5m) para decidir si el ciclo alcista terminó.
+
+En **ambos casos**, el símbolo ya queda descartado directamente por la condición BASE del Paso 10 (SMA20(4h) ≤ EMA50(4h)), sin importar su relación con la EMA200 — este criterio de fin de ciclo, en su condición base, **no cambió** con la incorporación del Patrón B. La distinción entre Patrón A y Patrón B es **puramente diagnóstica**: el bot ahora identifica y registra en el log cuál de los dos ocurrió, para poder distinguirlos al revisar el historial de ejecuciones, pero no cambia qué símbolos se aprueban o descartan. Ver `_classify_fin_ciclo_alcista()` en `strategy_entries.py`.
+
+**Chequeo adicional (cuando ambas medias ya están por encima de la EMA200):** se exige que el cruce de la SMA20 sobre la EMA200 haya ocurrido **dentro** del ciclo alcista actual (en o después de su inicio, según la definición de arriba) — y no en un ciclo alcista anterior que ya haya terminado por un retroceso (Patrón A o Patrón B). Si se detecta un retroceso así, **el símbolo se descarta por completo**, porque la señal de tendencia ya no se considera "limpia".
 
 **Caso borde (supuesto adoptado, confirmado con el usuario):** si dentro de las 1200 velas de 4h consultadas **ninguno** de los dos patrones de inicio de ciclo se encuentra (la SMA20 se mantuvo siempre por encima de la EMA50 Y la EMA50 se mantuvo siempre por encima de la EMA200 durante toda la ventana), no hay evidencia de ningún retroceso y se aprueba el short con normalidad.
 
-Si SMA20(4h) no está por encima de la EMA50(4h), o se detecta el retroceso, el símbolo se descarta por completo. Ver `_find_cycle_start_index()` y `_check_retroceso_ciclo_alcista()` en `strategy_entries.py`.
+Si SMA20(4h) no está por encima de la EMA50(4h) (mercado fuera de un ciclo alcista, sea por el Patrón A o el Patrón B de fin), o se detecta el retroceso dentro de un ciclo que parecía activo, el símbolo se descarta por completo. Ver `_find_cycle_start_index()`, `_check_retroceso_ciclo_alcista()` y `_classify_fin_ciclo_alcista()` en `strategy_entries.py`.
 
 ## 🏦 Barrido de balance excedente: futuros → fondos (solo mercado real, solo disparador externo)
 
@@ -124,6 +137,8 @@ Ver `check_and_sweep_futures_balance()` en `bingx_bot.py` para el detalle de la 
 - El margen total de la cuenta (Paso 13) se calcula como margen libre + margen ya usado en otras operaciones abiertas, no solo el saldo libre.
 - El Paso 10 (SMA20 vs EMA50 en 4h) se evalúa solo sobre la última vela 4h ya cerrada, con un histórico fijo de 1200 velas.
 - Chequeo de retroceso del Paso 10 (ver detalle más arriba): si dentro de las 1200 velas de 4h consultadas no se encuentra ninguno de los dos patrones de inicio de ciclo alcista, se asume que no hay evidencia de un retroceso y se aprueba el short con normalidad.
+- **Dos patrones de FIN de ciclo alcista en el Paso 10** (Patrón A original y Patrón B nuevo, ver detalle más arriba): ambos ya quedan descartados por la misma condición base (SMA20(4h) ≤ EMA50(4h)); la distinción entre ambos es puramente diagnóstica, no cambia qué símbolos se aprueban.
+- **No se agrega un tercer patrón de INICIO de ciclo alcista** para cubrir la recuperación tras el Patrón B de fin: el Patrón de inicio 2 ya existente (EMA50 recuperando la EMA200) es suficiente, porque si la EMA50 cruza la EMA200 hacia arriba, la SMA20 (más rápida) ya la cruzó antes.
 - El chequeo de W%R de los Pasos 7 y 8 (ver detalle más arriba) asume que la vela verde previa a la roja del máximo siempre existe dentro de la ventana consultada, por la propia lógica de un round alcista ya confirmado.
 - El Stop Loss (Gatillo 2 del Paso 1) solo se coloca en corridas disparadas por el disparador externo de cronjob.org (`repository_dispatch`), nunca desde el cron interno de GitHub ni desde ejecuciones manuales — ver detalle más arriba.
 - El barrido de balance (ver arriba) usa un tope fijo de 10,000 USDT y transfiere el excedente calculado sobre el balance total, limitado al margen libre realmente disponible en ese momento.
@@ -283,3 +298,4 @@ Se corrigió generalizando el filtro con dos señales independientes: (1) el pre
 - Prueba primero en cuenta demo/testnet o con montos pequeños, y revisa tanto "Posiciones" como el "Historial de órdenes" en BingX — una orden STOP puede quedar "colocada" en el log sin llegar a ejecutarse si el precio nunca la cruza.
 - El trading con apalancamiento conlleva riesgo real de pérdida total del capital, especialmente con una estrategia con tantas variables y ejecución automática.
 - La interpretación de "máximo en 15m/5m" se hizo tomando como ventana de búsqueda la hora exacta de la vela 1h que se confirmó como máximo del round (Paso 3).
+- **Si el mercado está fuera de un ciclo alcista (Paso 10) no se entra en ninguna operación** para ese par en esa corrida, sin importar si el resto de los pasos (11-14) hubiera aprobado el símbolo — el Paso 10 corta la cascada por completo en ese caso.
