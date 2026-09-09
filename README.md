@@ -6,10 +6,30 @@ Bot asincrónico para futuros perpetuos USDT-M en BingX, compuesto por dos módu
 
 - Filtra solo pares de futuros perpetuos CRIPTO con USDT como referencia, excluyendo explícitamente TODO el "Standard Futures" de BingX (forex, índices, commodities, acciones sintéticas) — ver `_looks_like_forex_or_cfd()` en `bingx_bot.py`.
 - Revisa tus posiciones abiertas.
-- **Gatillo 1 — Take Profit:** si el precio toca la **SMA20 (1h)**, coloca el Take Profit en la EMA200(1h).
-- **Gatillo 2 — Stop Loss:** si el precio toca la **EMA50 (1h)**, coloca el Stop Loss en break even (precio de entrada exacto).
+- **Gatillo 1 — Take Profit:** si el precio toca la **SMA20 (1h)**, coloca el Take Profit en la EMA200(1h). Se evalúa siempre, sin importar el disparador que corrió el bot (cron interno de GitHub, disparador externo de cronjob.org, o ejecución manual).
+- **Gatillo 2 — Stop Loss:** si el precio toca la **EMA50 (1h)**, coloca el Stop Loss en break even (precio de entrada exacto). **Este gatillo ahora SOLO se evalúa cuando la corrida fue disparada por el disparador EXTERNO (cronjob.org → `repository_dispatch`)** — ver la sección "Disparador del Stop Loss" más abajo.
 
-Estos dos gatillos son **completamente independientes** entre sí: uno puede dispararse sin que el otro lo haya hecho todavía. Por ejemplo, si el precio tocó la SMA20 pero aún no la EMA50, existirá un Take Profit sin Stop Loss; si luego toca la EMA50, se agrega el Stop Loss por separado.
+Estos dos gatillos son **completamente independientes** entre sí: uno puede dispararse sin que el otro lo haya hecho todavía. Por ejemplo, si el precio tocó la SMA20 pero aún no la EMA50, existirá un Take Profit sin Stop Loss; si luego toca la EMA50 (en una corrida disparada externamente), se agrega el Stop Loss por separado.
+
+## 🎯 Disparador del Stop Loss: ahora SOLO el disparador externo de cronjob.org
+
+**Antes**, el Gatillo 2 (Stop Loss en break even, toque de la EMA50(1h)) se evaluaba en cualquier corrida que ejecutara el Paso 1 — tanto el cron interno de GitHub (`schedule`, cada hora) como el disparador externo (`repository_dispatch`) y las ejecuciones manuales (`workflow_dispatch`).
+
+**Ahora**, el Stop Loss SOLO se coloca cuando la corrida fue disparada por el **disparador externo de cronjob.org** (`repository_dispatch`), por ser más puntual que el cron interno de GitHub (`schedule`), que puede sufrir retrasos frente al minuto exacto configurado — confirmado con el usuario. El Take Profit (Gatillo 1) **no cambió**: sigue evaluándose siempre, en cualquier disparador.
+
+| Disparador | ¿Coloca Take Profit? | ¿Coloca Stop Loss? |
+|---|---|---|
+| `schedule` (cron interno de GitHub, cada hora) | ✅ Sí | ❌ No |
+| `repository_dispatch` (cronjob.org) | ✅ Sí | ✅ Sí |
+| `workflow_dispatch` (manual) | ✅ Sí | ❌ No |
+
+Esto se controla con la nueva variable de entorno `RUN_STOP_LOSS_CHECK`, fijada en `.github/workflows/bingx-bot.yml`:
+
+```yaml
+RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
+```
+
+`process_position_tp()` en `bingx_bot.py` recibe este flag (`run_stop_loss_check`) y solo evalúa el toque de la EMA50(1h)/coloca el Stop Loss si viene en `True`; en caso contrario, lo omite y lo deja registrado en el log. Así, el Stop Loss se dispara desde un único disparador, nunca desde dos a la vez.
 
 ## Pasos 2 a 14 — Escáner de nuevas entradas en corto
 
@@ -22,14 +42,55 @@ Para cada par SIN posición abierta:
 | 4 | RSI6 (1h) de la vela verde relevante no está sobrecomprado (>90 descarta) |
 | 5 | El máximo en 15m debe estar en vela roja y coincidir con el máximo de 1h |
 | 6 | El máximo en 5m debe estar en vela roja y coincidir con el máximo de 1h |
-| 7-8 | W%R6, W%R12, W%R24 de esa vela roja son todos distintos entre sí (15m y 5m) |
+| 7-8 | W%R6, W%R12, W%R24 de la vela roja del máximo, Y de la última vela verde que la antecede, son todos distintos entre sí (15m y 5m) — ver el detalle completo más abajo |
 | 9 | Volumen 24h > 2,000,000 USDT (siempre del mercado real, ver más abajo) |
-| 10 | SMA20 por encima de la EMA50, en temporalidad 4h. Si además ambas están por encima de la EMA200(4h), se exige que la SMA20 nunca haya retrocedido por debajo de la EMA50 desde que cruzó la EMA200 — ver el detalle completo más abajo. Si SMA20 no está por encima de la EMA50, se descarta el símbolo por completo |
+| 10 | SMA20 por encima de la EMA50, en temporalidad 4h. Si además ambas están por encima de la EMA200(4h), se exige que la SMA20 nunca haya retrocedido por debajo de la EMA50 desde el inicio del ciclo alcista actual — ver el detalle completo más abajo. Si SMA20 no está por encima de la EMA50, se descarta el símbolo por completo |
 | 11-12 | Singularidad: S = ln(2k) - 1 > 0 en 15m (paso 11) y/o 5m (paso 12) — basta con que exista en UNA de las dos temporalidades (k = a/r o a/|r| según color de la vela 1h). Si existe en ambas, se trata igual que si fuera una sola |
 | 13 | Apalancamiento = 80% ÷ (% de distancia). La distancia usa la SMA20(5m) si la entrada es STOP, o el precio actual si es a mercado (ver detalle más abajo), redondeado por defecto a múltiplos de 5 y limitado al máximo de BingX. Margen = el MENOR entre el 10% del margen total de la cuenta (libre + usado en otras operaciones abiertas) y el margen máximo que permite ese apalancamiento en el par (nunca se reduce el apalancamiento para poder usar más margen) |
 | 14 | Si el precio ya tocó la SMA20(5m): entrada a mercado. Si no: orden STOP en la SMA20(5m), esperando a que el precio la cruce de arriba hacia abajo |
 
 Todas las posiciones se abren en margen aislado, en corto (short).
+
+## 🔍 Pasos 7 y 8 — W%R distintos: ahora también en la vela verde previa (4 chequeos en total)
+
+**Antes**, los Pasos 7 (15m) y 8 (5m) solo exigían que W%R6, W%R12 y W%R24 fueran todos distintos entre sí en la vela ROJA del máximo.
+
+**Ahora**, se agrega el mismo chequeo también en la **última vela VERDE que antecede a la roja del máximo**: si la vela inmediatamente anterior a la roja ya es verde, esa es la que se usa; si es roja, se sigue retrocediendo vela por vela hasta encontrar la primera vela verde. Por construcción de un round alcista ya confirmado (Pasos 2-3), esa vela verde siempre existe — el máximo del round solo puede alcanzarse tras un movimiento alcista (confirmado con el usuario).
+
+En total, un símbolo debe aprobar **4 chequeos de W%R** para no ser descartado en estos pasos:
+
+1. Vela roja del máximo en 15m (Paso 7).
+2. Última vela verde previa en 15m (Paso 7).
+3. Vela roja del máximo en 5m (Paso 8).
+4. Última vela verde previa en 5m (Paso 8).
+
+Basta con que **uno solo** de estos 4 chequeos falle (algún par de W%R6/12/24 coincide) para que el símbolo quede descartado en ese paso. Los valores de W%R usados después para la singularidad (Pasos 11-12) siguen siendo los de la vela ROJA del máximo — el chequeo de la vela verde es un filtro adicional, no reemplaza esos valores. Ver `check_wr_all_distinct_red_and_green()` y `_find_preceding_green_candle_idx()` en `strategy_entries.py`.
+
+## 🔧 Paso 10 — SMA20 vs EMA50 (4h) y chequeo de retroceso
+
+**Historial del paso:** originalmente el Paso 10 exigía SMA20(4h) > EMA50(4h) **y** ambas por debajo de la EMA200(4h). Ese segundo requisito resultó demasiado estricto (confirmado con capturas reales de ETHFIUSDT y SPACEUSDT) y se eliminó: desde entonces, la única condición era SMA20(4h) > EMA50(4h), sin importar su relación con la EMA200(4h).
+
+**Después**, se reincorporó una condición relacionada con la EMA200, pero de forma distinta y más específica — **solo aplica en un caso particular**:
+
+- Si SMA20(4h) > EMA50(4h) **pero no** están ambas por encima de la EMA200(4h) — como en SPACEUSDT —: el Paso 10 funciona exactamente igual que antes de este cambio, sin ningún chequeo extra.
+- Si SMA20(4h) > EMA50(4h) **y además** ambas están por encima de la EMA200(4h) — como en ETHFIUSDT —: se agrega un chequeo extra, basado en la definición de "ciclo alcista" (ver más abajo).
+
+### Definición de "ciclo alcista" (con el nuevo patrón de inicio, visto en OPUSDT)
+
+- El ciclo alcista **EMPIEZA** en el instante más reciente en que ocurre **cualquiera de estos dos patrones**:
+  1. La SMA20(4h) cruza de abajo hacia arriba la EMA50(4h) (patrón original, visto en SPACEUSDT). En ese momento, ambas pueden estar todavía por debajo de la EMA200(4h).
+  2. La EMA50(4h) cruza de arriba hacia abajo la EMA200(4h) y **luego vuelve a cruzarla de abajo hacia arriba**, es decir, la EMA50 **recupera** la EMA200 después de haber estado por debajo — visto en **OPUSDT**. Aunque el cruce de la SMA20 sobre la EMA50 haya ocurrido mucho antes (incluso durante una fase todavía por debajo de la EMA200), lo que de verdad reinicia el ciclo alcista es este segundo cruce: la EMA50 recuperando la EMA200.
+
+  Se usa el que haya ocurrido **más reciente** de los dos.
+
+- El ciclo se **EXTIENDE** mientras la SMA20 se mantenga por encima de la EMA50 sin ninguna interrupción, e incluye el momento (si llega a ocurrir dentro de ese mismo tramo) en que la SMA20 también cruza por encima de la EMA200.
+- El ciclo **TERMINA** en el instante exacto en que la SMA20 vuelve a caer por debajo de la EMA50 mientras ambas siguen por encima de la EMA200 (sin siquiera tocarla) — este es el "retroceso". Este criterio de fin de ciclo **no cambió**: ya se descarta directamente en la condición base del Paso 10 (SMA20(4h) ≤ EMA50(4h)).
+
+**Chequeo adicional:** cuando ambas medias ya están por encima de la EMA200, se exige que el cruce de la SMA20 sobre la EMA200 haya ocurrido **dentro** del ciclo alcista actual (en o después de su inicio, según la definición de arriba) — y no en un ciclo alcista anterior que ya haya terminado por un retroceso. Si se detecta un retroceso así, **el símbolo se descarta por completo**, porque la señal de tendencia ya no se considera "limpia".
+
+**Caso borde (supuesto adoptado, confirmado con el usuario):** si dentro de las 1200 velas de 4h consultadas **ninguno** de los dos patrones de inicio de ciclo se encuentra (la SMA20 se mantuvo siempre por encima de la EMA50 Y la EMA50 se mantuvo siempre por encima de la EMA200 durante toda la ventana), no hay evidencia de ningún retroceso y se aprueba el short con normalidad.
+
+Si SMA20(4h) no está por encima de la EMA50(4h), o se detecta el retroceso, el símbolo se descarta por completo. Ver `_find_cycle_start_index()` y `_check_retroceso_ciclo_alcista()` en `strategy_entries.py`.
 
 ## 🏦 Barrido de balance excedente: futuros → fondos (solo mercado real, solo disparador externo)
 
@@ -62,7 +123,9 @@ Ver `check_and_sweep_futures_balance()` en `bingx_bot.py` para el detalle de la 
 - El apalancamiento calculado se limita al máximo que permite BingX para ese par cuando el cálculo da un valor mayor.
 - El margen total de la cuenta (Paso 13) se calcula como margen libre + margen ya usado en otras operaciones abiertas, no solo el saldo libre.
 - El Paso 10 (SMA20 vs EMA50 en 4h) se evalúa solo sobre la última vela 4h ya cerrada, con un histórico fijo de 1200 velas.
-- Chequeo de retroceso del Paso 10 (ver detalle más abajo): si dentro de las 1200 velas de 4h consultadas nunca se encuentra el cruce de la SMA20 sobre la EMA200 (por ejemplo, la SMA20 ya empezaba por encima desde el inicio del historial disponible), se asume que no hay evidencia de un retroceso y se aprueba el short con normalidad.
+- Chequeo de retroceso del Paso 10 (ver detalle más arriba): si dentro de las 1200 velas de 4h consultadas no se encuentra ninguno de los dos patrones de inicio de ciclo alcista, se asume que no hay evidencia de un retroceso y se aprueba el short con normalidad.
+- El chequeo de W%R de los Pasos 7 y 8 (ver detalle más arriba) asume que la vela verde previa a la roja del máximo siempre existe dentro de la ventana consultada, por la propia lógica de un round alcista ya confirmado.
+- El Stop Loss (Gatillo 2 del Paso 1) solo se coloca en corridas disparadas por el disparador externo de cronjob.org (`repository_dispatch`), nunca desde el cron interno de GitHub ni desde ejecuciones manuales — ver detalle más arriba.
 - El barrido de balance (ver arriba) usa un tope fijo de 10,000 USDT y transfiere el excedente calculado sobre el balance total, limitado al margen libre realmente disponible en ese momento.
 
 ## Configuración
@@ -82,7 +145,7 @@ En **Settings → Secrets and variables → Actions**, agrega:
 - `TELEGRAM_BOT_TOKEN` (token de tu bot de Telegram)
 - `TELEGRAM_CHAT_ID` (chat_id de tu conversación PRIVADA con el bot — no de un grupo)
 
-La Action corre cada 15 minutos por defecto (ajustable en el cron), se puede disparar manualmente desde **Actions → Run workflow**, o de forma externa vía `repository_dispatch` (por ejemplo, usando cronjob.org para mayor puntualidad). Cada entrada exitosa (a mercado o STOP) se notifica automáticamente por Telegram, igual que cada transferencia del barrido de balance.
+La Action corre cada hora por defecto vía el cron interno de GitHub (dedicado solo a TP, ya no a SL — ver arriba), se puede disparar manualmente desde **Actions → Run workflow**, o de forma externa vía `repository_dispatch` (por ejemplo, usando cronjob.org para mayor puntualidad — este es ahora el único disparador que coloca el Stop Loss y el único que ejecuta el barrido de balance). Cada entrada exitosa (a mercado o STOP) se notifica automáticamente por Telegram, igual que cada transferencia del barrido de balance.
 
 ## 📡 El bot SIEMPRE analiza el mercado REAL — el modo demo/real solo afecta a la cuenta
 
@@ -135,8 +198,8 @@ Se corrigió pidiendo `EMA_WARMUP_CANDLES` (400) velas EXTRA, **antes** de la ve
 
 **Ahora**, cada orden tiene su propio gatillo, evaluado por separado:
 
-- Toque de la **SMA20(1h)** → coloca el **Take Profit** (en la EMA200(1h), sin cambios en dónde se coloca).
-- Toque de la **EMA50(1h)** → coloca el **Stop Loss** en break even (sin cambios en cómo se coloca: tipo `STOP` límite, ver el bug de TAUSDT más abajo).
+- Toque de la **SMA20(1h)** → coloca el **Take Profit** (en la EMA200(1h), sin cambios en dónde se coloca). Se evalúa en cualquier disparador.
+- Toque de la **EMA50(1h)** → coloca el **Stop Loss** en break even (sin cambios en cómo se coloca: tipo `STOP` límite, ver el bug de TAUSDT más abajo). Se evalúa SOLO en el disparador externo de cronjob.org — ver la sección "Disparador del Stop Loss" más arriba.
 
 Como la SMA20 suele tocarse antes que la EMA50 en un retroceso normal, en la práctica esto adelanta el momento en que se asegura el Take Profit, y deja el Stop Loss en break even para un retroceso más profundo. Cada gatillo tiene su propio chequeo anti-duplicados (uno para `TAKE_PROFIT_MARKET`, otro para `STOP`), así que uno puede existir sin el otro sin generar conflictos.
 
@@ -160,23 +223,23 @@ Se corrigió cambiando el tipo de orden de `STOP_MARKET` a **`STOP`** (límite):
 
 **Trade-off aceptado (confirmado con el usuario):** si el precio salta de golpe más allá del precio de entrada en una sola vela (gap fuerte, típico de pares con poca liquidez), esta orden puede quedar **sin ejecutarse**, y la posición seguiría abierta sin protección hasta que el precio regrese exactamente a ese nivel. Se prioriza "nunca cerrar peor que break even" sobre "siempre garantizar el cierre" — lo opuesto exacto del comportamiento anterior con `STOP_MARKET`.
 
-## ⏱️ Cron interno de GitHub dedicado solo a TP/SL (evita entradas duplicadas)
+## ⏱️ Cron interno de GitHub dedicado solo a Take Profit (evita entradas duplicadas)
 
-Además del disparador externo (cronjob.org → `repository_dispatch`, que corre el bot **completo**: Paso 1 + Pasos 2-14, y además dispara el barrido de balance), el workflow incluye un cron **interno** de GitHub Actions que corre **cada hora** (`0 * * * *`) usando `schedule`, en sintonía con el timeframe 1h del Paso 1.
+Además del disparador externo (cronjob.org → `repository_dispatch`, que corre el bot **completo**: Paso 1 + Pasos 2-14, coloca el Stop Loss, y además dispara el barrido de balance), el workflow incluye un cron **interno** de GitHub Actions que corre **cada hora** (`0 * * * *`) usando `schedule`, en sintonía con el timeframe 1h del Paso 1.
 
-Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit / Stop Loss sobre posiciones ya abiertas, con sus dos gatillos independientes). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada. Por el mismo motivo, **nunca** dispara el barrido de balance (`RUN_BALANCE_CHECK` siempre viene en `false` para este disparador).
+Ese cron interno corre el bot en modo `BOT_MODE=tp_only`: **solo** ejecuta el Paso 1 (gestión de Take Profit sobre posiciones ya abiertas — el Stop Loss ya no se coloca desde este disparador, ver la sección "Disparador del Stop Loss" más arriba). **Nunca** escanea ni abre nuevas entradas (Pasos 2-14), precisamente para que no compita con tu disparador externo de cronjob.org y termine abriendo una posición duplicada. Por el mismo motivo, **nunca** dispara el barrido de balance (`RUN_BALANCE_CHECK` siempre viene en `false` para este disparador).
 
 El filtro de "solo futuros perpetuos cripto con USDT como referencia" (ver más abajo) es **una única función**, compartida por todo el script — se aplica igual sin importar qué disparador o `BOT_MODE` esté corriendo, tanto al Paso 1 como a los Pasos 2-14.
 
 En resumen:
 
-| Disparador | `BOT_MODE` | `RUN_BALANCE_CHECK` | Qué corre |
-|---|---|---|---|
-| `schedule` (cron interno de GitHub, cada hora) | `tp_only` | `false` (nunca) | Solo Paso 1 (TP/SL) |
-| `repository_dispatch` (cronjob.org) | `full` | `true` (solo si además `BINGX_DEMO=false`) | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) + barrido de balance |
-| `workflow_dispatch` (manual) | `full` | `false` (nunca) | Paso 1 + Pasos 2-14 (TP/SL, nuevas entradas short) |
+| Disparador | `BOT_MODE` | `RUN_STOP_LOSS_CHECK` | `RUN_BALANCE_CHECK` | Qué corre |
+|---|---|---|---|---|
+| `schedule` (cron interno de GitHub, cada hora) | `tp_only` | `false` (nunca) | `false` (nunca) | Solo Paso 1, y solo su Gatillo 1 (Take Profit) |
+| `repository_dispatch` (cronjob.org) | `full` | `true` | `true` (solo si además `BINGX_DEMO=false`) | Paso 1 completo (TP + SL) + Pasos 2-14 (nuevas entradas short) + barrido de balance |
+| `workflow_dispatch` (manual) | `full` | `false` (nunca) | `false` (nunca) | Paso 1, pero solo su Gatillo 1 (Take Profit) + Pasos 2-14 (nuevas entradas short) |
 
-Si quieres cambiar la frecuencia del cron interno, ajusta la línea `cron: "0 * * * *"` en `.github/workflows/bingx-bot.yml` (formato estándar de cron; GitHub Actions no garantiza precisión exacta al minuto en horarios de alta demanda).
+Si quieres cambiar la frecuencia del cron interno, ajusta la línea `cron: "0 * * * *"` en `.github/workflows/bingx-bot.yml` (formato estándar de cron; GitHub Actions no garantiza precisión exacta al minuto en horarios de alta demanda — precisamente el motivo por el que el Stop Loss ya no se coloca desde este disparador).
 
 ## 📊 El Paso 9 (volumen 24h) siempre usa el mercado REAL
 
@@ -207,18 +270,6 @@ En producción el bot llegó a incluir en su universo de símbolos pares del pro
 
 Se corrigió generalizando el filtro con dos señales independientes: (1) el prefijo del id se amplió a `NC`, cubriendo cualquier subtipo de este producto; y (2) se descarta cualquier símbolo cuya moneda base siga el patrón `SUBYACENTE2REFERENCIA` (ej. `EUR2USD`, `APP2USD`) o sea directamente una divisa fiat. Esta función (`_looks_like_forex_or_cfd`) es **una sola** y se usa para construir el universo de símbolos del bot completo, además de una segunda verificación justo antes de ejecutar la orden.
 
-## 🔧 Paso 10 — SMA20 vs EMA50 (4h) y chequeo de retroceso
-
-**Historial del paso:** originalmente el Paso 10 exigía SMA20(4h) > EMA50(4h) **y** ambas por debajo de la EMA200(4h). Ese segundo requisito resultó demasiado estricto (confirmado con capturas reales de ETHFIUSDT y SPACEUSDT) y se eliminó: desde entonces, la única condición era SMA20(4h) > EMA50(4h), sin importar su relación con la EMA200(4h).
-
-**Ahora**, se reincorpora una condición relacionada con la EMA200, pero de forma distinta y más específica — **solo aplica en un caso particular**:
-
-- Si SMA20(4h) > EMA50(4h) **pero no** están ambas por encima de la EMA200(4h): el Paso 10 funciona exactamente igual que antes de este cambio, sin ningún chequeo extra.
-- Si SMA20(4h) > EMA50(4h) **y además** ambas están por encima de la EMA200(4h): se agrega un chequeo extra. Se busca el punto donde la SMA20 cruzó de abajo hacia arriba la EMA200, y se revisa **todo el tramo** desde ese cruce hasta la vela actual: la SMA20 debe haberse mantenido **siempre** por encima de la EMA50 en ese tramo, sin ningún retroceso por debajo (aunque después haya vuelto a subir). Si se detecta un retroceso así, **el símbolo se descarta por completo**, porque la señal de tendencia ya no se considera "limpia".
-- **Caso borde (supuesto adoptado, confirmado con el usuario):** si dentro de las 1200 velas de 4h consultadas nunca se encuentra el cruce de la SMA20 sobre la EMA200 (por ejemplo, porque la SMA20 ya empezaba por encima desde el inicio del historial disponible), no hay forma de confirmar ni negar un retroceso — se aprueba el short con normalidad en ese caso.
-
-Si SMA20(4h) no está por encima de la EMA50(4h), o se detecta el retroceso, el símbolo se descarta por completo.
-
 ## ⚠️ Advertencias importantes
 
 - Este bot abre posiciones apalancadas en corto de forma 100% automática, sin confirmación manual. Revisa cuidadosamente la lógica antes de usarlo con capital real.
@@ -228,6 +279,7 @@ Si SMA20(4h) no está por encima de la EMA50(4h), o se detecta el retroceso, el 
 - El tipo de orden correcto para la entrada condicional (Paso 14, cuando el precio aún no tocó la SMA20) es `"STOP"` en la API de BingX (no `"STOP_LIMIT"`, que el exchange rechaza).
 - En Hedge Mode, BingX rechaza el campo `reduceOnly` en las órdenes de cierre (error 109400) — no debe enviarse; `positionSide` ya es suficiente para identificar que la orden cierra la posición.
 - El barrido de balance transfiere fondos DENTRO de tu propia cuenta de BingX (de futuros a fondos) — nunca retira dinero fuera del exchange. Aun así, revisa el historial de transferencias en BingX después de las primeras corridas para confirmar que el monto y el destino son los esperados.
+- Recuerda que el Stop Loss (Gatillo 2 del Paso 1) solo se coloca cuando corres el bot vía tu disparador externo (cronjob.org); si dependes únicamente del cron interno de GitHub o de ejecuciones manuales, tus posiciones abiertas solo tendrán Take Profit hasta que cronjob.org corra.
 - Prueba primero en cuenta demo/testnet o con montos pequeños, y revisa tanto "Posiciones" como el "Historial de órdenes" en BingX — una orden STOP puede quedar "colocada" en el log sin llegar a ejecutarse si el precio nunca la cruza.
 - El trading con apalancamiento conlleva riesgo real de pérdida total del capital, especialmente con una estrategia con tantas variables y ejecución automática.
 - La interpretación de "máximo en 15m/5m" se hizo tomando como ventana de búsqueda la hora exacta de la vela 1h que se confirmó como máximo del round (Paso 3).
