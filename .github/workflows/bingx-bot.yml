@@ -19,6 +19,14 @@ on:
     # NUNCA escanea ni abre nuevas entradas, así se evita duplicar una
     # posición que el disparador externo (cronjob.org ->
     # repository_dispatch) ya haya abierto.
+    #
+    # IMPORTANTE (Stop Loss): este cron interno de GitHub NO es
+    # puntual -- schedule puede sufrir retrasos frente al minuto
+    # exacto configurado, especialmente en horarios de alta demanda.
+    # Por eso el Stop Loss (Gatillo 2 del Paso 1, toque de la
+    # EMA50(1h)) ya NO se coloca desde este disparador -- ver
+    # RUN_STOP_LOSS_CHECK más abajo. El Take Profit (Gatillo 1) sigue
+    # evaluándose aquí sin cambios.
     - cron: "0 * * * *"
 
 jobs:
@@ -69,6 +77,17 @@ jobs:
           # (workflow_dispatch). El propio bingx_bot.py además solo lo
           # ejecuta de verdad si BINGX_DEMO=false (mercado real).
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
+          # Gatillo del Stop Loss (Gatillo 2 del Paso 1, toque de la
+          # EMA50(1h) -- ver process_position_tp en bingx_bot.py): SOLO
+          # se activa cuando el disparador es el EXTERNO (cronjob.org
+          # -> repository_dispatch), por ser más puntual que el cron
+          # interno de GitHub (schedule), que puede sufrir retrasos.
+          # NUNCA se activa en el cron interno (schedule) ni en
+          # ejecuciones manuales (workflow_dispatch) -- así el Stop
+          # Loss se coloca desde un único disparador, nunca desde dos
+          # a la vez. El Take Profit (Gatillo 1) NO usa esta variable:
+          # sigue evaluándose siempre, sin importar el disparador.
+          RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
