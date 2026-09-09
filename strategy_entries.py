@@ -28,6 +28,13 @@ IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
     SMA20 ya empezaba por encima de la EMA200 desde el inicio del
     historial disponible), se considera que NO hay evidencia de un
     retroceso y el símbolo aprueba el Paso 10 con normalidad.
+  - Pasos 7 y 8, chequeo de W%R (ver check_wr_all_distinct_red_and_green):
+    además de la vela ROJA del máximo, se exige el mismo chequeo de
+    distinción entre W%R6/W%R12/W%R24 en la última vela VERDE que la
+    antecede (retrocediendo vela por vela si hay rojas consecutivas
+    antes del máximo). Se asume que esa vela verde SIEMPRE existe,
+    porque el máximo del round (Paso 3) solo puede alcanzarse tras un
+    movimiento alcista -- confirmado con el usuario.
 
 NOTA: Esta estrategia abre posiciones apalancadas en corto de forma 100%
 automática. Antes de usar dinero real, pruébala en testnet o con montos
@@ -309,12 +316,37 @@ def check_max_candle_matches_and_is_red(df_closed: pd.DataFrame, since_ts: int, 
     return True, {"idx": idx, "max_candle": max_candle, "max_high": max_high_tf}
 
 
+def _find_preceding_green_candle_idx(df_closed: pd.DataFrame, idx_red_max: int):
+    """
+    Busca hacia atrás, desde la vela INMEDIATAMENTE ANTERIOR a la vela
+    roja del máximo (idx_red_max - 1), la última vela VERDE:
+      - Si esa vela anterior ya es verde, esa es la que se usa.
+      - Si es roja, se sigue retrocediendo vela por vela hasta
+        encontrar la primera vela verde.
+
+    Por construcción de un round alcista ya confirmado (Paso 2/3): el
+    máximo del round se alcanzó tras un movimiento alcista, así que
+    SIEMPRE debe existir una vela verde en algún punto hacia atrás
+    dentro de esa ventana -- de lo contrario el precio nunca habría
+    llegado a marcar ese máximo (confirmado con el usuario). Aun así,
+    se devuelve None como red de seguridad si por cualquier motivo
+    (datos insuficientes, ventana cortada) no se encuentra ninguna, y
+    el llamador decide cómo manejarlo.
+    """
+    i = idx_red_max - 1
+    while i >= 0:
+        if _is_green(df_closed.iloc[i]):
+            return i
+        i -= 1
+    return None
+
+
 def check_wr_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, step_num: int):
     """
-    FUNCIÓN INDEPENDIENTE para el Paso {step_num}: en la vela `idx` (el
-    máximo ya validado por su propio paso), chequea que W%R6, W%R12 y
-    W%R24 sean todos distintos entre sí. Si cualquiera de las 3
-    combinaciones coincide, se descarta el par.
+    FUNCIÓN INDEPENDIENTE: en la vela `idx` dada, chequea que W%R6,
+    W%R12 y W%R24 sean todos distintos entre sí. Si cualquiera de las 3
+    combinaciones coincide, se descarta el par. `tf_label` es solo
+    texto descriptivo usado en el mensaje de log/razón de descarte.
     """
     high = df_closed["high"]
     low = df_closed["low"]
@@ -338,6 +370,54 @@ def check_wr_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, step
         }
 
     return True, {"wr6": v_wr6, "wr12": v_wr12, "wr24": v_wr24}
+
+
+def check_wr_all_distinct_red_and_green(df_closed: pd.DataFrame, idx_red_max: int, tf_label: str, step_num: int):
+    """
+    FUNCIÓN INDEPENDIENTE para el Paso {step_num}: exige que W%R6,
+    W%R12 y W%R24 sean todos distintos entre sí en DOS velas de la
+    misma temporalidad:
+
+      1) La vela ROJA del máximo (`idx_red_max`) -- chequeo original,
+         sin cambios.
+      2) La última vela VERDE que la antecede (ver
+         _find_preceding_green_candle_idx): si la vela inmediatamente
+         anterior a la roja del máximo también es roja, se sigue
+         retrocediendo vela por vela hasta encontrar la primera verde.
+
+    Si CUALQUIERA de las dos velas tiene W%R6/12/24 repetidos entre sí,
+    se descarta el símbolo en este paso. Los valores de W%R que se
+    exponen en el resultado (wr6/wr12/wr24, usados después para la
+    singularidad de los Pasos 11-12) siguen siendo los de la vela ROJA
+    del máximo, sin cambios -- el chequeo de la vela verde es un
+    filtro adicional, no reemplaza los valores usados más adelante.
+    """
+    ok_red, res_red = check_wr_all_distinct(df_closed, idx_red_max, f"{tf_label} (vela roja del máximo)", step_num)
+    if not ok_red:
+        return False, res_red
+
+    idx_green = _find_preceding_green_candle_idx(df_closed, idx_red_max)
+    if idx_green is None:
+        # Red de seguridad: por la lógica de un round alcista ya
+        # confirmado (Paso 2/3), esto no debería ocurrir nunca -- ver
+        # el comentario de cabecera de _find_preceding_green_candle_idx.
+        return False, {
+            "reason": (
+                f"[Paso {step_num}] No se encontró ninguna vela verde antes del máximo en {tf_label} "
+                f"dentro de la ventana consultada (inesperado en un round alcista confirmado)"
+            ),
+            "failed_step": step_num,
+        }
+
+    ok_green, res_green = check_wr_all_distinct(df_closed, idx_green, f"{tf_label} (última vela verde previa)", step_num)
+    if not ok_green:
+        return False, res_green
+
+    return True, {
+        "wr6": res_red["wr6"], "wr12": res_red["wr12"], "wr24": res_red["wr24"],
+        "idx_green": idx_green,
+        "green_wr6": res_green["wr6"], "green_wr12": res_green["wr12"], "green_wr24": res_green["wr24"],
+    }
 
 
 def _get_rsi6_rsi12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
@@ -489,23 +569,46 @@ async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_li
 # ventana de datos consultada.
 #
 # Se corrige calculando el chequeo al revés: primero se ubica el
-# INICIO del ciclo alcista actual (el cruce más reciente de la SMA20
-# sobre la EMA50), y luego se compara ese punto contra el cruce de la
-# SMA20 sobre la EMA200. Si el cruce sobre la EMA200 ocurrió en o
-# después del inicio del ciclo actual, el ciclo es limpio y se aprueba.
-# Si el cruce sobre la EMA200 quedó ANTES del inicio del ciclo actual
-# (o no se encuentra en absoluto dentro de la ventana, lo que implica
-# que ya estaba por encima desde antes del historial disponible, y por
-# lo tanto también antes del ciclo actual), significa que el ciclo en
-# el que la SMA20 cruzó limpiamente la EMA200 ya terminó por un
-# retroceso -- se descarta por completo.
+# INICIO del ciclo alcista actual, y luego se compara ese punto contra
+# el cruce de la SMA20 sobre la EMA200. Si el cruce sobre la EMA200
+# ocurrió en o después del inicio del ciclo actual, el ciclo es limpio
+# y se aprueba. Si el cruce sobre la EMA200 quedó ANTES del inicio del
+# ciclo actual (o no se encuentra en absoluto dentro de la ventana, lo
+# que implica que ya estaba por encima desde antes del historial
+# disponible, y por lo tanto también antes del ciclo actual), significa
+# que el ciclo en el que la SMA20 cruzó limpiamente la EMA200 ya
+# terminó por un retroceso -- se descarta por completo.
+#
+# DOS PATRONES POSIBLES DE INICIO DE CICLO (confirmado con el usuario,
+# visto en OPUSDT) -- se usa el que haya ocurrido MÁS RECIENTE de los
+# dos:
+#   1) El cruce de la SMA20 de abajo hacia arriba de la EMA50 (patrón
+#      original, visto en SPACEUSDT) -- en ese momento ambas pueden
+#      estar todavía por debajo de la EMA200.
+#   2) La EMA50 cruza de ARRIBA HACIA ABAJO la EMA200 (entra en una
+#      fase bajista respecto a la EMA200) y LUEGO vuelve a cruzarla de
+#      abajo hacia arriba (recupera la EMA200) -- ese segundo cruce (la
+#      EMA50 recuperando la EMA200) TAMBIÉN marca el inicio de un
+#      nuevo ciclo alcista, visto en OPUSDT. Esto cubre el caso en que
+#      el cruce de la SMA20 sobre la EMA50 quedó "viejo" (ocurrió mucho
+#      antes, incluso durante una fase todavía por debajo de la
+#      EMA200), pero lo que de verdad reinicia el ciclo alcista es la
+#      EMA50 recuperando la EMA200 más adelante. Ver
+#      _find_cycle_start_index() para el detalle.
+#
+# El FIN de ciclo NO cambió: sigue siendo el instante exacto en que la
+# SMA20 cae por debajo de la EMA50 mientras AMBAS siguen por encima de
+# la EMA200 (sin siquiera tocarla) -- eso ya se descarta directamente
+# en la condición base de check_step_10 (SMA20(4h) <= EMA50(4h)), sin
+# necesidad de un chequeo aparte.
 #
 # Caso borde (SUPUESTO ADOPTADO, confirmado con el usuario): si dentro
-# de las 1200 velas de 4h consultadas la SMA20 se mantuvo SIEMPRE por
-# encima de la EMA50 (no se encuentra ningún cruce de la SMA20 sobre la
-# EMA50 dentro de la ventana), no hay evidencia de ningún retroceso
-# -- se aprueba el short con normalidad, sin importar dónde quede el
-# cruce sobre la EMA200.
+# de las 1200 velas de 4h consultadas NINGUNO de los dos patrones de
+# inicio de ciclo se encuentra (la SMA20 se mantuvo SIEMPRE por encima
+# de la EMA50 Y la EMA50 se mantuvo SIEMPRE por encima de la EMA200
+# durante toda la ventana), no hay evidencia de ningún retroceso -- se
+# aprueba el short con normalidad, sin importar dónde quede el cruce
+# sobre la EMA200.
 #
 # Si SMA20(4h) <= EMA50(4h), o se detecta el retroceso, se descarta el
 # símbolo por completo.
@@ -532,6 +635,46 @@ def _find_last_cross_up_index(fast: pd.Series, slow: pd.Series, idx_max: int):
     return None
 
 
+def _find_cycle_start_index(sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h: pd.Series, idx_max: int):
+    """
+    Encuentra el INICIO del ciclo alcista ACTUAL (4h), considerando DOS
+    patrones posibles (confirmado con el usuario, visto en OPUSDT) -- se
+    usa el que haya ocurrido MÁS RECIENTE (índice más alto) de los dos:
+
+      1) El cruce de la SMA20 de abajo hacia arriba de la EMA50 (patrón
+         original, visto en SPACEUSDT) -- en ese momento ambas pueden
+         estar todavía por debajo de la EMA200.
+      2) La EMA50 cruzando de abajo hacia arriba la EMA200 -- es decir,
+         RECUPERANDO la EMA200 después de haber estado por debajo de
+         ella (visto en OPUSDT). Por definición, un "cruce hacia
+         arriba" ya implica que la vela anterior estaba por debajo o
+         igual, así que este cruce por sí solo confirma el patrón
+         completo "EMA50 cruza abajo de la EMA200 y luego vuelve a
+         cruzarla hacia arriba", sin necesitar detectar el cruce hacia
+         abajo por separado.
+
+    Se usa el ÍNDICE MÁS RECIENTE entre ambos patrones, porque ese es
+    el evento que de verdad dio inicio al ciclo alcista que sigue
+    activo en la vela actual (un cruce SMA20->EMA50 muy antiguo, ocurrido
+    incluso mientras la EMA50 seguía por debajo de la EMA200, no
+    describe con precisión un ciclo que en realidad se reinició después
+    cuando la EMA50 recuperó la EMA200).
+
+    Devuelve None si NINGUNO de los dos patrones se encuentra dentro de
+    la ventana consultada -- es decir, la SMA20 se mantuvo siempre por
+    encima de la EMA50 Y la EMA50 se mantuvo siempre por encima de la
+    EMA200 durante toda la ventana (sin evidencia de ningún reinicio de
+    ciclo ni de ningún retroceso).
+    """
+    sma20_cross_up_ema50_idx = _find_last_cross_up_index(sma20_4h, ema50_4h, idx_max)
+    ema50_cross_up_ema200_idx = _find_last_cross_up_index(ema50_4h, ema200_4h, idx_max)
+
+    candidates = [i for i in (sma20_cross_up_ema50_idx, ema50_cross_up_ema200_idx) if i is not None]
+    if not candidates:
+        return None
+    return max(candidates)
+
+
 def _check_retroceso_ciclo_alcista(
     sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h: pd.Series,
 ):
@@ -543,36 +686,38 @@ def _check_retroceso_ciclo_alcista(
 
     Devuelve (ok, info):
       ok = True  -> el cruce de la SMA20 sobre la EMA200 ocurrió DENTRO
-                    del ciclo alcista actual (en o después del último
-                    cruce de la SMA20 sobre la EMA50), o no hay
-                    evidencia de que la SMA20 haya estado alguna vez
-                    por debajo de la EMA50 dentro de la ventana
-                    consultada -- el símbolo puede aprobar el Paso 10.
+                    del ciclo alcista actual (en o después del inicio
+                    de ese ciclo -- ver _find_cycle_start_index para
+                    los DOS patrones posibles de inicio), o no hay
+                    evidencia de ningún reinicio de ciclo dentro de la
+                    ventana consultada -- el símbolo puede aprobar el
+                    Paso 10.
       ok = False -> el ciclo alcista actual empezó DESPUÉS de que la
                     SMA20 ya había cruzado la EMA200 en un ciclo
-                    anterior -- es decir, hubo un retroceso (SMA20 por
-                    debajo de la EMA50) posterior a ese cruce que
-                    terminó aquel ciclo, y el ciclo alcista actual
-                    todavía no ha confirmado un cruce limpio y propio
-                    de la SMA20 sobre la EMA200. Se descarta POR
-                    COMPLETO.
+                    anterior -- es decir, hubo un reinicio de ciclo
+                    (por cualquiera de los dos patrones) posterior a
+                    ese cruce, y el ciclo alcista actual todavía no ha
+                    confirmado un cruce limpio y propio de la SMA20
+                    sobre la EMA200. Se descarta POR COMPLETO.
     """
     last_idx = len(sma20_4h) - 1
 
-    # Inicio del ciclo alcista ACTUAL: el cruce más reciente de la
-    # SMA20 sobre la EMA50. Si no se encuentra ninguno dentro de la
-    # ventana, la SMA20 se mantuvo por encima de la EMA50 de forma
-    # ininterrumpida durante todo el historial disponible -- sin
-    # evidencia de ningún retroceso, se aprueba directamente.
-    cycle_start_idx = _find_last_cross_up_index(sma20_4h, ema50_4h, last_idx)
+    # Inicio del ciclo alcista ACTUAL: ver _find_cycle_start_index()
+    # para el detalle de los DOS patrones posibles (cruce SMA20->EMA50,
+    # o la EMA50 recuperando la EMA200 -- visto en OPUSDT). Se toma el
+    # más reciente de los dos. Si no se encuentra ninguno dentro de la
+    # ventana, ni la SMA20 cruzó nunca la EMA50 ni la EMA50 cruzó nunca
+    # la EMA200 durante todo el historial disponible -- sin evidencia
+    # de ningún retroceso, se aprueba directamente.
+    cycle_start_idx = _find_cycle_start_index(sma20_4h, ema50_4h, ema200_4h, last_idx)
 
     if cycle_start_idx is None:
         return True, {
             "cycle_start_found": False,
             "note": (
-                "La SMA20(4h) se mantuvo por encima de la EMA50(4h) de forma "
-                "ininterrumpida durante toda la ventana consultada -- sin evidencia "
-                "de ningún retroceso, se aprueba por defecto"
+                "Ni la SMA20(4h) cruzó la EMA50(4h) ni la EMA50(4h) cruzó la EMA200(4h) "
+                "dentro de la ventana consultada -- sin evidencia de ningún reinicio de "
+                "ciclo ni de ningún retroceso, se aprueba por defecto"
             ),
         }
 
@@ -599,21 +744,22 @@ def _check_retroceso_ciclo_alcista(
     # de la EMA200 desde antes del historial disponible, y por lo
     # tanto también antes del ciclo actual. En ambos casos: el ciclo en
     # el que la SMA20 cruzó limpiamente la EMA200 ya terminó por un
-    # retroceso -- la SMA20 cayó por debajo de la EMA50 justo antes de
-    # la vela idx=cycle_start_idx, reiniciando el ciclo alcista DESPUÉS
-    # de que ya estaba por encima de la EMA200. Ese es exactamente el
-    # retroceso que se debe descartar.
+    # retroceso, y el ciclo actual se reinició DESPUÉS de eso -- por
+    # cualquiera de los dos patrones de _find_cycle_start_index() (la
+    # SMA20 volviendo a cruzar la EMA50, o la EMA50 recuperando la
+    # EMA200 -- visto en OPUSDT). Ese es exactamente el retroceso que
+    # se debe descartar.
     return False, {
         "cycle_start_found": True,
         "cycle_start_idx": cycle_start_idx,
         "ema200_cross_idx": ema200_cross_idx,
         "reason": (
-            f"[Paso 10] Retroceso detectado -- la SMA20(4h) cayó por debajo de la "
-            f"EMA50(4h) justo antes de la vela idx={cycle_start_idx} (dando inicio a "
-            f"un nuevo ciclo alcista), después de que ya había cruzado sobre la "
-            f"EMA200(4h) en un ciclo anterior. El ciclo alcista actual todavía no ha "
-            f"confirmado un cruce propio y limpio de la SMA20 sobre la EMA200(4h) "
-            f"-- se descarta"
+            f"[Paso 10] Retroceso detectado -- el ciclo alcista actual se reinició en "
+            f"la vela idx={cycle_start_idx} (cruce SMA20->EMA50 o EMA50 recuperando la "
+            f"EMA200, ver _find_cycle_start_index), después de que la SMA20(4h) ya "
+            f"había cruzado sobre la EMA200(4h) en un ciclo anterior. El ciclo alcista "
+            f"actual todavía no ha confirmado un cruce propio y limpio de la SMA20 "
+            f"sobre la EMA200(4h) -- se descarta"
         ),
     }
 
@@ -1044,14 +1190,16 @@ async def evaluate_symbol(exchange, symbol: str):
             symbol, ts_5m, pd.to_datetime(ts_5m, unit="ms", utc=True), res6["max_high"],
         )
 
-        # ---- Paso 7: W%R6/12/24 todos distintos en la vela roja de 15m ----
-        ok, res7 = check_wr_all_distinct(df_15m, idx_15m, "15m", step_num=7)
+        # ---- Paso 7: W%R6/12/24 todos distintos en la vela roja de 15m
+        #      Y en la última vela verde que la antecede ----
+        ok, res7 = check_wr_all_distinct_red_and_green(df_15m, idx_15m, "15m", step_num=7)
         if not ok:
             log.info("%s descartado en %s", symbol, res7["reason"])
             return None, 7
 
-        # ---- Paso 8: W%R6/12/24 todos distintos en la vela roja de 5m ----
-        ok, res8 = check_wr_all_distinct(df_5m, idx_5m, "5m", step_num=8)
+        # ---- Paso 8: W%R6/12/24 todos distintos en la vela roja de 5m
+        #      Y en la última vela verde que la antecede ----
+        ok, res8 = check_wr_all_distinct_red_and_green(df_5m, idx_5m, "5m", step_num=8)
         if not ok:
             log.info("%s descartado en %s", symbol, res8["reason"])
             return None, 8
