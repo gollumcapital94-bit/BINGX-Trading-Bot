@@ -28,6 +28,17 @@ IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
     SMA20 ya empezaba por encima de la EMA200 desde el inicio del
     historial disponible), se considera que NO hay evidencia de un
     retroceso y el símbolo aprueba el Paso 10 con normalidad.
+  - Paso 10, DOS patrones de FIN de ciclo alcista (Patrón A original y
+    Patrón B nuevo, confirmado con el usuario -- ver el comentario de
+    cabecera de la sección del Paso 10 más abajo para el detalle
+    completo): ambos ya quedan descartados por la misma condición base
+    (SMA20(4h) <= EMA50(4h)); la distinción es solo diagnóstica.
+  - Paso 10, DOS patrones de INICIO de ciclo alcista (sin cambios): no
+    se agrega un tercer patrón para el caso del Patrón B de fin --
+    el mismo patrón de inicio ya existente (EMA50 recuperando la
+    EMA200) es suficiente, porque si la EMA50 (más lenta) cruza la
+    EMA200 hacia arriba, la SMA20 (más rápida) ya la cruzó antes --
+    confirmado con el usuario.
   - Pasos 7 y 8, chequeo de W%R (ver check_wr_all_distinct_red_and_green):
     además de la vela ROJA del máximo, se exige el mismo chequeo de
     distinción entre W%R6/W%R12/W%R24 en la última vela VERDE que la
@@ -542,76 +553,56 @@ async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_li
 #     la EMA50 SIN NINGUNA interrupción, e incluye el momento (si
 #     llega a ocurrir dentro de ese mismo tramo) en que la SMA20
 #     también cruza por encima de la EMA200.
-#   - El ciclo TERMINA en el instante EXACTO en que la SMA20 vuelve a
-#     caer por debajo de la EMA50 -- este es el "retroceso". No
-#     importa si para ese momento la SMA20 ya estaba o no por encima
-#     de la EMA200: el retroceso siempre termina el ciclo alcista.
+#   - El ciclo TERMINA -- confirmado con el usuario -- en el instante
+#     en que ocurre CUALQUIERA de estos DOS patrones ("retroceso"):
 #
-# CHEQUEO ADICIONAL (confirmado con el usuario): si en la vela actual
-# AMBAS medias están por encima de la EMA200(4h) (SMA20 > EMA200 Y
-# EMA50 > EMA200), se exige que el cruce de la SMA20 sobre la EMA200
-# haya ocurrido DENTRO del ciclo alcista ACTUAL -- es decir, en o
-# después del último cruce de la SMA20 sobre la EMA50 -- y no en un
-# ciclo alcista anterior que ya haya terminado por un retroceso.
+#       PATRÓN A DE FIN, EN 4H (original): la SMA20(4h) vuelve a caer
+#       por debajo de la EMA50(4h) MIENTRAS AMBAS siguen por encima de
+#       la EMA200(4h) (sin siquiera tocarla). Es el retroceso
+#       "superficial": la SMA20(4h) pierde la EMA50(4h), pero se
+#       mantiene por encima de la EMA200(4h).
 #
-# BUG CORREGIDO (visto en producción: LITUSDT): la versión anterior de
-# este chequeo buscaba el retroceso SOLO desde el cruce de la SMA20
-# sobre la EMA200 en adelante, usando ese cruce como punto de partida
-# de la ventana de búsqueda. El problema: si la SMA20 cruzó la EMA200
-# hace mucho tiempo (o incluso varias veces, oscilando alrededor de
-# ella) y en el camino tuvo un retroceso por debajo de la EMA50 que
-# reinició el ciclo alcista -- pero luego la SMA20 volvió a estar por
-# encima de la EMA200 SIN necesitar "re-cruzarla" (porque nunca había
-# caído por debajo de ella, solo de la EMA50) -- el chequeo anterior no
-# encontraba ningún cruce NUEVO de la EMA200 para usar como punto de
-# partida, y terminaba aplicando el supuesto de "sin evidencia,
-# aprobado" incluso cuando el retroceso SÍ era visible dentro de la
-# ventana de datos consultada.
+#       PATRÓN B DE FIN, EN 4H (nuevo, visto en mercado real --
+#       confirmado con el usuario): la SMA20(4h) cae por debajo de la
+#       EMA50(4h) Y ADEMÁS cae por debajo de la EMA200(4h), MIENTRAS
+#       la EMA50(4h) se mantiene por encima de la EMA200(4h). Es un
+#       retroceso más profundo: solo la SMA20(4h) (más reactiva) llega
+#       a perforar la EMA200(4h); la EMA50(4h) (más lenta) nunca la
+#       pierde.
 #
-# Se corrige calculando el chequeo al revés: primero se ubica el
-# INICIO del ciclo alcista actual, y luego se compara ese punto contra
-# el cruce de la SMA20 sobre la EMA200. Si el cruce sobre la EMA200
-# ocurrió en o después del inicio del ciclo actual, el ciclo es limpio
-# y se aprueba. Si el cruce sobre la EMA200 quedó ANTES del inicio del
-# ciclo actual (o no se encuentra en absoluto dentro de la ventana, lo
-# que implica que ya estaba por encima desde antes del historial
-# disponible, y por lo tanto también antes del ciclo actual), significa
-# que el ciclo en el que la SMA20 cruzó limpiamente la EMA200 ya
-# terminó por un retroceso -- se descarta por completo.
+#       Ambos patrones (A y B) se evalúan EXCLUSIVAMENTE con velas de
+#       4H -- las mismas sma20_4h/ema50_4h/ema200_4h ya calculadas en
+#       check_step_10() a partir de OHLCV_LIMIT_4H velas de 4h. Nunca
+#       se mezclan datos de otras temporalidades (1h, 15m, 5m) para
+#       decidir el fin de un ciclo alcista.
 #
-# DOS PATRONES POSIBLES DE INICIO DE CICLO (confirmado con el usuario,
-# visto en OPUSDT) -- se usa el que haya ocurrido MÁS RECIENTE de los
-# dos:
-#   1) El cruce de la SMA20 de abajo hacia arriba de la EMA50 (patrón
-#      original, visto en SPACEUSDT) -- en ese momento ambas pueden
-#      estar todavía por debajo de la EMA200.
-#   2) La EMA50 cruza de ARRIBA HACIA ABAJO la EMA200 (entra en una
-#      fase bajista respecto a la EMA200) y LUEGO vuelve a cruzarla de
-#      abajo hacia arriba (recupera la EMA200) -- ese segundo cruce (la
-#      EMA50 recuperando la EMA200) TAMBIÉN marca el inicio de un
-#      nuevo ciclo alcista, visto en OPUSDT. Esto cubre el caso en que
-#      el cruce de la SMA20 sobre la EMA50 quedó "viejo" (ocurrió mucho
-#      antes, incluso durante una fase todavía por debajo de la
-#      EMA200), pero lo que de verdad reinicia el ciclo alcista es la
-#      EMA50 recuperando la EMA200 más adelante. Ver
-#      _find_cycle_start_index() para el detalle.
+#     En AMBOS casos, el símbolo ya queda descartado directamente por
+#     la condición BASE del Paso 10 (SMA20(4h) <= EMA50(4h)), sin
+#     importar su relación con la EMA200 -- no hace falta un chequeo
+#     aparte para rechazar el símbolo. La distinción entre Patrón A y
+#     Patrón B es puramente DIAGNÓSTICA (para identificar en el log
+#     cuál de los dos ocurrió), y se calcula en
+#     _classify_fin_ciclo_alcista().
 #
-# El FIN de ciclo NO cambió: sigue siendo el instante exacto en que la
-# SMA20 cae por debajo de la EMA50 mientras AMBAS siguen por encima de
-# la EMA200 (sin siquiera tocarla) -- eso ya se descarta directamente
-# en la condición base de check_step_10 (SMA20(4h) <= EMA50(4h)), sin
-# necesidad de un chequeo aparte.
+# CHEQUEO ADICIONAL: cuando ambas medias ya están por encima de la
+# EMA200, se exige que el cruce de la SMA20 sobre la EMA200 haya
+# ocurrido DENTRO del ciclo alcista actual (en o después de su inicio,
+# según la definición de arriba) -- y no en un ciclo alcista anterior
+# que ya haya terminado por CUALQUIERA de los dos patrones de fin (A o
+# B). Si se detecta un retroceso así, el símbolo se descarta por
+# completo, porque la señal de tendencia ya no se considera "limpia".
 #
-# Caso borde (SUPUESTO ADOPTADO, confirmado con el usuario): si dentro
-# de las 1200 velas de 4h consultadas NINGUNO de los dos patrones de
-# inicio de ciclo se encuentra (la SMA20 se mantuvo SIEMPRE por encima
-# de la EMA50 Y la EMA50 se mantuvo SIEMPRE por encima de la EMA200
-# durante toda la ventana), no hay evidencia de ningún retroceso -- se
-# aprueba el short con normalidad, sin importar dónde quede el cruce
-# sobre la EMA200.
-#
-# Si SMA20(4h) <= EMA50(4h), o se detecta el retroceso, se descarta el
-# símbolo por completo.
+# INICIO DE UN NUEVO CICLO TRAS UN RETROCESO (Patrón A o Patrón B) --
+# confirmado con el usuario: NO se agrega un tercer patrón de inicio
+# para el caso del Patrón B. Se siguen usando exactamente los mismos
+# DOS patrones de inicio ya existentes (ver más abajo, "DOS PATRONES
+# POSIBLES DE INICIO DE CICLO"): el cruce de la SMA20 sobre la EMA50
+# (con ambas por debajo de la EMA200), o la EMA50 recuperando la
+# EMA200. Este segundo patrón de inicio, sin ningún cambio, también
+# cubre la recuperación tras un Patrón B de fin: si la EMA50 (más
+# lenta) llega a cruzar la EMA200 de abajo hacia arriba, eso implica
+# que la SMA20 (más rápida) ya la cruzó antes -- no hace falta
+# detectar ese cruce de la SMA20 por separado.
 # ----------------------------------------------------------------------
 def _find_last_cross_up_index(fast: pd.Series, slow: pd.Series, idx_max: int):
     """
@@ -653,6 +644,15 @@ def _find_cycle_start_index(sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h:
          cruzarla hacia arriba", sin necesitar detectar el cruce hacia
          abajo por separado.
 
+    NOTA (confirmado con el usuario, ver el nuevo Patrón B de fin de
+    ciclo en la cabecera de esta sección): este mismo patrón 2 también
+    cubre la recuperación tras un Patrón B de fin (donde solo la SMA20
+    perfora la EMA200, sin que la EMA50 la pierda) -- porque si la
+    EMA50 (más lenta) termina cruzando la EMA200 hacia arriba en algún
+    punto posterior, eso implica que la SMA20 (más rápida) ya la había
+    cruzado antes. No se agrega un tercer patrón de inicio específico
+    para el Patrón B.
+
     Se usa el ÍNDICE MÁS RECIENTE entre ambos patrones, porque ese es
     el evento que de verdad dio inicio al ciclo alcista que sigue
     activo en la vela actual (un cruce SMA20->EMA50 muy antiguo, ocurrido
@@ -675,14 +675,53 @@ def _find_cycle_start_index(sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h:
     return max(candidates)
 
 
+def _classify_fin_ciclo_alcista(sma20_value: float, ema50_value: float, ema200_value: float) -> str:
+    """
+    Clasifica, SOLO para diagnóstico/logging, cuál de los DOS patrones
+    de FIN de ciclo alcista -- AMBOS evaluados EXCLUSIVAMENTE en
+    TEMPORALIDAD 4H -- describe la relación ACTUAL entre SMA20(4h),
+    EMA50(4h) y EMA200(4h), cuando ya se sabe que SMA20(4h) <=
+    EMA50(4h) (la condición BASE que descarta el símbolo en el Paso
+    10, sin importar cuál de los dos patrones sea -- ver el comentario
+    de cabecera de esta sección para el detalle completo).
+
+    `sma20_value`, `ema50_value` y `ema200_value` deben ser SIEMPRE los
+    valores de la vela 4h más reciente (los mismos que calcula
+    check_step_10() a partir de sma20_4h/ema50_4h/ema200_4h) -- nunca
+    valores de otra temporalidad.
+
+    Patrón A, en 4h (original): la SMA20(4h) cae por debajo de la
+    EMA50(4h) mientras AMBAS siguen por encima de la EMA200(4h) (la
+    SMA20(4h) nunca llega a tocarla).
+
+    Patrón B, en 4h (nuevo, confirmado con el usuario, visto en
+    mercado real): la SMA20(4h) cae por debajo de la EMA50(4h) Y
+    TAMBIÉN cae por debajo de la EMA200(4h), mientras la EMA50(4h) se
+    mantiene por encima de la EMA200(4h) -- un retroceso más profundo,
+    donde solo la SMA20(4h) (más rápida) perfora la EMA200(4h), sin
+    que la EMA50(4h) llegue a perderla.
+
+    Devuelve "A", "B", o "otro" (por ejemplo, si además la EMA50(4h)
+    ya está por debajo de la EMA200(4h) -- un retroceso todavía más
+    profundo, no nombrado como patrón aparte, pero que de todos modos
+    descarta el símbolo por la misma condición base).
+    """
+    if ema50_value > ema200_value and sma20_value > ema200_value:
+        return "A"
+    if ema50_value > ema200_value and sma20_value <= ema200_value:
+        return "B"
+    return "otro"
+
+
 def _check_retroceso_ciclo_alcista(
     sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h: pd.Series,
 ):
     """
     Chequeo de retroceso del Paso 10, basado en la definición exacta de
     "ciclo alcista" confirmada con el usuario -- ver el comentario de
-    cabecera de esta sección para el criterio completo y el bug que
-    corrige (visto en producción con LITUSDT).
+    cabecera de esta sección para el criterio completo (incluidos los
+    DOS patrones de fin, A y B) y el bug que corrige (visto en
+    producción con LITUSDT).
 
     Devuelve (ok, info):
       ok = True  -> el cruce de la SMA20 sobre la EMA200 ocurrió DENTRO
@@ -704,8 +743,9 @@ def _check_retroceso_ciclo_alcista(
 
     # Inicio del ciclo alcista ACTUAL: ver _find_cycle_start_index()
     # para el detalle de los DOS patrones posibles (cruce SMA20->EMA50,
-    # o la EMA50 recuperando la EMA200 -- visto en OPUSDT). Se toma el
-    # más reciente de los dos. Si no se encuentra ninguno dentro de la
+    # o la EMA50 recuperando la EMA200 -- visto en OPUSDT, y que además
+    # cubre la recuperación tras un Patrón B de fin). Se toma el más
+    # reciente de los dos. Si no se encuentra ninguno dentro de la
     # ventana, ni la SMA20 cruzó nunca la EMA50 ni la EMA50 cruzó nunca
     # la EMA200 durante todo el historial disponible -- sin evidencia
     # de ningún retroceso, se aprueba directamente.
@@ -731,7 +771,8 @@ def _check_retroceso_ciclo_alcista(
         # actual (en o después de que la SMA20 cruzó sobre la EMA50).
         # Por construcción, desde el inicio del ciclo hasta ahora la
         # SMA20 no pudo haber caído por debajo de la EMA50 sin que eso
-        # terminara el ciclo -- no hay retroceso posible en este tramo.
+        # terminara el ciclo (por el Patrón A o el Patrón B de fin) --
+        # no hay retroceso posible en este tramo.
         return True, {
             "cycle_start_found": True,
             "cycle_start_idx": cycle_start_idx,
@@ -744,11 +785,11 @@ def _check_retroceso_ciclo_alcista(
     # de la EMA200 desde antes del historial disponible, y por lo
     # tanto también antes del ciclo actual. En ambos casos: el ciclo en
     # el que la SMA20 cruzó limpiamente la EMA200 ya terminó por un
-    # retroceso, y el ciclo actual se reinició DESPUÉS de eso -- por
-    # cualquiera de los dos patrones de _find_cycle_start_index() (la
-    # SMA20 volviendo a cruzar la EMA50, o la EMA50 recuperando la
-    # EMA200 -- visto en OPUSDT). Ese es exactamente el retroceso que
-    # se debe descartar.
+    # retroceso (Patrón A o Patrón B, ver cabecera de esta sección), y
+    # el ciclo actual se reinició DESPUÉS de eso -- por cualquiera de
+    # los dos patrones de _find_cycle_start_index() (la SMA20 volviendo
+    # a cruzar la EMA50, o la EMA50 recuperando la EMA200 -- visto en
+    # OPUSDT). Ese es exactamente el retroceso que se debe descartar.
     return False, {
         "cycle_start_found": True,
         "cycle_start_idx": cycle_start_idx,
@@ -772,12 +813,18 @@ async def check_step_10(exchange, symbol: str):
                          ningún retroceso de la SMA20 por debajo de la
                          EMA50 desde que cruzó la EMA200 (ver chequeo
                          adicional arriba).
-      passed = False -> SMA20(4h) <= EMA50(4h), o se cumplía el patrón
-                         pero se descartó por el chequeo de retroceso --
-                         en ambos casos se descarta el símbolo por
-                         completo.
+      passed = False -> SMA20(4h) <= EMA50(4h) -- ya sea por el Patrón
+                         A o el Patrón B de fin de ciclo (ver la
+                         cabecera de esta sección; la distinción es
+                         solo diagnóstica, ver
+                         _classify_fin_ciclo_alcista) --, o se cumplía
+                         el patrón alcista pero se descartó por el
+                         chequeo de retroceso -- en ambos casos se
+                         descarta el símbolo por completo.
     `info` siempre incluye sma20_4h/ema50_4h/ema200_4h para diagnóstico
-    y, en caso de passed=False, también "reason" y "failed_step".
+    y, en caso de passed=False, también "reason" y "failed_step" (y,
+    cuando aplica la condición base, "fin_ciclo_patron" con "A", "B" u
+    "otro").
     """
     raw_4h = await _fetch_ohlcv_paginated(exchange, symbol, "4h", OHLCV_LIMIT_4H + 1)
     closed_4h = raw_4h[:-1]  # se descarta la vela en formación
@@ -805,12 +852,36 @@ async def check_step_10(exchange, symbol: str):
     base_info = {"sma20_4h": sma20_value, "ema50_4h": ema50_value, "ema200_4h": ema200_value}
 
     if sma20_value <= ema50_value:
+        # CONDICIÓN BASE: descarta el símbolo sin importar la relación
+        # con la EMA200 -- cubre tanto el Patrón A como el Patrón B de
+        # fin de ciclo (ver la cabecera de esta sección). La
+        # clasificación de abajo es puramente diagnóstica, para poder
+        # distinguir en el log cuál de los dos ocurrió.
+        fin_patron = _classify_fin_ciclo_alcista(sma20_value, ema50_value, ema200_value)
+        if fin_patron == "A":
+            detalle_patron = (
+                "Patrón A de fin de ciclo alcista, en 4h: la SMA20(4h) cayó por debajo de "
+                "la EMA50(4h) mientras ambas siguen por encima de la EMA200(4h) (sin tocarla)."
+            )
+        elif fin_patron == "B":
+            detalle_patron = (
+                "Patrón B de fin de ciclo alcista, en 4h (retroceso profundo, nuevo): la "
+                "SMA20(4h) cayó por debajo de la EMA50(4h) Y también por debajo de la "
+                "EMA200(4h), mientras la EMA50(4h) se mantiene por encima de la EMA200(4h)."
+            )
+        else:
+            detalle_patron = (
+                "La SMA20(4h) y la EMA50(4h) están además por debajo de la EMA200(4h) "
+                "(retroceso aún más profundo, en 4h)."
+            )
+
         return False, {
             "reason": (
                 f"[Paso 10] SMA20(4h)={sma20_value:.8f} no está por encima de la "
-                f"EMA50(4h)={ema50_value:.8f}"
+                f"EMA50(4h)={ema50_value:.8f}. {detalle_patron}"
             ),
             "failed_step": 10,
+            "fin_ciclo_patron": fin_patron,
             **base_info,
         }
 
