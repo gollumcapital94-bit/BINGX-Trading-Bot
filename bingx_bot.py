@@ -999,7 +999,7 @@ async def run_pasos_2_a_14_entradas(
         # El apalancamiento y el margen (Paso 13) ya no están en el
         # plan -- se calculan justo antes de ejecutar la orden (ver
         # execute_entry), porque dependen del precio en vivo en ese
-        # momento para saber qué distancia usar en la fórmula.
+        # momento para saber qué distancia usar.
         log.info("  -> SHORT %s | máximo(5m)=%.8f | SMA20(5m)=%.8f", plan["symbol"], plan["max_high_5m"], plan["ma20_5m_value"])
 
     for plan in plans:
