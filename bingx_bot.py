@@ -45,7 +45,7 @@ Requiere las variables de entorno:
     BINGX_API_KEY
     BINGX_API_SECRET
 
-Dependencias: ccxt, pandas, numpy (ver requirements.txt)
+Dependencias: ccxt, pandas, numpy (ver utils/requirements.txt)
 """
 
 import asyncio
@@ -58,7 +58,7 @@ import pandas as pd
 import ccxt.async_support as ccxt
 
 import strategy_entries as strat
-from indicators import sma, ema
+from utils.indicators import sma, ema
 
 logging.basicConfig(
     level=logging.INFO,
