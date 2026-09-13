@@ -58,7 +58,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from indicators import sma, ema, rsi, williams_r
+from utils.indicators import sma, ema, rsi, williams_r
 
 log = logging.getLogger("bingx_bot.strategy")
 
