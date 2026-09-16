@@ -1,23 +1,32 @@
 """
 Motor de la estrategia de ENTRADA EN LARGO (LONG) -- Pasos 2 a 13.
 
-Este módulo es el ESPEJO INVERTIDO de strategy_entries.py (estrategia en
-corto / SHORT). Recibe un símbolo ya filtrado como futuro perpetuo
-USDT-M (Paso 1, en bingx_bot.py, sin cambios respecto al short) y evalúa
-toda la cascada de condiciones para detectar un "round BAJISTA" que ya
-tocó fondo, en vez de un "round alcista" que ya tocó techo.
+Este módulo es el ESPEJO INVERTIDO de short_strategy.py (estrategia en
+corto / SHORT, antes llamado strategy_entries.py). Recibe un símbolo ya
+filtrado como futuro perpetuo USDT-M (Paso 1, en bingx_bot.py, sin
+cambios respecto al short) y evalúa toda la cascada de condiciones para
+detectar un "round BAJISTA" que ya tocó fondo, en vez de un "round
+alcista" que ya tocó techo.
 
 Si el símbolo pasa todos los filtros, devuelve un diccionario con los
 datos necesarios para ejecutar la entrada (LONG, orden a mercado o
 STOP-LIMIT, esperando en la SMA20(5m) desde ABAJO en vez de desde
 arriba). El cálculo final de apalancamiento/margen y la ejecución de la
-orden (Paso 14) siguen viviendo en bingx_bot.py, igual que en la
-estrategia short -- ahí es donde se debe agregar la función equivalente
-a execute_entry() pero abriendo posiciones LONG (comprando en vez de
-vendiendo), usando las mismas piezas de este módulo.
+orden (Paso 14) viven en bingx_bot.py, en execute_entry_long() -- el
+equivalente en LONG (comprando en vez de vendiendo) de execute_entry()
+(SHORT), usando las piezas de este módulo.
+
+INTEGRACIÓN CON bingx_bot.py: este módulo se importa como `strat_long`
+y se ejecuta contra su PROPIA conexión de cuenta (`exchange_long`),
+independiente de la conexión de cuenta del short (`exchange_short`).
+Cada una tiene su propia variable de entorno de modo demo/real
+(BINGX_DEMO_LONG y BINGX_DEMO_SHORT respectivamente) -- ver
+build_exchange() en bingx_bot.py. Ambas leen el mercado (velas,
+indicadores, volumen) de la MISMA conexión de mercado compartida
+(`market_exchange`, siempre real), igual que el short.
 
 RESUMEN DE TODAS LAS INVERSIONES CONFIRMADAS RESPECTO AL SHORT
-(strategy_entries.py):
+(short_strategy.py):
 
   Paso 1 (bingx_bot.py) -> SIN CAMBIOS. Ya es genérico por lado de
       posición (lee position["side"] y decide comprar/vender según
@@ -38,9 +47,10 @@ RESUMEN DE TODAS LAS INVERSIONES CONFIRMADAS RESPECTO AL SHORT
       VERDE) en 15m/5m que coincide con el mínimo de 1h.
 
   Paso 7/8 -> en vez de chequear W%R6/12/24 (todos distintos entre sí)
-      en la vela roja del máximo + su verde previa, se chequea
-      RSI6/12/24 (todos distintos entre sí) en la vela VERDE del
-      mínimo + su ROJA previa.
+      ÚNICAMENTE en la vela roja del máximo, se chequea RSI6/12/24
+      (todos distintos entre sí) ÚNICAMENTE en la vela VERDE del
+      mínimo (REVERTIDO: se quitó el chequeo adicional en la vela roja
+      previa, para permitir más entradas -- confirmado con el usuario).
 
   Paso 9 -> SIN CAMBIOS (volumen 24h, filtro direccional-neutro).
 
@@ -73,7 +83,7 @@ RESUMEN DE TODAS LAS INVERSIONES CONFIRMADAS RESPECTO AL SHORT
       `reference_price` sigue siendo la SMA20(5m) (orden STOP) o el
       precio actual (entrada a mercado), decidido en bingx_bot.py.
 
-  Paso 14 (bingx_bot.py, pendiente de integrar) -> orden de COMPRA
+  Paso 14 (bingx_bot.py, execute_entry_long()) -> orden de COMPRA
       (buy) para abrir LONG, en vez de venta (sell) para abrir SHORT.
       Entrada a MERCADO si el precio YA tocó/cruzó la SMA20(5m) desde
       abajo (last_price >= ma20_5m_value); si no, orden STOP tipo
@@ -328,20 +338,6 @@ def check_min_candle_matches_and_is_green(df_closed: pd.DataFrame, since_ts: int
     return True, {"idx": idx, "min_candle": min_candle, "min_low": min_low_tf}
 
 
-def _find_preceding_red_candle_idx(df_closed: pd.DataFrame, idx_green_min: int):
-    """
-    Espejo de _find_preceding_green_candle_idx: busca hacia atrás,
-    desde la vela inmediatamente anterior a la vela verde del mínimo,
-    la última vela ROJA (retrocediendo si hay varias verdes seguidas).
-    """
-    i = idx_green_min - 1
-    while i >= 0:
-        if _is_red(df_closed.iloc[i]):
-            return i
-        i -= 1
-    return None
-
-
 def check_rsi_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, step_num: int):
     """
     Espejo de check_wr_all_distinct: en la vela `idx` dada, chequea que
@@ -366,37 +362,6 @@ def check_rsi_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, ste
         }
 
     return True, {"rsi6": v_rsi6, "rsi12": v_rsi12, "rsi24": v_rsi24}
-
-
-def check_rsi_all_distinct_green_and_red(df_closed: pd.DataFrame, idx_green_min: int, tf_label: str, step_num: int):
-    """
-    Espejo de check_wr_all_distinct_red_and_green: exige que RSI6/12/24
-    sean todos distintos entre sí en la vela VERDE del mínimo, Y en la
-    última vela ROJA que la antecede.
-    """
-    ok_green, res_green = check_rsi_all_distinct(df_closed, idx_green_min, f"{tf_label} (vela verde del mínimo)", step_num)
-    if not ok_green:
-        return False, res_green
-
-    idx_red = _find_preceding_red_candle_idx(df_closed, idx_green_min)
-    if idx_red is None:
-        return False, {
-            "reason": (
-                f"[Paso {step_num}] No se encontró ninguna vela roja antes del mínimo en {tf_label} "
-                f"dentro de la ventana consultada (inesperado en un round bajista confirmado)"
-            ),
-            "failed_step": step_num,
-        }
-
-    ok_red, res_red = check_rsi_all_distinct(df_closed, idx_red, f"{tf_label} (última vela roja previa)", step_num)
-    if not ok_red:
-        return False, res_red
-
-    return True, {
-        "rsi6": res_green["rsi6"], "rsi12": res_green["rsi12"], "rsi24": res_green["rsi24"],
-        "idx_red": idx_red,
-        "red_rsi6": res_red["rsi6"], "red_rsi12": res_red["rsi12"], "red_rsi24": res_red["rsi24"],
-    }
 
 
 def _get_wr6_wr12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
@@ -439,7 +404,7 @@ async def check_step_9_volume(exchange, symbol: str):
 
 async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_limit: int) -> list:
     """
-    Idéntico a strategy_entries.py -- ver ese archivo para el detalle
+    Idéntico a short_strategy.py -- ver ese archivo para el detalle
     completo de la lógica de paginación.
     """
     per_request = min(total_limit, BINGX_MAX_OHLCV_PER_REQUEST)
@@ -472,48 +437,9 @@ async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_li
 
 # ----------------------------------------------------------------------
 # Paso 10: SMA20/EMA50/EMA200 en TEMPORALIDAD 4H -- versión BAJISTA.
-#
-# Condición base: SMA20(4h) < EMA50(4h).
-#
-# DEFINICIÓN DE "CICLO BAJISTA" (confirmada con el usuario):
-#   - EMPIEZA cuando la SMA20(4h) cruza de arriba hacia abajo la
-#     EMA50(4h). En ese momento, ambas pueden estar todavía por encima
-#     de la EMA200(4h).
-#   - Se EXTIENDE mientras la SMA20 se mantenga por debajo de la EMA50
-#     sin interrupción, e incluye el cruce de la SMA20 por debajo de
-#     la EMA200 si llega a ocurrir en ese mismo tramo.
-#   - TERMINA cuando ocurre cualquiera de estos DOS patrones:
-#
-#       PATRÓN A' DE FIN, EN 4H: la SMA20(4h) cruza de abajo hacia
-#       arriba la EMA50(4h), MIENTRAS AMBAS siguen por debajo de la
-#       EMA200(4h) (retroceso superficial, sin tocar la EMA200).
-#
-#       PATRÓN B' DE FIN, EN 4H: la SMA20(4h) cruza de abajo hacia
-#       arriba la EMA50(4h) Y ADEMÁS cruza por encima de la EMA200(4h),
-#       MIENTRAS la EMA50(4h) se mantiene por debajo de la EMA200(4h)
-#       (retroceso más profundo, solo la SMA20 perfora la EMA200).
-#
-#     En AMBOS casos el símbolo ya queda descartado por la condición
-#     BASE (SMA20(4h) >= EMA50(4h)) -- la distinción A'/B' es solo
-#     diagnóstica.
-#
-# CHEQUEO ADICIONAL: cuando ambas medias ya están por debajo de la
-# EMA200, se exige que el cruce de la SMA20 por debajo de la EMA200
-# haya ocurrido DENTRO del ciclo bajista actual (según la definición de
-# inicio de ciclo de abajo) y no en un ciclo bajista anterior que ya
-# terminó por el Patrón A' o B'.
-#
-# DOS PATRONES DE INICIO DE CICLO BAJISTA (confirmados con el usuario):
-#   1) La SMA20(4h) cruza de arriba hacia abajo la EMA50(4h), con
-#      ambas todavía por encima de la EMA200(4h).
-#   2) La EMA50(4h) cruza de arriba hacia abajo la EMA200(4h) --
-#      "pierde" la EMA200 viniendo de estar por encima de ella (cubre
-#      también la recuperación tras un Patrón B' de fin, donde la
-#      EMA50 nunca la perdió del todo: si en algún punto posterior la
-#      EMA50 SÍ termina cruzando la EMA200 hacia abajo, eso ya marca el
-#      inicio de un nuevo ciclo bajista propio, sin necesitar un tercer
-#      patrón aparte).
-# Se usa el más reciente de los dos.
+# (Ver short_strategy.py para el detalle equivalente del lado alcista;
+# aquí todo está invertido -- ver el resumen de inversiones en la
+# cabecera de este archivo.)
 # ----------------------------------------------------------------------
 def _find_last_cross_down_index(fast: pd.Series, slow: pd.Series, idx_max: int):
     """
@@ -791,7 +717,9 @@ def calculate_leverage(min_low_5m: float, reference_price: float) -> float:
 
 async def get_max_leverage_for_symbol(exchange, symbol: str):
     """
-    Idéntico al short -- no depende de la dirección de la posición.
+    Idéntico al short -- no depende de la dirección de la posición. Se
+    llama con la conexión de CUENTA del lado LONG (exchange_long,
+    demo/real según BINGX_DEMO_LONG) desde bingx_bot.execute_entry_long().
     """
     market = exchange.markets.get(symbol, {})
     max_lev = (market.get("limits", {}) or {}).get("leverage", {}).get("max")
@@ -852,7 +780,8 @@ def _get_available_balance(balance: dict) -> float:
 async def calculate_position_size(exchange, symbol: str, leverage: int) -> float:
     """
     Idéntico al short -- el margen (Paso 13) no depende de la
-    dirección de la posición.
+    dirección de la posición. Se llama con la conexión de CUENTA del
+    lado LONG (exchange_long) desde bingx_bot.execute_entry_long().
     """
     balance = await exchange.fetch_balance()
     total_balance = _get_available_balance(balance)
@@ -885,7 +814,7 @@ async def fetch_1h_with_expanding_window(exchange, symbol: str):
 async def evaluate_symbol(exchange, symbol: str):
     """
     `exchange`: SIEMPRE la conexión de MERCADO (real) de bingx_bot.py,
-    igual que en strategy_entries.evaluate_symbol.
+    igual que en short_strategy.evaluate_symbol.
 
     Devuelve SIEMPRE una tupla (plan, failed_step):
       - Si el símbolo pasa todos los filtros: (plan_dict, None).
@@ -943,16 +872,17 @@ async def evaluate_symbol(exchange, symbol: str):
             symbol, ts_5m, pd.to_datetime(ts_5m, unit="ms", utc=True), res6["min_low"],
         )
 
-        # ---- Paso 7: RSI6/12/24 todos distintos en la vela verde de
-        #      15m Y en la última vela roja que la antecede ----
-        ok, res7 = check_rsi_all_distinct_green_and_red(df_15m, idx_15m, "15m", step_num=7)
+        # ---- Paso 7: RSI6/12/24 todos distintos en la vela verde del
+        #      mínimo en 15m (REVERTIDO: ya no se chequea también la
+        #      última vela roja previa) ----
+        ok, res7 = check_rsi_all_distinct(df_15m, idx_15m, "15m", step_num=7)
         if not ok:
             log.info("%s descartado en %s", symbol, res7["reason"])
             return None, 7
 
-        # ---- Paso 8: RSI6/12/24 todos distintos en la vela verde de
-        #      5m Y en la última vela roja que la antecede ----
-        ok, res8 = check_rsi_all_distinct_green_and_red(df_5m, idx_5m, "5m", step_num=8)
+        # ---- Paso 8: RSI6/12/24 todos distintos en la vela verde del
+        #      mínimo en 5m (REVERTIDO) ----
+        ok, res8 = check_rsi_all_distinct(df_5m, idx_5m, "5m", step_num=8)
         if not ok:
             log.info("%s descartado en %s", symbol, res8["reason"])
             return None, 8
