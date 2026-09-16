@@ -47,13 +47,12 @@ IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
     EMA200) es suficiente, porque si la EMA50 (más lenta) cruza la
     EMA200 hacia arriba, la SMA20 (más rápida) ya la cruzó antes --
     confirmado con el usuario.
-  - Pasos 7 y 8, chequeo de W%R (ver check_wr_all_distinct_red_and_green):
-    además de la vela ROJA del máximo, se exige el mismo chequeo de
-    distinción entre W%R6/W%R12/W%R24 en la última vela VERDE que la
-    antecede (retrocediendo vela por vela si hay rojas consecutivas
-    antes del máximo). Se asume que esa vela verde SIEMPRE existe,
-    porque el máximo del round (Paso 3) solo puede alcanzarse tras un
-    movimiento alcista -- confirmado con el usuario.
+  - Pasos 7 y 8, chequeo de W%R (ver check_wr_all_distinct): se exige
+    que W%R6/W%R12/W%R24 sean todos distintos entre sí ÚNICAMENTE en
+    la vela ROJA del máximo (15m y 5m respectivamente). REVERTIDO: se
+    quitó el chequeo adicional que también exigía esto en la última
+    vela verde previa -- confirmado con el usuario, para permitir más
+    entradas.
 
 NOTA: Esta estrategia abre posiciones apalancadas en corto de forma 100%
 automática. Antes de usar dinero real, pruébala en testnet o con montos
@@ -335,31 +334,6 @@ def check_max_candle_matches_and_is_red(df_closed: pd.DataFrame, since_ts: int, 
     return True, {"idx": idx, "max_candle": max_candle, "max_high": max_high_tf}
 
 
-def _find_preceding_green_candle_idx(df_closed: pd.DataFrame, idx_red_max: int):
-    """
-    Busca hacia atrás, desde la vela INMEDIATAMENTE ANTERIOR a la vela
-    roja del máximo (idx_red_max - 1), la última vela VERDE:
-      - Si esa vela anterior ya es verde, esa es la que se usa.
-      - Si es roja, se sigue retrocediendo vela por vela hasta
-        encontrar la primera vela verde.
-
-    Por construcción de un round alcista ya confirmado (Paso 2/3): el
-    máximo del round se alcanzó tras un movimiento alcista, así que
-    SIEMPRE debe existir una vela verde en algún punto hacia atrás
-    dentro de esa ventana -- de lo contrario el precio nunca habría
-    llegado a marcar ese máximo (confirmado con el usuario). Aun así,
-    se devuelve None como red de seguridad si por cualquier motivo
-    (datos insuficientes, ventana cortada) no se encuentra ninguna, y
-    el llamador decide cómo manejarlo.
-    """
-    i = idx_red_max - 1
-    while i >= 0:
-        if _is_green(df_closed.iloc[i]):
-            return i
-        i -= 1
-    return None
-
-
 def check_wr_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, step_num: int):
     """
     FUNCIÓN INDEPENDIENTE: en la vela `idx` dada, chequea que W%R6,
@@ -389,54 +363,6 @@ def check_wr_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, step
         }
 
     return True, {"wr6": v_wr6, "wr12": v_wr12, "wr24": v_wr24}
-
-
-def check_wr_all_distinct_red_and_green(df_closed: pd.DataFrame, idx_red_max: int, tf_label: str, step_num: int):
-    """
-    FUNCIÓN INDEPENDIENTE para el Paso {step_num}: exige que W%R6,
-    W%R12 y W%R24 sean todos distintos entre sí en DOS velas de la
-    misma temporalidad:
-
-      1) La vela ROJA del máximo (`idx_red_max`) -- chequeo original,
-         sin cambios.
-      2) La última vela VERDE que la antecede (ver
-         _find_preceding_green_candle_idx): si la vela inmediatamente
-         anterior a la roja del máximo también es roja, se sigue
-         retrocediendo vela por vela hasta encontrar la primera verde.
-
-    Si CUALQUIERA de las dos velas tiene W%R6/12/24 repetidos entre sí,
-    se descarta el símbolo en este paso. Los valores de W%R que se
-    exponen en el resultado (wr6/wr12/wr24, usados después para la
-    singularidad de los Pasos 11-12) siguen siendo los de la vela ROJA
-    del máximo, sin cambios -- el chequeo de la vela verde es un
-    filtro adicional, no reemplaza los valores usados más adelante.
-    """
-    ok_red, res_red = check_wr_all_distinct(df_closed, idx_red_max, f"{tf_label} (vela roja del máximo)", step_num)
-    if not ok_red:
-        return False, res_red
-
-    idx_green = _find_preceding_green_candle_idx(df_closed, idx_red_max)
-    if idx_green is None:
-        # Red de seguridad: por la lógica de un round alcista ya
-        # confirmado (Paso 2/3), esto no debería ocurrir nunca -- ver
-        # el comentario de cabecera de _find_preceding_green_candle_idx.
-        return False, {
-            "reason": (
-                f"[Paso {step_num}] No se encontró ninguna vela verde antes del máximo en {tf_label} "
-                f"dentro de la ventana consultada (inesperado en un round alcista confirmado)"
-            ),
-            "failed_step": step_num,
-        }
-
-    ok_green, res_green = check_wr_all_distinct(df_closed, idx_green, f"{tf_label} (última vela verde previa)", step_num)
-    if not ok_green:
-        return False, res_green
-
-    return True, {
-        "wr6": res_red["wr6"], "wr12": res_red["wr12"], "wr24": res_red["wr24"],
-        "idx_green": idx_green,
-        "green_wr6": res_green["wr6"], "green_wr12": res_green["wr12"], "green_wr24": res_green["wr24"],
-    }
 
 
 def _get_rsi6_rsi12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
@@ -978,12 +904,14 @@ async def evaluate_symbol(exchange, symbol: str):
             return None, 6
         idx_5m = res6["idx"]
 
-        ok, res7 = check_wr_all_distinct_red_and_green(df_15m, idx_15m, "15m", step_num=7)
+        # REVERTIDO: ya no se chequea también la última vela verde previa
+        # -- solo la vela roja del máximo, como antes de ese cambio.
+        ok, res7 = check_wr_all_distinct(df_15m, idx_15m, "15m", step_num=7)
         if not ok:
             log.info("%s descartado en %s", symbol, res7["reason"])
             return None, 7
 
-        ok, res8 = check_wr_all_distinct_red_and_green(df_5m, idx_5m, "5m", step_num=8)
+        ok, res8 = check_wr_all_distinct(df_5m, idx_5m, "5m", step_num=8)
         if not ok:
             log.info("%s descartado en %s", symbol, res8["reason"])
             return None, 8
