@@ -5,28 +5,30 @@ on:
     types: [bingx-trigger]
   workflow_dispatch:
     inputs:
-      demo_mode:
-        description: "Ejecutar en cuenta DEMO (VST) en vez de cuenta real"
+      demo_mode_short:
+        description: "Ejecutar la estrategia SHORT en cuenta DEMO (VST) en vez de cuenta real"
+        required: true
+        type: boolean
+        default: false
+      demo_mode_long:
+        description: "Ejecutar la estrategia LONG en cuenta DEMO (VST) en vez de cuenta real"
         required: true
         type: boolean
         default: true
   schedule:
     # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE a la gestión de
     # TP/SL (Paso 1) -- ver BOT_MODE más abajo. Corre CADA HORA, en
-    # sintonía con TIMEFRAME_TP="1h" en bingx_bot.py: el Paso 1 solo
-    # evalúa velas 1h ya cerradas, así que revisar con más frecuencia
-    # no aportaría datos nuevos hasta que cierre la siguiente vela.
-    # NUNCA escanea ni abre nuevas entradas, así se evita duplicar una
-    # posición que el disparador externo (cronjob.org ->
-    # repository_dispatch) ya haya abierto.
+    # sintonía con TIMEFRAME_TP="1h" en bingx_bot.py. NUNCA escanea ni
+    # abre nuevas entradas (ninguna de las dos direcciones), así se
+    # evita duplicar una posición que el disparador externo
+    # (cronjob.org -> repository_dispatch) ya haya abierto.
     #
     # IMPORTANTE (Stop Loss): este cron interno de GitHub NO es
     # puntual -- schedule puede sufrir retrasos frente al minuto
-    # exacto configurado, especialmente en horarios de alta demanda.
-    # Por eso el Stop Loss (Gatillo 2 del Paso 1, toque de la
-    # EMA50(1h)) ya NO se coloca desde este disparador -- ver
-    # RUN_STOP_LOSS_CHECK más abajo. El Take Profit (Gatillo 1) sigue
-    # evaluándose aquí sin cambios.
+    # exacto configurado. Por eso el Stop Loss (Gatillo 2 del Paso 1)
+    # ya NO se coloca desde este disparador -- ver RUN_STOP_LOSS_CHECK
+    # más abajo. El Take Profit (Gatillo 1) sigue evaluándose aquí sin
+    # cambios, para ambas cuentas (short y long).
     - cron: "0 * * * *"
 
 jobs:
@@ -38,10 +40,8 @@ jobs:
     # -> repository_dispatch) podrían caer en el mismo instante y correr
     # EN PARALELO -- ambos verificarían "¿ya existe el TP/SL?" casi al
     # mismo tiempo, verían que no, y crearían la orden duplicada de
-    # todos modos (el chequeo de duplicados en bingx_bot.py no es
-    # atómico frente a corridas simultáneas). `cancel-in-progress:
-    # false` hace que la segunda ejecución espere en cola a que termine
-    # la primera, en vez de cancelarla o correr al mismo tiempo.
+    # todos modos. `cancel-in-progress: false` hace que la segunda
+    # ejecución espere en cola a que termine la primera.
     concurrency:
       group: bingx-trading-bot
       cancel-in-progress: false
@@ -62,31 +62,29 @@ jobs:
         env:
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
-          BINGX_DEMO: ${{ github.event.inputs.demo_mode || vars.BINGX_DEMO || 'true' }}
-          # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1).
-          # Cualquier otro disparador -- manual (workflow_dispatch) o
-          # externo (repository_dispatch desde cronjob.org) -- corre el
-          # bot completo (Pasos 1 a 14), incluida la búsqueda de nuevas
-          # entradas.
+          # Antes: una sola BINGX_DEMO para toda la cuenta. Ahora, DOS
+          # variables independientes -- una por dirección de la
+          # estrategia -- para poder tener, por ejemplo, la SHORT (ya
+          # probada) en real mientras la LONG (más nueva) sigue en
+          # demo por más tiempo.
+          BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
+          BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
+          # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1),
+          # en ambas cuentas. Cualquier otro disparador -- manual
+          # (workflow_dispatch) o externo (repository_dispatch desde
+          # cronjob.org) -- corre el bot completo (Pasos 1 a 14, en
+          # ambas direcciones).
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
           # Barrido de balance de futuros -> fondos (ver
-          # check_and_sweep_futures_balance en bingx_bot.py): SOLO debe
-          # correr cuando el disparador es el EXTERNO (cronjob.org ->
-          # repository_dispatch) -- NUNCA en el cron interno de GitHub
-          # (schedule, modo tp_only) ni en ejecuciones manuales
-          # (workflow_dispatch). El propio bingx_bot.py además solo lo
-          # ejecuta de verdad si BINGX_DEMO=false (mercado real).
+          # check_and_sweep_futures_balance en bingx_bot.py, evaluado
+          # por separado para cada cuenta): SOLO debe correr cuando el
+          # disparador es el EXTERNO (cronjob.org -> repository_dispatch).
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
           # Gatillo del Stop Loss (Gatillo 2 del Paso 1, toque de la
-          # EMA50(1h) -- ver process_position_tp en bingx_bot.py): SOLO
-          # se activa cuando el disparador es el EXTERNO (cronjob.org
-          # -> repository_dispatch), por ser más puntual que el cron
-          # interno de GitHub (schedule), que puede sufrir retrasos.
-          # NUNCA se activa en el cron interno (schedule) ni en
-          # ejecuciones manuales (workflow_dispatch) -- así el Stop
-          # Loss se coloca desde un único disparador, nunca desde dos
-          # a la vez. El Take Profit (Gatillo 1) NO usa esta variable:
-          # sigue evaluándose siempre, sin importar el disparador.
+          # EMA50(1h)): SOLO se activa cuando el disparador es el
+          # EXTERNO (cronjob.org -> repository_dispatch). El Take
+          # Profit (Gatillo 1) NO usa esta variable: sigue
+          # evaluándose siempre, sin importar el disparador.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
@@ -100,11 +98,10 @@ jobs:
         run: |
           # NOTA: el patrón de "Stop Loss" usa ".*" entre "break even" y
           # "colocado" porque el log real dice "Stop Loss en break even
-          # EXACTO colocado (gatillo: ...)" -- un patrón literal sin el
-          # ".*" nunca hubiera hecho match y esa notificación de Telegram
-          # jamás se habría disparado. El patrón de "Transferencia
-          # ejecutada" notifica el barrido de balance de futuros -> fondos.
-          grep -E "Market entry executed|Short STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
+          # EXACTO colocado (gatillo: ...)". El patrón de "Transferencia
+          # ejecutada" notifica el barrido de balance de futuros -> fondos
+          # (de cualquiera de las dos cuentas, short o long).
+          grep -E "Market entry executed|STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
