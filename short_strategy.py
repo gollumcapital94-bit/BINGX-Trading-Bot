@@ -53,6 +53,17 @@ IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
     quitó el chequeo adicional que también exigía esto en la última
     vela verde previa -- confirmado con el usuario, para permitir más
     entradas.
+  - Paso 3 (EXPERIMENTAL, ver check_step_2_3 más abajo): antes
+    descartaba el par si la última vela 1h cerrada no era el máximo
+    histórico del round. Ahora YA NO descarta -- se sospecha que la
+    singularidad (Pasos 11/12) también puede ser válida en puntos del
+    round distintos al máximo exacto (hipótesis a comprobar, visto en
+    producción: sequías de varios días seguidas de entradas seguidas).
+    El par ahora SIEMPRE continúa al Paso 4, y solo se anota
+    `es_maximo_round` (True/False) para poder analizar después el
+    desempeño de cada caso por separado. Ver también, en
+    bingx_bot.execute_entry(), el manejo experimental de margen/tipo
+    de orden cuando es_maximo_round=False.
 
 NOTA: Esta estrategia abre posiciones apalancadas en corto de forma 100%
 automática. Antes de usar dinero real, pruébala en testnet o con montos
@@ -77,6 +88,14 @@ MIN_VOLUME_24H_USDT = 2_000_000
 MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 13)
 LEVERAGE_BASE = 80  # numerador de la fórmula de apalancamiento (antes 90)
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
+
+# EXPERIMENTO (ver check_step_2_3 / es_maximo_round): cuando la entrada
+# ocurre FUERA del máximo del round, se limita el margen a este valor
+# FIJO (en vez del 10% del balance de la cuenta) para no arriesgar la
+# cuenta completa mientras se valida si la singularidad también
+# funciona fuera del máximo exacto. Se sigue respetando el límite real
+# de notional/apalancamiento de BingX (ver calculate_position_size_fixed).
+FIXED_EXPERIMENT_MARGIN_USDT = 100.0
 
 OHLCV_LIMIT_1H = 1200   # histórico fijo (~50 días) para que SMA20/EMA50/EMA200 converjan; una sola petición, sin reintentos
 OHLCV_LIMIT_4H = 1200   # mismo criterio que OHLCV_LIMIT_1H, pero en 4h (~200 días) para el Paso 10 (SMA20 vs EMA50 en 4h)
@@ -229,8 +248,18 @@ def find_round_start_index(df_1h_closed: pd.DataFrame):
 
 def check_step_2_3(df_1h_closed: pd.DataFrame):
     """
-    Devuelve (ok, info) donde info incluye: round_start_idx, last_idx,
-    last_candle (Series), es_verde (bool del máximo en 1h).
+    Paso 2: detecta si hay un round alcista activo -- SIN CAMBIOS: si
+    no lo hay, el par se descarta (return False).
+
+    Paso 3 (EXPERIMENTAL -- ver nota de cabecera del archivo): ANTES
+    descartaba el par si la última vela 1h cerrada no era el máximo
+    histórico de todo el round. Esto YA NO descarta al par. Ahora solo
+    se calcula y se anota `es_maximo_round` (True/False) en el info
+    devuelto, y el par SIEMPRE continúa hacia el Paso 4 (y los
+    siguientes, que conservan su lógica de filtro normal, sin cambios).
+
+    Devuelve (ok, info). ok=False únicamente si el Paso 2 no encontró
+    ningún round alcista activo.
     """
     round_start_idx, reason = find_round_start_index(df_1h_closed)
 
@@ -241,9 +270,7 @@ def check_step_2_3(df_1h_closed: pd.DataFrame):
     round_highs = df_1h_closed["high"].iloc[round_start_idx: last_idx + 1]
     last_high = df_1h_closed["high"].iloc[last_idx]
 
-    is_round_max = last_high >= round_highs.max()
-    if not is_round_max:
-        return False, {"reason": "[Paso 3] La última vela 1h cerrada no es el máximo del round"}
+    es_maximo_round = bool(last_high >= round_highs.max())
 
     last_candle = df_1h_closed.iloc[last_idx]
     return True, {
@@ -251,6 +278,7 @@ def check_step_2_3(df_1h_closed: pd.DataFrame):
         "last_idx": last_idx,
         "last_candle": last_candle,
         "es_verde_1h": _is_green(last_candle),
+        "es_maximo_round": es_maximo_round,
         "round_start_ts": int(df_1h_closed["ts"].iloc[round_start_idx]),
     }
 
@@ -825,7 +853,8 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
     margen máximo que permite el apalancamiento elegido para ese par.
 
     Se llama con la conexión de CUENTA del lado SHORT (exchange_short)
-    desde bingx_bot.execute_entry().
+    desde bingx_bot.execute_entry(), cuando es_maximo_round=True (caso
+    normal, sin cambios).
     """
     balance = await exchange.fetch_balance()
     total_balance = _get_available_balance(balance)
@@ -835,6 +864,28 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
     max_margin_by_leverage = max_notional / leverage if leverage else max_notional
 
     return min(margin_20pct, max_margin_by_leverage)
+
+
+async def calculate_position_size_fixed(
+    exchange, symbol: str, leverage: int, fixed_margin: float = FIXED_EXPERIMENT_MARGIN_USDT,
+) -> float:
+    """
+    EXPERIMENTO (ver es_maximo_round en check_step_2_3 / evaluate_symbol
+    y el manejo en bingx_bot.execute_entry()): cuando la entrada ocurre
+    FUERA del máximo del round, se usa un margen FIJO (`fixed_margin`,
+    por defecto 100 USDT/VST) en vez del 10% del balance de la cuenta,
+    para no arriesgar la cuenta completa mientras se valida si la
+    singularidad también es válida fuera del máximo exacto del round.
+
+    Igual que calculate_position_size(), sigue respetando el límite
+    real de notional/apalancamiento que impone BingX para el par: si
+    ese límite permite MENOS que `fixed_margin` (por ejemplo, solo 50
+    USDT de margen para ese apalancamiento), se usa ese límite menor.
+    """
+    max_notional = await get_max_notional_for_leverage(exchange, symbol, leverage)
+    max_margin_by_leverage = max_notional / leverage if leverage else max_notional
+
+    return min(fixed_margin, max_margin_by_leverage)
 
 
 # ----------------------------------------------------------------------
@@ -872,6 +923,15 @@ async def evaluate_symbol(exchange, symbol: str):
         last_idx = info["last_idx"]
         round_start_ts = info["round_start_ts"]
         es_verde_1h = info["es_verde_1h"]
+        es_maximo_round = info["es_maximo_round"]
+
+        # Paso 3 (EXPERIMENTAL): ya NO descarta -- solo se anota si el
+        # par está o no en el máximo del round, y siempre continúa al
+        # Paso 4. Ver nota de cabecera del archivo.
+        log.info(
+            "%s [Paso 3] %s en el máximo del round (informativo, ya NO descarta) -- continúa al Paso 4.",
+            symbol, "SÍ ESTÁ" if es_maximo_round else "NO ESTÁ",
+        )
 
         last_candle_ts = int(info["last_candle"]["ts"])
         window_start_ts = last_candle_ts
@@ -977,8 +1037,8 @@ async def evaluate_symbol(exchange, symbol: str):
 
         log.info(
             "%s [Paso 13] Datos preparados para calcular apalancamiento en la ejecución: "
-            "max_high_5m=%.8f | ma20_5m_value=%.8f",
-            symbol, max_high_5m, ma20_5m_value,
+            "max_high_5m=%.8f | ma20_5m_value=%.8f | es_maximo_round=%s",
+            symbol, max_high_5m, ma20_5m_value, es_maximo_round,
         )
 
         plan = {
@@ -987,6 +1047,7 @@ async def evaluate_symbol(exchange, symbol: str):
             "max_high_5m": max_high_5m,
             "round_start_ts": round_start_ts,
             "es_verde_1h": es_verde_1h,
+            "es_maximo_round": es_maximo_round,
             "singularidad_15m": singularidad_15m,
             "singularidad_5m": singularidad_5m,
         }
