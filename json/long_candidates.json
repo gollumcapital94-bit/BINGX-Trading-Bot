@@ -1,20 +1,8 @@
 {
-  "FHE/USDT:USDT": {
+  "KAITO/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.02466,
-    "vela_a_low": 0.02388,
-    "vela_a_ts": 1790186400000
-  },
-  "MOVE/USDT:USDT": {
-    "status": "waiting_b",
-    "vela_a_high": 0.009333,
-    "vela_a_low": 0.009139,
-    "vela_a_ts": 1790186400000
-  },
-  "TOWNS/USDT:USDT": {
-    "status": "waiting_b",
-    "vela_a_high": 0.001983,
-    "vela_a_low": 0.001959,
-    "vela_a_ts": 1790186400000
+    "vela_a_high": 0.3188,
+    "vela_a_low": 0.3128,
+    "vela_a_ts": 1790190000000
   }
 }
