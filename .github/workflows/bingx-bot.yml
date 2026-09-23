@@ -29,7 +29,19 @@ on:
     # ya NO se coloca desde este disparador -- ver RUN_STOP_LOSS_CHECK
     # más abajo. El Take Profit (Gatillo 1) sigue evaluándose aquí sin
     # cambios, para ambas cuentas (short y long).
+    #
+    # NOTA -- EXPERIMENTO REVERSAL LONG: bingx_bot.py revisa las
+    # señales pendientes (vela A/vela B, ver long_reversal.py) en
+    # TODAS las corridas, incluida esta cron horaria -- de hecho es
+    # la que más importa para no perderse la ventana de la vela B,
+    # que también es de 1h.
     - cron: "0 * * * *"
+
+# NUEVO: necesario para que el paso "Guardar estado de REVERSAL LONG"
+# pueda hacer `git push` de vuelta al repo con el JSON de señales
+# pendientes actualizado.
+permissions:
+  contents: write
 
 jobs:
   run-bot:
@@ -41,7 +53,9 @@ jobs:
     # EN PARALELO -- ambos verificarían "¿ya existe el TP/SL?" casi al
     # mismo tiempo, verían que no, y crearían la orden duplicada de
     # todos modos. `cancel-in-progress: false` hace que la segunda
-    # ejecución espere en cola a que termine la primera.
+    # ejecución espere en cola a que termine la primera. Esto también
+    # evita conflictos de `git push` al commitear el estado del
+    # experimento REVERSAL LONG (ver más abajo).
     concurrency:
       group: bingx-trading-bot
       cancel-in-progress: false
@@ -70,10 +84,11 @@ jobs:
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
           BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
           # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1),
-          # en ambas cuentas. Cualquier otro disparador -- manual
-          # (workflow_dispatch) o externo (repository_dispatch desde
-          # cronjob.org) -- corre el bot completo (Pasos 1 a 14, en
-          # ambas direcciones).
+          # en ambas cuentas, y el seguimiento de señales pendientes
+          # del experimento REVERSAL LONG. Cualquier otro disparador --
+          # manual (workflow_dispatch) o externo (repository_dispatch
+          # desde cronjob.org) -- corre el bot completo (Pasos 1 a 14,
+          # en ambas direcciones), además del mismo seguimiento.
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
           # Barrido de balance de futuros -> fondos (ver
           # check_and_sweep_futures_balance en bingx_bot.py, evaluado
@@ -90,6 +105,26 @@ jobs:
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
 
+      - name: Guardar estado de REVERSAL LONG (long_reversal_state.json)
+        # NUEVO: el JSON con las señales pendientes del experimento
+        # REVERSAL LONG (ver long_reversal.py) se escribe en el disco
+        # efímero del runner -- si no se commitea de vuelta al repo, se
+        # pierde al terminar el job y el bot "olvidaría" las señales
+        # pendientes en la siguiente corrida. `if: always()` asegura
+        # que esto corra incluso si el paso "Ejecutar bot" falló a
+        # mitad de camino, para no perder cambios de estado ya hechos.
+        if: always()
+        run: |
+          if [ -f long_reversal_state.json ] && [ -n "$(git status --porcelain long_reversal_state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add long_reversal_state.json
+            git commit -m "chore: actualizar estado de señales pendientes REVERSAL LONG [skip ci]"
+            git push
+          else
+            echo "Sin cambios en long_reversal_state.json, no se commitea nada."
+          fi
+
       - name: Enviar señales a Telegram
         if: always()
         env:
@@ -100,7 +135,9 @@ jobs:
           # "colocado" porque el log real dice "Stop Loss en break even
           # EXACTO colocado (gatillo: ...)". El patrón de "Transferencia
           # ejecutada" notifica el barrido de balance de futuros -> fondos
-          # (de cualquiera de las dos cuentas, short o long).
+          # (de cualquiera de las dos cuentas, short o long). El patrón
+          # "REVERSAL LONG.*Market entry executed" notifica las entradas
+          # del nuevo experimento.
           grep -E "Market entry executed|STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
