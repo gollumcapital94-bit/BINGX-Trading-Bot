@@ -105,24 +105,26 @@ jobs:
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
 
-      - name: Guardar estado de REVERSAL LONG (long_candidates.json)
+      - name: Guardar estado de REVERSAL LONG (json/long_candidates.json)
         # NUEVO: el JSON con las señales pendientes del experimento
         # REVERSAL LONG (ver long_reversal.py) se escribe en el disco
-        # efímero del runner -- si no se commitea de vuelta al repo, se
-        # pierde al terminar el job y el bot "olvidaría" las señales
-        # pendientes en la siguiente corrida. `if: always()` asegura
-        # que esto corra incluso si el paso "Ejecutar bot" falló a
-        # mitad de camino, para no perder cambios de estado ya hechos.
+        # efímero del runner, dentro de la carpeta json/ (creada sola
+        # por long_reversal._save_state() si no existe) -- si no se
+        # commitea de vuelta al repo, se pierde al terminar el job y
+        # el bot "olvidaría" las señales pendientes en la siguiente
+        # corrida. `if: always()` asegura que esto corra incluso si
+        # el paso "Ejecutar bot" falló a mitad de camino, para no
+        # perder cambios de estado ya hechos.
         if: always()
         run: |
-          if [ -f long_candidates.json ] && [ -n "$(git status --porcelain long_candidates.json)" ]; then
+          if [ -f json/long_candidates.json ] && [ -n "$(git status --porcelain json/long_candidates.json)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add long_candidates.json
+            git add json/long_candidates.json
             git commit -m "chore: actualizar estado de señales pendientes REVERSAL LONG [skip ci]"
             git push
           else
-            echo "Sin cambios en long_candidates.json, no se commitea nada."
+            echo "Sin cambios en json/long_candidates.json, no se commitea nada."
           fi
 
       - name: Enviar señales a Telegram
