@@ -1,0 +1,14 @@
+{
+  "AIO/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.04274,
+    "vela_a_low": 0.04206,
+    "vela_a_ts": 1790136000000
+  },
+  "BANK/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.03464,
+    "vela_a_low": 0.03435,
+    "vela_a_ts": 1790136000000
+  }
+}
