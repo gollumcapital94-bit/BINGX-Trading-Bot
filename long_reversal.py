@@ -78,10 +78,13 @@ from utils.indicators import sma, ema
 
 log = logging.getLogger("bingx_bot.long_reversal")
 
-# Se guarda en la raíz del repo (mismo directorio que este archivo),
-# junto a bingx_bot.py / short_strategy.py, para que el workflow de
-# GitHub Actions lo encuentre fácilmente con una ruta relativa fija.
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "long_candidates.json")
+# Se guarda dentro de la carpeta json/ (hermana de utils/), para
+# mantener la raíz del repo organizada -- junto a bingx_bot.py /
+# short_strategy.py, con una ruta relativa fija que el workflow de
+# GitHub Actions puede encontrar fácilmente. La carpeta json/ no
+# necesita existir de antemano en el repo (git no rastrea carpetas
+# vacías): _save_state() la crea sola si hace falta, ver más abajo.
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "json", "long_candidates.json")
 
 TAKE_PROFIT_DISTANCE_MULTIPLIER = 2.0
 
@@ -109,6 +112,7 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, sort_keys=True)
     except Exception as exc:
