@@ -1,20 +1,8 @@
 {
-  "AIO/USDT:USDT": {
+  "GUA/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.03852,
-    "vela_a_low": 0.03772,
-    "vela_a_ts": 1790193600000
-  },
-  "KGEN/USDT:USDT": {
-    "status": "waiting_b",
-    "vela_a_high": 0.1582,
-    "vela_a_low": 0.157,
-    "vela_a_ts": 1790193600000
-  },
-  "SAPIEN/USDT:USDT": {
-    "status": "waiting_b",
-    "vela_a_high": 0.07517,
-    "vela_a_low": 0.0747,
-    "vela_a_ts": 1790193600000
+    "vela_a_high": 0.03561,
+    "vela_a_low": 0.03522,
+    "vela_a_ts": 1790197200000
   }
 }
