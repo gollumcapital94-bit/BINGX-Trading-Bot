@@ -1,8 +1,50 @@
 {
-  "IDOL/USDT:USDT": {
+  "2Z/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.01204,
-    "vela_a_low": 0.01192,
-    "vela_a_ts": 1790157600000
+    "vela_a_high": 0.05452,
+    "vela_a_low": 0.05346,
+    "vela_a_ts": 1790161200000
+  },
+  "MOVE/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.010068,
+    "vela_a_low": 0.009793,
+    "vela_a_ts": 1790161200000
+  },
+  "RAVE/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.2086,
+    "vela_a_low": 0.2041,
+    "vela_a_ts": 1790161200000
+  },
+  "RIVER/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 1.276,
+    "vela_a_low": 1.248,
+    "vela_a_ts": 1790161200000
+  },
+  "SEI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.06167,
+    "vela_a_low": 0.06014,
+    "vela_a_ts": 1790161200000
+  },
+  "SUI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 1.0199,
+    "vela_a_low": 1.0021,
+    "vela_a_ts": 1790161200000
+  },
+  "TURBO/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.001121,
+    "vela_a_low": 0.0010764,
+    "vela_a_ts": 1790161200000
+  },
+  "XAI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.008374,
+    "vela_a_low": 0.008193,
+    "vela_a_ts": 1790161200000
   }
 }
