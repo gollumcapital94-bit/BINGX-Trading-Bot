@@ -1,1 +1,14 @@
-{}
+{
+  "TOWNS/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.001991,
+    "vela_a_low": 0.001943,
+    "vela_a_ts": 1790179200000
+  },
+  "XAI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.007913,
+    "vela_a_low": 0.007687,
+    "vela_a_ts": 1790179200000
+  }
+}
