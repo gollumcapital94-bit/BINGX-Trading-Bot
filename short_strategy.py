@@ -47,12 +47,25 @@ IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
     EMA200) es suficiente, porque si la EMA50 (más lenta) cruza la
     EMA200 hacia arriba, la SMA20 (más rápida) ya la cruzó antes --
     confirmado con el usuario.
-  - Pasos 7 y 8, chequeo de W%R (ver check_wr_all_distinct): se exige
-    que W%R6/W%R12/W%R24 sean todos distintos entre sí ÚNICAMENTE en
-    la vela ROJA del máximo (15m y 5m respectivamente). REVERTIDO: se
-    quitó el chequeo adicional que también exigía esto en la última
-    vela verde previa -- confirmado con el usuario, para permitir más
-    entradas.
+  - Pasos 7 y 8, CHEQUEO DE BORDES DE W%R (ver check_wr_bordes más
+    abajo): se exige que W%R6/W%R12/W%R24 sean todos distintos entre sí
+    en la vela ROJA del máximo (15m y 5m respectivamente) -- esto SIEMPRE
+    descarta el símbolo si falla, sin cambios.
+    REINTRODUCIDO (confirmado con el usuario): además de la vela roja
+    del máximo, también se chequea la vela INMEDIATAMENTE ANTERIOR a
+    ella (el otro "borde" del patrón):
+      - Si esa vela anterior es VERDE, se le exige la MISMA condición
+        (W%R6/12/24 todos distintos entre sí). Si falla ahí, el símbolo
+        SE DESCARTA (aunque la vela roja del máximo sí haya pasado).
+      - Si esa vela anterior es ROJA (no verde), el chequeo de esa vela
+        se OMITE por completo -- se toma como aprobado y el símbolo
+        SIGUE adelante sin descartarse por este motivo, en NINGUNA de
+        las dos temporalidades (15m ni 5m).
+    Nota histórica: este chequeo de la vela verde previa había existido
+    antes y se había revertido (ver versiones anteriores de este
+    archivo) para permitir más entradas. Se reintroduce ahora bajo el
+    nombre "chequeo de bordes", con la nueva regla de omisión cuando la
+    vela previa es roja (en vez de descartar directamente).
   - Paso 3 (ver check_step_2_3 más abajo): YA NO descarta el par si la
     última vela 1h cerrada no es el máximo histórico del round. El par
     ahora SIEMPRE continúa al Paso 4, y solo se anota `es_maximo_round`
@@ -392,6 +405,61 @@ def check_wr_all_distinct(df_closed: pd.DataFrame, idx: int, tf_label: str, step
         }
 
     return True, {"wr6": v_wr6, "wr12": v_wr12, "wr24": v_wr24}
+
+
+def check_wr_bordes(df_closed: pd.DataFrame, idx: int, tf_label: str, step_num: int):
+    """
+    CHEQUEO DE BORDES (Pasos 7/8): extiende check_wr_all_distinct()
+    para chequear los DOS bordes del patrón, no solo la vela roja del
+    máximo:
+
+      1) Vela roja del máximo (`idx`): se exige W%R6/12/24 todos
+         distintos entre sí, IGUAL que antes -- si falla, se descarta
+         el símbolo (sin excepción).
+
+      2) Vela inmediatamente ANTERIOR (`idx - 1`), el otro "borde":
+           - Si es VERDE: se le exige la MISMA condición. Si falla
+             ahí, el símbolo TAMBIÉN se descarta, aunque la vela roja
+             del máximo sí haya pasado.
+           - Si es ROJA (no verde): el chequeo de esa vela se OMITE
+             por completo -- se toma como aprobado, sin descartar el
+             símbolo por este motivo.
+           - Si `idx == 0` (no hay vela anterior disponible en la
+             ventana): se omite igual, por falta de datos.
+
+    Devuelve (ok, info). `info` incluye los W%R de la vela roja del
+    máximo y, si se evaluó, los de la vela verde previa.
+    """
+    ok_red, res_red = check_wr_all_distinct(df_closed, idx, tf_label, step_num)
+    if not ok_red:
+        return False, res_red
+
+    info = dict(res_red)
+
+    if idx == 0:
+        info["borde_previo"] = "omitido (sin vela anterior disponible)"
+        return True, info
+
+    prev_candle = df_closed.iloc[idx - 1]
+
+    if not _is_green(prev_candle):
+        log.info(
+            "[Paso %d] Chequeo de bordes en %s: la vela previa (idx=%d) es ROJA, "
+            "se OMITE su chequeo de W%%R -- el par continúa.",
+            step_num, tf_label, idx - 1,
+        )
+        info["borde_previo"] = "omitido (vela previa roja)"
+        return True, info
+
+    ok_prev, res_prev = check_wr_all_distinct(df_closed, idx - 1, f"{tf_label} (vela verde previa)", step_num)
+    if not ok_prev:
+        return False, res_prev
+
+    info["borde_previo"] = "verificado (vela previa verde, W%R distintos)"
+    info["wr6_prev"] = res_prev["wr6"]
+    info["wr12_prev"] = res_prev["wr12"]
+    info["wr24_prev"] = res_prev["wr24"]
+    return True, info
 
 
 def _get_rsi6_rsi12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
@@ -966,14 +1034,16 @@ async def evaluate_symbol(exchange, symbol: str):
             return None, 6
         idx_5m = res6["idx"]
 
-        # REVERTIDO: ya no se chequea también la última vela verde previa
-        # -- solo la vela roja del máximo, como antes de ese cambio.
-        ok, res7 = check_wr_all_distinct(df_15m, idx_15m, "15m", step_num=7)
+        # CHEQUEO DE BORDES (reintroducido): además de la vela roja del
+        # máximo, también se chequea la vela verde previa -- ver
+        # check_wr_bordes() para la regla completa (se omite si la
+        # vela previa es roja, en vez de descartar).
+        ok, res7 = check_wr_bordes(df_15m, idx_15m, "15m", step_num=7)
         if not ok:
             log.info("%s descartado en %s", symbol, res7["reason"])
             return None, 7
 
-        ok, res8 = check_wr_all_distinct(df_5m, idx_5m, "5m", step_num=8)
+        ok, res8 = check_wr_bordes(df_5m, idx_5m, "5m", step_num=8)
         if not ok:
             log.info("%s descartado en %s", symbol, res8["reason"])
             return None, 8
