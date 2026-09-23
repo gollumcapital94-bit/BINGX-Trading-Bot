@@ -53,17 +53,19 @@ IMPORTANTE — SUPUESTOS ADOPTADOS (confirmados con el usuario):
     quitó el chequeo adicional que también exigía esto en la última
     vela verde previa -- confirmado con el usuario, para permitir más
     entradas.
-  - Paso 3 (EXPERIMENTAL, ver check_step_2_3 más abajo): antes
-    descartaba el par si la última vela 1h cerrada no era el máximo
-    histórico del round. Ahora YA NO descarta -- se sospecha que la
-    singularidad (Pasos 11/12) también puede ser válida en puntos del
-    round distintos al máximo exacto (hipótesis a comprobar, visto en
-    producción: sequías de varios días seguidas de entradas seguidas).
-    El par ahora SIEMPRE continúa al Paso 4, y solo se anota
-    `es_maximo_round` (True/False) para poder analizar después el
-    desempeño de cada caso por separado. Ver también, en
-    bingx_bot.execute_entry(), el manejo experimental de margen/tipo
-    de orden cuando es_maximo_round=False.
+  - Paso 3 (ver check_step_2_3 más abajo): YA NO descarta el par si la
+    última vela 1h cerrada no es el máximo histórico del round. El par
+    ahora SIEMPRE continúa al Paso 4, y solo se anota `es_maximo_round`
+    (True/False) para poder analizar después el desempeño de cada caso
+    por separado.
+    CAMBIO DE ORQUESTACIÓN (ver bingx_bot.execute_entry() y
+    long_reversal.py): cuando es_maximo_round=False, YA NO se fuerza
+    una entrada SHORT a mercado. En su lugar, ese caso ahora alimenta
+    el experimento REVERSAL LONG -- ver long_reversal.py para el
+    detalle completo del patrón (vela A -> vela B -> entrada en C).
+    Para eso, evaluate_symbol() ahora también devuelve, dentro del
+    plan, la ubicación exacta de la vela 1h del máximo del round
+    (vela_a_ts/vela_a_low/vela_a_high) -- ver el final de esta función.
 
 NOTA: Esta estrategia abre posiciones apalancadas en corto de forma 100%
 automática. Antes de usar dinero real, pruébala en testnet o con montos
@@ -89,12 +91,12 @@ MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 13)
 LEVERAGE_BASE = 80  # numerador de la fórmula de apalancamiento (antes 90)
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 
-# EXPERIMENTO (ver check_step_2_3 / es_maximo_round): cuando la entrada
-# ocurre FUERA del máximo del round, se limita el margen a este valor
-# FIJO (en vez del 10% del balance de la cuenta) para no arriesgar la
-# cuenta completa mientras se valida si la singularidad también
-# funciona fuera del máximo exacto. Se sigue respetando el límite real
-# de notional/apalancamiento de BingX (ver calculate_position_size_fixed).
+# EXPERIMENTO REVERSAL LONG (ver long_reversal.py): cuando la vela B
+# confirma el toque de la EMA50(1h) y se entra en LARGO en la vela C,
+# se limita el margen a este valor FIJO (en vez del 10% del balance de
+# la cuenta) para no arriesgar la cuenta completa mientras se valida
+# el patrón. Se sigue respetando el límite real de notional/
+# apalancamiento de BingX (ver calculate_position_size_fixed).
 FIXED_EXPERIMENT_MARGIN_USDT = 100.0
 
 OHLCV_LIMIT_1H = 1200   # histórico fijo (~50 días) para que SMA20/EMA50/EMA200 converjan; una sola petición, sin reintentos
@@ -251,12 +253,11 @@ def check_step_2_3(df_1h_closed: pd.DataFrame):
     Paso 2: detecta si hay un round alcista activo -- SIN CAMBIOS: si
     no lo hay, el par se descarta (return False).
 
-    Paso 3 (EXPERIMENTAL -- ver nota de cabecera del archivo): ANTES
-    descartaba el par si la última vela 1h cerrada no era el máximo
-    histórico de todo el round. Esto YA NO descarta al par. Ahora solo
-    se calcula y se anota `es_maximo_round` (True/False) en el info
-    devuelto, y el par SIEMPRE continúa hacia el Paso 4 (y los
-    siguientes, que conservan su lógica de filtro normal, sin cambios).
+    Paso 3: YA NO descarta el par si la última vela 1h cerrada no es
+    el máximo histórico de todo el round. Esto solo se calcula y se
+    anota `es_maximo_round` (True/False) en el info devuelto, y el par
+    SIEMPRE continúa hacia el Paso 4 (y los siguientes, que conservan
+    su lógica de filtro normal, sin cambios).
 
     Devuelve (ok, info). ok=False únicamente si el Paso 2 no encontró
     ningún round alcista activo.
@@ -853,8 +854,8 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
     margen máximo que permite el apalancamiento elegido para ese par.
 
     Se llama con la conexión de CUENTA del lado SHORT (exchange_short)
-    desde bingx_bot.execute_entry(), cuando es_maximo_round=True (caso
-    normal, sin cambios).
+    desde bingx_bot.execute_entry(), para las entradas SHORT normales
+    (es_maximo_round=True).
     """
     balance = await exchange.fetch_balance()
     total_balance = _get_available_balance(balance)
@@ -870,12 +871,11 @@ async def calculate_position_size_fixed(
     exchange, symbol: str, leverage: int, fixed_margin: float = FIXED_EXPERIMENT_MARGIN_USDT,
 ) -> float:
     """
-    EXPERIMENTO (ver es_maximo_round en check_step_2_3 / evaluate_symbol
-    y el manejo en bingx_bot.execute_entry()): cuando la entrada ocurre
-    FUERA del máximo del round, se usa un margen FIJO (`fixed_margin`,
-    por defecto 100 USDT/VST) en vez del 10% del balance de la cuenta,
-    para no arriesgar la cuenta completa mientras se valida si la
-    singularidad también es válida fuera del máximo exacto del round.
+    EXPERIMENTO REVERSAL LONG (ver long_reversal.py y
+    bingx_bot.execute_long_reversal_entry()): se usa un margen FIJO
+    (`fixed_margin`, por defecto 100 USDT/VST) en vez del 10% del
+    balance de la cuenta, para no arriesgar la cuenta completa mientras
+    se valida el patrón.
 
     Igual que calculate_position_size(), sigue respetando el límite
     real de notional/apalancamiento que impone BingX para el par: si
@@ -925,9 +925,10 @@ async def evaluate_symbol(exchange, symbol: str):
         es_verde_1h = info["es_verde_1h"]
         es_maximo_round = info["es_maximo_round"]
 
-        # Paso 3 (EXPERIMENTAL): ya NO descarta -- solo se anota si el
-        # par está o no en el máximo del round, y siempre continúa al
-        # Paso 4. Ver nota de cabecera del archivo.
+        # Paso 3: ya NO descarta -- solo se anota si el par está o no
+        # en el máximo del round, y siempre continúa al Paso 4. Ver
+        # nota de cabecera del archivo y long_reversal.py para lo que
+        # pasa después cuando es_maximo_round=False.
         log.info(
             "%s [Paso 3] %s en el máximo del round (informativo, ya NO descarta) -- continúa al Paso 4.",
             symbol, "SÍ ESTÁ" if es_maximo_round else "NO ESTÁ",
@@ -937,6 +938,7 @@ async def evaluate_symbol(exchange, symbol: str):
         window_start_ts = last_candle_ts
         window_end_ts = last_candle_ts + 3_600_000
         expected_max_high = float(info["last_candle"]["high"])
+        expected_max_low = float(info["last_candle"]["low"])
 
         ok, info4 = check_step_4(df_1h, last_idx)
         if not ok:
@@ -1050,6 +1052,15 @@ async def evaluate_symbol(exchange, symbol: str):
             "es_maximo_round": es_maximo_round,
             "singularidad_15m": singularidad_15m,
             "singularidad_5m": singularidad_5m,
+            # NUEVO -- necesarios solo cuando es_maximo_round=False,
+            # para alimentar el experimento REVERSAL LONG (ver
+            # long_reversal.register_singularity_candle() en
+            # bingx_bot.execute_entry()): ubicación exacta (1h) de la
+            # vela A (la vela roja del máximo del round que dio la
+            # singularidad).
+            "vela_a_ts": window_start_ts,
+            "vela_a_low": expected_max_low,
+            "vela_a_high": expected_max_high,
         }
         return plan, None
 
