@@ -81,7 +81,7 @@ log = logging.getLogger("bingx_bot.long_reversal")
 # Se guarda en la raíz del repo (mismo directorio que este archivo),
 # junto a bingx_bot.py / short_strategy.py, para que el workflow de
 # GitHub Actions lo encuentre fácilmente con una ruta relativa fija.
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "long_reversal_state.json")
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "long_candidates.json")
 
 TAKE_PROFIT_DISTANCE_MULTIPLIER = 2.0
 
