@@ -1,14 +1,8 @@
 {
-  "SEI/USDT:USDT": {
+  "IDOL/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.06159,
-    "vela_a_low": 0.06066,
-    "vela_a_ts": 1790154000000
-  },
-  "ZAMA/USDT:USDT": {
-    "status": "waiting_b",
-    "vela_a_high": 0.09891,
-    "vela_a_low": 0.09681,
-    "vela_a_ts": 1790154000000
+    "vela_a_high": 0.01204,
+    "vela_a_low": 0.01192,
+    "vela_a_ts": 1790157600000
   }
 }
