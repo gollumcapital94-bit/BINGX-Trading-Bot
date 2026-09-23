@@ -20,6 +20,15 @@ PASOS 2-14 -> Escáner de nuevas entradas, en DOS direcciones
                run_pasos_2_a_14_entradas_long() más abajo.
            Ver strategy_entries.py -> short_strategy.py y long_strategy.py
            para el detalle de cada paso en cada dirección.
+EXPERIMENTO REVERSAL LONG -> cuando el escáner SHORT encuentra una
+           singularidad FUERA del máximo del round (es_maximo_round=
+           False), YA NO se fuerza un short a mercado. En su lugar, se
+           registra esa vela ("vela A") y se espera a ver si la
+           siguiente vela 1h ("vela B") toca la EMA50(1h): si la toca,
+           se entra en LARGO a mercado apenas se detecta (ya en la
+           vela C). Ver long_reversal.py para el detalle completo del
+           patrón y register_singularity_candle()/execute_long_reversal_entry()
+           más abajo para la implementación.
 BARRIDO DE BALANCE (solo mercado real, solo disparador externo) -> al
            terminar de leer el mercado y evaluar la estrategia (Pasos
            2-14, en ambas direcciones), sin importar si se abrió o no
@@ -43,6 +52,11 @@ DOS CUENTAS/CONEXIONES DE CUENTA INDEPENDIENTES (SHORT y LONG):
     (más nueva, todavía en pruebas) sigue en DEMO (VST) por más tiempo,
     sin que un cambio de modo en una afecte a la otra.
 
+    El experimento REVERSAL LONG (ver arriba) se opera con
+    `exchange_short`, NO con `exchange_long` -- así lo pidió el
+    usuario, para reutilizar la misma cuenta que ya usa la estrategia
+    short mientras se valida el patrón.
+
 LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO_* Y QUÉ NO:
     - Universo de símbolos válidos (crypto perpetuo USDT-M) y TODO el
       escaneo de nuevas entradas, en ambas direcciones (Pasos 2-14:
@@ -50,7 +64,9 @@ LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO_* Y QUÉ NO:
       SIEMPRE del mercado REAL de BingX, sin importar BINGX_DEMO_SHORT
       ni BINGX_DEMO_LONG -- un patrón técnico o un volumen real no
       cambian porque una de las dos cuentas esté operando con dinero
-      virtual. Ver build_market_data_exchange().
+      virtual. Ver build_market_data_exchange(). El seguimiento del
+      experimento REVERSAL LONG (vela A / vela B, ver long_reversal.py)
+      también lee siempre del mercado real, por el mismo motivo.
     - El Paso 1 (gestión de Take Profit/Stop Loss) SÍ sigue el modo
       demo/real de la cuenta DONDE VIVE cada posición -- lee sus velas
       1h de esa MISMA cuenta (exchange_short o exchange_long, según
@@ -76,6 +92,7 @@ Dependencias: ccxt, pandas, numpy (ver utils/requirements.txt)
 
 import asyncio
 import logging
+import math
 import os
 import re
 import sys
@@ -84,6 +101,7 @@ import pandas as pd
 import ccxt.async_support as ccxt
 
 import short_strategy as strat_short
+import long_reversal
 # TEMPORAL: la estrategia LONG (long_strategy.py) queda DESACTIVADA
 # mientras se prueban los cambios nuevos de short_strategy.py, para no
 # gastar minutos de GitHub Actions evaluándola (no hay posiciones LONG
@@ -104,7 +122,9 @@ log = logging.getLogger("bingx_bot")
 # LONG (Pasos 2-14) -- así se ahorran minutos de GitHub Actions mientras
 # se prueban los cambios de short_strategy.py. No hay posiciones LONG
 # abiertas actualmente, así que apagar también el Paso 1 de esa cuenta
-# es seguro.
+# es seguro. Esto NO afecta al experimento REVERSAL LONG (ver arriba),
+# que se opera con exchange_short y corre siempre, independientemente
+# de este interruptor.
 #
 # Para reactivar la estrategia LONG más adelante:
 #   1) Descomentar `import long_strategy as strat_long` arriba.
@@ -193,7 +213,8 @@ def build_market_data_exchange(
     AMBAS estrategias (short y long) -- lista de símbolos, velas OHLCV
     de cualquier temporalidad (1h, 15m, 5m, 4h) e indicadores
     derivados, y volumen 24h (Paso 9). Esto cubre TODO el script (Paso
-    1 y Pasos 2-14, en ambas direcciones), no una parte de él.
+    1 y Pasos 2-14, en ambas direcciones, y el seguimiento del
+    experimento REVERSAL LONG), no una parte de él.
 
     Esta conexión SIEMPRE apunta al mercado REAL, sin importar si
     alguna de las dos cuentas (short/long) corre en modo demo -- un
@@ -458,7 +479,7 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_l
     (siempre), toque de EMA50(1h) -> Stop Loss en break even (solo si
     `run_stop_loss_check` es True). Genérico por lado de posición
     (LONG/SHORT) -- sirve igual para posiciones abiertas por la
-    estrategia short o por la long.
+    estrategia short, por la long, o por el experimento REVERSAL LONG.
     """
     symbol = position["symbol"]
     try:
@@ -547,8 +568,11 @@ async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]
 
 # ----------------------------------------------------------------------
 # PASOS 13-14 (SHORT): apalancamiento/margen (Paso 13) y ejecución de
-# la orden de entrada en corto (Paso 14). Ver run_pasos_2_a_14_entradas
-# y execute_entry_long() más abajo para el equivalente en LONG.
+# la orden de entrada en corto (Paso 14). También reutilizados por el
+# experimento REVERSAL LONG (ver execute_long_reversal_entry() más
+# abajo) para el manejo de errores de notional/apalancamiento máximo.
+# Ver run_pasos_2_a_14_entradas y execute_entry_long() más abajo para
+# el equivalente en LONG.
 # ----------------------------------------------------------------------
 _MAX_POSITION_VALUE_RE = re.compile(
     r"maximum position value for this leverage is\s*([\d.]+)", re.IGNORECASE
@@ -654,15 +678,17 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     SHORT -- combina el Paso 13 (apalancamiento y margen) con el Paso
     14 (ejecución de la orden). `exchange` aquí es SIEMPRE
     `exchange_short` (demo o real según BINGX_DEMO_SHORT).
+
+    CAMBIO IMPORTANTE: cuando `plan["es_maximo_round"]` es False, YA NO
+    se fuerza esta entrada SHORT a mercado (como hacía el experimento
+    anterior). En su lugar, se registra la vela ("vela A") en el
+    experimento REVERSAL LONG (ver long_reversal.py) y se sale sin
+    operar nada por el lado short -- ver el bloque justo después de
+    validar que el símbolo no sea forex/CFD.
     """
     symbol = plan["symbol"]
     max_high_5m = plan["max_high_5m"]
     ma20_5m_value = plan["ma20_5m_value"]
-    # EXPERIMENTO (ver short_strategy.check_step_2_3 / evaluate_symbol):
-    # el Paso 3 ya no descarta pares fuera del máximo del round, solo
-    # los marca con es_maximo_round=False. Aquí, en la ejecución, ese
-    # marcador decide si se opera con el tamaño/tipo de orden normal o
-    # con el modo experimental (margen fijo, siempre a mercado).
     es_maximo_round = plan.get("es_maximo_round", True)
 
     market = exchange.markets.get(symbol, {})
@@ -670,6 +696,26 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         log.error(
             "%s: BLOQUEADO -- parece ser forex/CFD/índice/acción sintética, no un futuro perpetuo cripto. "
             "No se ejecuta la entrada.",
+            symbol,
+        )
+        return
+
+    if not es_maximo_round:
+        # EXPERIMENTO REVERSAL LONG (ver long_reversal.py): la
+        # singularidad ocurrió FUERA del máximo del round. Ya NO se
+        # opera nada en SHORT aquí -- se registra la vela A y se deja
+        # que process_pending_signals() (llamado desde main(), en cada
+        # corrida) se encargue de vigilar la vela B y, si corresponde,
+        # ejecutar la entrada en LARGO más adelante.
+        long_reversal.register_singularity_candle(
+            symbol,
+            vela_a_ts=plan["vela_a_ts"],
+            vela_a_low=plan["vela_a_low"],
+            vela_a_high=plan["vela_a_high"],
+        )
+        log.info(
+            "%s [Paso 13][SHORT] es_maximo_round=False -> YA NO se fuerza un short a mercado (ese "
+            "experimento fue reemplazado). Se registró la vela A para el experimento REVERSAL LONG.",
             symbol,
         )
         return
@@ -682,36 +728,20 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
             return
         last_price = float(last_price)
 
-        if not es_maximo_round:
-            # EXPERIMENTO: el par disparó la singularidad FUERA del
-            # máximo del round. Se fuerza SIEMPRE entrada a MERCADO
-            # (para confirmar que la orden sí entra, sin depender de
-            # que el precio retroceda hasta la SMA20(5m)) y, más abajo,
-            # un margen FIJO en vez del 10% de la cuenta -- ver
-            # strat_short.calculate_position_size_fixed().
-            touched = True
+        touched = last_price <= ma20_5m_value
+
+        if touched:
             reference_price = last_price
             log.info(
-                "%s [Paso 13][SHORT][EXPERIMENTO fuera-de-máximo] es_maximo_round=False -> se fuerza "
-                "entrada A MERCADO (precio actual=%.8f) para observar el comportamiento de la "
-                "singularidad fuera del máximo del round.",
+                "%s [Paso 13][SHORT] Entrada será a MERCADO -> distancia usa el precio actual=%.8f (no la SMA20)",
                 symbol, reference_price,
             )
         else:
-            touched = last_price <= ma20_5m_value
-
-            if touched:
-                reference_price = last_price
-                log.info(
-                    "%s [Paso 13][SHORT] Entrada será a MERCADO -> distancia usa el precio actual=%.8f (no la SMA20)",
-                    symbol, reference_price,
-                )
-            else:
-                reference_price = ma20_5m_value
-                log.info(
-                    "%s [Paso 13][SHORT] Entrada será STOP -> distancia usa la SMA20(5m)=%.8f",
-                    symbol, reference_price,
-                )
+            reference_price = ma20_5m_value
+            log.info(
+                "%s [Paso 13][SHORT] Entrada será STOP -> distancia usa la SMA20(5m)=%.8f",
+                symbol, reference_price,
+            )
 
         try:
             leverage_calc = strat_short.calculate_leverage(max_high_5m, reference_price)
@@ -737,15 +767,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
             log.error("%s: no se pudo configurar el apalancamiento en BingX, se omite la entrada.", symbol)
             return
 
-        if es_maximo_round:
-            margin_usdt = await strat_short.calculate_position_size(exchange, symbol, leverage)
-        else:
-            margin_usdt = await strat_short.calculate_position_size_fixed(exchange, symbol, leverage)
-            log.info(
-                "%s [Paso 13][SHORT][EXPERIMENTO fuera-de-máximo] Margen limitado a %.2f USDT/VST "
-                "FIJO (no el 10%% de la cuenta) por es_maximo_round=False.",
-                symbol, margin_usdt,
-            )
+        margin_usdt = await strat_short.calculate_position_size(exchange, symbol, leverage)
 
         if margin_usdt <= 0:
             log.info("%s descartado en [Paso 13][SHORT]: margen calculado <= 0", symbol)
@@ -766,10 +788,9 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 exchange, symbol, "market", "sell", amount, None,
                 {"positionSide": "SHORT"}, last_price,
             )
-            experimento_tag = " [EXPERIMENTO fuera-de-máximo]" if not es_maximo_round else ""
             log.info(
-                "[Paso 14][SHORT]%s Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
-                experimento_tag, symbol, margin_usdt, leverage, order.get("id"),
+                "[Paso 14][SHORT] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                symbol, margin_usdt, leverage, order.get("id"),
             )
         else:
             order = await _create_order_with_notional_cap_retry(
@@ -783,6 +804,120 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
 
     except Exception as exc:
         log.error("Error ejecutando entrada SHORT para %s: %s", symbol, exc)
+
+
+# ----------------------------------------------------------------------
+# EXPERIMENTO REVERSAL LONG -- ejecución de la orden (ver long_reversal.py
+# para el detalle completo del patrón vela A -> vela B -> entrada en C).
+# Se llama desde long_reversal.process_pending_signals() como callback,
+# SIEMPRE con `exchange` = exchange_short (misma cuenta que el short).
+# ----------------------------------------------------------------------
+async def execute_long_reversal_entry(
+    exchange: "ccxt.bingx", symbol: str, vela_b_low: float, sma20_b: float, ema200_b: float,
+) -> dict | None:
+    """
+    Se llama cuando la vela B ya confirmó el toque de la EMA50(1h) --
+    se entra a MERCADO en LARGO ahora mismo (ya estamos dentro de la
+    vela C).
+
+    Apalancamiento: misma fórmula de siempre (LEVERAGE_BASE /
+    distancia_pct), con la distancia medida desde el LOW de la vela B
+    (`vela_b_low`) hasta el precio de entrada actual.
+
+    Margen: FIJO (strat_short.FIXED_EXPERIMENT_MARGIN_USDT), igual que
+    el experimento anterior, para no arriesgar el balance completo de
+    la cuenta demo (VST) mientras se valida el patrón.
+
+    Take Profit: entry_price + 2 * |SMA20(1h)_B - EMA200(1h)_B| --
+    ASUNCIÓN A CONFIRMAR CON EL USUARIO, ver long_reversal.py.
+
+    Stop Loss: AÚN NO DEFINIDO -- no se coloca ninguno todavía. Se
+    deja un log de advertencia cada vez que se ejecuta una entrada sin
+    Stop Loss, para que sea visible en las notificaciones de Telegram.
+    """
+    market = exchange.markets.get(symbol, {})
+    if _looks_like_forex_or_cfd(market):
+        log.error("%s: BLOQUEADO (forex/CFD) -- no se ejecuta la entrada REVERSAL LONG.", symbol)
+        return None
+
+    try:
+        ticker = await exchange.fetch_ticker(symbol)
+        last_price = ticker.get("last")
+        if last_price is None:
+            log.error("%s: no se pudo obtener el precio actual, se omite la entrada REVERSAL LONG.", symbol)
+            return None
+        last_price = float(last_price)
+
+        if vela_b_low <= 0 or last_price <= vela_b_low:
+            log.info(
+                "%s descartado en REVERSAL LONG: el precio actual (%.8f) no está por encima del "
+                "low de la vela B (%.8f), distancia inválida para calcular apalancamiento.",
+                symbol, last_price, vela_b_low,
+            )
+            return None
+
+        distancia_pct = (last_price - vela_b_low) / vela_b_low * 100
+        leverage_calc = strat_short.LEVERAGE_BASE / distancia_pct
+        leverage_rounded = math.floor(leverage_calc / strat_short.LEVERAGE_ROUND_STEP) * strat_short.LEVERAGE_ROUND_STEP
+        leverage_wanted_raw = max(leverage_rounded, strat_short.LEVERAGE_ROUND_STEP)
+
+        max_leverage_exchange = await strat_short.get_max_leverage_for_symbol(exchange, symbol)
+        if max_leverage_exchange is not None:
+            leverage_wanted = min(int(leverage_wanted_raw), max_leverage_exchange)
+        else:
+            leverage_wanted = int(leverage_wanted_raw)
+            log.warning(
+                "%s [REVERSAL LONG]: no se pudo confirmar el apalancamiento máximo real del exchange; "
+                "se usará el calculado (%dx) sin capar.",
+                symbol, leverage_wanted,
+            )
+
+        await exchange.set_margin_mode("isolated", symbol)
+
+        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage_wanted, side="LONG")
+        if leverage is None:
+            log.error("%s: no se pudo configurar el apalancamiento (REVERSAL LONG), se omite la entrada.", symbol)
+            return None
+
+        margin_usdt = await strat_short.calculate_position_size_fixed(exchange, symbol, leverage)
+        if margin_usdt <= 0:
+            log.info("%s descartado en REVERSAL LONG: margen calculado <= 0", symbol)
+            return None
+
+        log.info(
+            "%s aprobó [REVERSAL LONG]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%s) | margen=%.2f USDT (FIJO)",
+            symbol, leverage, leverage_calc,
+            f"{max_leverage_exchange}x" if max_leverage_exchange is not None else "desconocido",
+            margin_usdt,
+        )
+
+        notional = margin_usdt * leverage
+        amount = notional / last_price
+
+        order = await _create_order_with_notional_cap_retry(
+            exchange, symbol, "market", "buy", amount, None, {"positionSide": "LONG"}, last_price,
+        )
+        log.info(
+            "[REVERSAL LONG] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+            symbol, margin_usdt, leverage, order.get("id"),
+        )
+
+        tp_distance = abs(sma20_b - ema200_b) * long_reversal.TAKE_PROFIT_DISTANCE_MULTIPLIER
+        tp_price = last_price + tp_distance
+        pseudo_position = {"symbol": symbol, "side": "long", "contracts": amount}
+        await set_take_profit(exchange, pseudo_position, tp_price)
+
+        log.warning(
+            "%s [REVERSAL LONG]: Stop Loss AÚN NO DEFINIDO para esta posición -- no se colocó ningún "
+            "Stop Loss todavía. Pendiente de que el usuario indique dónde colocarlo.",
+            symbol,
+        )
+
+        return {"symbol": symbol, "margin_usdt": margin_usdt, "leverage": leverage, "tp_price": tp_price}
+
+    except Exception as exc:
+        log.error("Error ejecutando entrada REVERSAL LONG para %s: %s", symbol, exc)
+        return None
 
 
 async def run_pasos_2_a_14_entradas(
@@ -830,170 +965,6 @@ async def run_pasos_2_a_14_entradas(
 
     for plan in plans:
         await execute_entry(exchange, plan)
-
-
-# ----------------------------------------------------------------------
-# PASOS 13-14 (LONG): equivalente en largo (comprando) de execute_entry
-# y run_pasos_2_a_14_entradas. `exchange` aquí es SIEMPRE
-# `exchange_long` (demo o real según BINGX_DEMO_LONG).
-# ----------------------------------------------------------------------
-async def execute_entry_long(exchange: "ccxt.bingx", plan: dict) -> None:
-    """
-    LONG -- espejo de execute_entry() (SHORT): en vez de vender para
-    abrir un corto, compra para abrir un largo. La distancia del Paso
-    13 se mide desde el MÍNIMO del round (min_low_5m) hacia el precio
-    de referencia, en vez de desde el máximo -- ver
-    long_strategy.calculate_leverage().
-
-    Tipo de entrada (Paso 14):
-      - Si el precio YA cruzó la SMA20(5m) desde abajo hacia arriba
-        (last_price >= ma20_5m_value): entrada a MERCADO (compra).
-      - Si no: orden STOP tipo "buy" en la SMA20(5m), con
-        positionSide="LONG", que se dispara cuando el precio la cruza
-        de abajo hacia arriba (comportamiento estándar de un
-        "buy stop", simétrico al "sell stop" que ya usa el short).
-    """
-    symbol = plan["symbol"]
-    min_low_5m = plan["min_low_5m"]
-    ma20_5m_value = plan["ma20_5m_value"]
-
-    market = exchange.markets.get(symbol, {})
-    if _looks_like_forex_or_cfd(market):
-        log.error(
-            "%s: BLOQUEADO -- parece ser forex/CFD/índice/acción sintética, no un futuro perpetuo cripto. "
-            "No se ejecuta la entrada.",
-            symbol,
-        )
-        return
-
-    try:
-        ticker = await exchange.fetch_ticker(symbol)
-        last_price = ticker.get("last")
-        if last_price is None:
-            log.error("%s: no se pudo obtener el precio actual, se omite la entrada.", symbol)
-            return
-        last_price = float(last_price)
-
-        touched = last_price >= ma20_5m_value
-
-        if touched:
-            reference_price = last_price
-            log.info(
-                "%s [Paso 13][LONG] Entrada será a MERCADO -> distancia usa el precio actual=%.8f (no la SMA20)",
-                symbol, reference_price,
-            )
-        else:
-            reference_price = ma20_5m_value
-            log.info(
-                "%s [Paso 13][LONG] Entrada será STOP -> distancia usa la SMA20(5m)=%.8f",
-                symbol, reference_price,
-            )
-
-        try:
-            leverage_calc = strat_long.calculate_leverage(min_low_5m, reference_price)
-        except ValueError as exc:
-            log.info("%s descartado en [Paso 13][LONG]: %s", symbol, exc)
-            return
-
-        max_leverage_exchange = await strat_long.get_max_leverage_for_symbol(exchange, symbol)
-        if max_leverage_exchange is not None:
-            leverage_wanted = min(int(leverage_calc), max_leverage_exchange)
-        else:
-            leverage_wanted = int(leverage_calc)
-            log.warning(
-                "%s: no se pudo confirmar el apalancamiento máximo real del exchange; "
-                "se usará el calculado (%dx) sin capar -- BingX lo validará al ejecutar la entrada.",
-                symbol, leverage_wanted,
-            )
-
-        await exchange.set_margin_mode("isolated", symbol)
-
-        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage_wanted, side="LONG")
-        if leverage is None:
-            log.error("%s: no se pudo configurar el apalancamiento en BingX, se omite la entrada.", symbol)
-            return
-
-        margin_usdt = await strat_long.calculate_position_size(exchange, symbol, leverage)
-        if margin_usdt <= 0:
-            log.info("%s descartado en [Paso 13][LONG]: margen calculado <= 0", symbol)
-            return
-
-        log.info(
-            "%s aprobó [Paso 13][LONG]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%s) | margen=%.2f USDT",
-            symbol, leverage, leverage_calc,
-            f"{max_leverage_exchange}x" if max_leverage_exchange is not None else "desconocido",
-            margin_usdt,
-        )
-
-        notional = margin_usdt * leverage
-        amount = notional / last_price
-
-        if touched:
-            order = await _create_order_with_notional_cap_retry(
-                exchange, symbol, "market", "buy", amount, None,
-                {"positionSide": "LONG"}, last_price,
-            )
-            log.info(
-                "[Paso 14][LONG] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
-                symbol, margin_usdt, leverage, order.get("id"),
-            )
-        else:
-            order = await _create_order_with_notional_cap_retry(
-                exchange, symbol, "STOP", "buy", amount, ma20_5m_value,
-                {"stopPrice": ma20_5m_value, "positionSide": "LONG"}, last_price,
-            )
-            log.info(
-                "[Paso 14][LONG] Long STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
-                ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"),
-            )
-
-    except Exception as exc:
-        log.error("Error ejecutando entrada LONG para %s: %s", symbol, exc)
-
-
-async def run_pasos_2_a_14_entradas_long(
-    exchange: "ccxt.bingx",
-    market_exchange: "ccxt.bingx",
-    allowed_symbols: set[str],
-    symbols_with_position: set[str],
-) -> None:
-    """
-    LONG -- espejo de run_pasos_2_a_14_entradas() (SHORT): escanea
-    todos los pares permitidos que NO tengan ya una posición LONG
-    abierta (en `exchange`, la cuenta long), evaluando la cascada
-    completa de pasos 2-13 con `long_strategy`.
-    """
-    candidatos = [s for s in allowed_symbols if s not in symbols_with_position]
-    log.info("[Pasos 2-14][LONG] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
-
-    semaphore = asyncio.Semaphore(10)
-
-    async def _bounded_eval(symbol):
-        async with semaphore:
-            return await strat_long.evaluate_symbol(market_exchange, symbol)
-
-    results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
-
-    plans = [plan for plan, _fs in results if plan is not None]
-
-    rejection_counts: dict = {}
-    for _plan, failed_step in results:
-        if failed_step is not None:
-            rejection_counts[failed_step] = rejection_counts.get(failed_step, 0) + 1
-
-    if rejection_counts:
-        resumen = ", ".join(
-            f"Paso {paso}: {count}"
-            for paso, count in sorted(rejection_counts.items(), key=lambda x: str(x[0]))
-        )
-        log.info("[Pasos 2-14][LONG] Resumen de descartes por paso -> %s", resumen)
-
-    log.info("[Pasos 2-14][LONG] Pares que cumplen TODAS las condiciones: %d en LONG", len(plans))
-    for plan in plans:
-        log.info("  -> LONG %s | mínimo(5m)=%.8f | SMA20(5m)=%.8f", plan["symbol"], plan["min_low_5m"], plan["ma20_5m_value"])
-
-    for plan in plans:
-        await execute_entry_long(exchange, plan)
 
 
 async def ensure_hedge_mode(exchange: "ccxt.bingx", label: str) -> None:
@@ -1156,7 +1127,8 @@ async def main() -> None:
     if not LONG_STRATEGY_ENABLED:
         log.warning(
             "[LONG] Estrategia LONG DESACTIVADA temporalmente (LONG_STRATEGY_ENABLED=False): "
-            "no se gestiona TP/SL ni se buscan nuevas entradas en la cuenta LONG en esta corrida."
+            "no se gestiona TP/SL ni se buscan nuevas entradas en la cuenta LONG en esta corrida. "
+            "(Esto NO afecta al experimento REVERSAL LONG, que opera con exchange_short.)"
         )
 
     try:
@@ -1177,6 +1149,21 @@ async def main() -> None:
         # Universo de símbolos: SIEMPRE contra el mercado real,
         # compartido por ambas direcciones.
         allowed_symbols = set(await get_usdt_futures_symbols(market_exchange))
+
+        # EXPERIMENTO REVERSAL LONG: se revisan las señales pendientes
+        # (vela A ya registrada, esperando o confirmando la vela B) en
+        # TODAS las corridas, sin importar BOT_MODE -- así no se pierde
+        # ninguna ventana de vela B por correr solo en modo "full".
+        # Usa siempre exchange_short (cuenta) y market_exchange
+        # (lectura de mercado real), tal como pidió el usuario.
+        try:
+            reversal_results = await long_reversal.process_pending_signals(
+                market_exchange, exchange_short, execute_long_reversal_entry,
+            )
+            if reversal_results:
+                log.info("[REVERSAL LONG] Entradas ejecutadas en esta corrida: %d", len(reversal_results))
+        except Exception as exc:
+            log.error("[REVERSAL LONG] Error procesando señales pendientes: %s", exc)
 
         # Posiciones abiertas: acción de cuenta, una lista por cada
         # cuenta (short y long, esta última solo si está activada).
