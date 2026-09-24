@@ -1,8 +1,8 @@
 {
-  "PI/USDT:USDT": {
+  "DRIFT/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.08892,
-    "vela_a_low": 0.08775,
-    "vela_a_ts": 1790215200000
+    "vela_a_high": 0.01894,
+    "vela_a_low": 0.01861,
+    "vela_a_ts": 1790218800000
   }
 }
