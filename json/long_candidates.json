@@ -1,1 +1,8 @@
-{}
+{
+  "BTR/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.05669,
+    "vela_a_low": 0.05518,
+    "vela_a_ts": 1790251200000
+  }
+}
