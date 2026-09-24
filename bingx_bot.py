@@ -9,83 +9,92 @@ PASO 1  -> Gestión de posiciones abiertas con DOS gatillos INDEPENDIENTES
            Cada gatillo se evalúa y se dispara por separado; uno puede
            activarse sin que el otro lo haya hecho todavía. Este paso es
            genérico por lado de posición (LONG/SHORT), así que gestiona
-           igual las posiciones abiertas por CUALQUIERA de las dos
-           estrategias de entrada.
-PASOS 2-14 -> Escáner de nuevas entradas, en DOS direcciones
-           independientes, cada una con su propio módulo y su propia
-           conexión de cuenta:
-             - SHORT -> short_strategy.py (antes strategy_entries.py) +
-               execute_entry() / run_pasos_2_a_14_entradas() más abajo.
-             - LONG  -> long_strategy.py + execute_entry_long() /
-               run_pasos_2_a_14_entradas_long() más abajo.
-           Ver strategy_entries.py -> short_strategy.py y long_strategy.py
-           para el detalle de cada paso en cada dirección.
-EXPERIMENTO REVERSAL LONG -> cuando el escáner SHORT encuentra una
-           singularidad FUERA del máximo del round (es_maximo_round=
-           False), YA NO se fuerza un short a mercado. En su lugar, se
-           registra esa vela ("vela A") y se espera a ver si la
-           siguiente vela 1h ("vela B") toca la EMA50(1h): si la toca,
-           se entra en LARGO a mercado apenas se detecta (ya en la
-           vela C). Ver long_reversal.py para el detalle completo del
-           patrón y register_singularity_candle()/execute_long_reversal_entry()
-           más abajo para la implementación.
+           igual las posiciones abiertas por CUALQUIERA de las estrategias
+           de entrada -- SIEMPRE corre para AMBAS cuentas (exchange_short
+           y exchange_long), sin importar LONG_STRATEGY_ENABLED (ver más
+           abajo), porque el experimento REVERSAL LONG puede tener
+           posiciones abiertas en exchange_long en cualquier momento.
+PASOS 2-14 -> Escáner de nuevas entradas SHORT, en short_strategy.py
+           (SIN CAMBIOS) + execute_entry() / run_pasos_2_a_14_entradas()
+           más abajo. La dirección LONG "clásica" (long_strategy.py)
+           sigue DESACTIVADA (LONG_STRATEGY_ENABLED=False).
+EXPERIMENTO REVERSAL LONG (ACTUALIZADO) -> cuando el escáner SHORT
+           encuentra una singularidad FUERA del máximo del round
+           (es_maximo_round=False), YA NO se fuerza un short a
+           mercado. En su lugar, se chequea si esa vela roja con
+           singularidad ("vela A") ocurre DESPUÉS de un ciclo
+           confirmado de caída y recuperación entre la SMA20(1h) y la
+           EMA50(1h) (ver long_reversal.check_reversal_context() y el
+           docstring de cabecera de long_reversal.py para el detalle
+           completo de los dos patrones válidos, PATRÓN 1 y PATRÓN 2).
+           Si el contexto se cumple, se registra la vela A y se espera
+           a ver si la siguiente vela 1h ("vela B") toca la EMA50(1h):
+           si la toca, en la vela C se evalúa el precio contra la
+           SMA20 calculada en velas de 1 MINUTO -- si el precio ya la
+           superó, se entra en LARGO a MERCADO; si no, se coloca una
+           orden STOP-LIMIT en ese nivel. Ver long_reversal.py para el
+           patrón completo y register_singularity_candle()/
+           check_reversal_context()/execute_long_reversal_entry() más
+           abajo para la implementación. Este experimento SOLO se
+           revisa (process_pending_signals) en el disparador EXTERNO
+           (cronjob.org -> repository_dispatch, ver RUN_REVERSAL_CHECK
+           más abajo) -- YA NO en el cron interno horario de GitHub.
 BARRIDO DE BALANCE (solo mercado real, solo disparador externo) -> al
            terminar de leer el mercado y evaluar la estrategia (Pasos
-           2-14, en ambas direcciones), sin importar si se abrió o no
-           una operación nueva, se revisa el balance de CADA cuenta de
-           futuros perpetuos (short y long, por separado). Si supera
+           2-14 SHORT), sin importar si se abrió o no una operación
+           nueva, se revisa el balance de CADA cuenta de futuros
+           perpetuos (short y long, por separado) -- la cuenta LONG
+           SIEMPRE, sin importar LONG_STRATEGY_ENABLED, porque el
+           experimento REVERSAL LONG opera con ella. Si supera
            FUTURES_BALANCE_CAP_USDT, se transfiere el excedente de esa
            cuenta a su cuenta de FONDOS. Ver check_and_sweep_futures_balance()
            y la variable de entorno RUN_BALANCE_CHECK más abajo.
 
 DOS CUENTAS/CONEXIONES DE CUENTA INDEPENDIENTES (SHORT y LONG):
-    El bot opera la estrategia SHORT y la estrategia LONG con DOS
-    conexiones de cuenta separadas (`exchange_short` y `exchange_long`),
-    cada una con su propia variable de entorno de modo demo/real:
-        BINGX_DEMO_SHORT -> controla exchange_short (antes BINGX_DEMO).
-        BINGX_DEMO_LONG  -> controla exchange_long (nueva).
+    El bot opera la estrategia SHORT y el experimento REVERSAL LONG con
+    DOS conexiones de cuenta separadas (`exchange_short` y
+    `exchange_long`), cada una con su propia variable de entorno de
+    modo demo/real:
+        BINGX_DEMO_SHORT -> controla exchange_short.
+        BINGX_DEMO_LONG  -> controla exchange_long.
     Ambas usan las MISMAS API keys (BINGX_API_KEY / BINGX_API_SECRET) --
     es la misma cuenta de BingX y, cuando ambas están en el mismo modo
     (las dos demo o las dos reales), comparten el mismo margen real.
-    La razón de separarlas es poder tener, por ejemplo, la estrategia
-    SHORT (ya probada) operando en REAL, mientras la estrategia LONG
-    (más nueva, todavía en pruebas) sigue en DEMO (VST) por más tiempo,
-    sin que un cambio de modo en una afecte a la otra.
 
     El experimento REVERSAL LONG (ver arriba) se opera con
-    `exchange_short`, NO con `exchange_long` -- así lo pidió el
-    usuario, para reutilizar la misma cuenta que ya usa la estrategia
-    short mientras se valida el patrón.
+    `exchange_long` (ANTES usaba `exchange_short`) -- así se logra que
+    BINGX_DEMO_LONG (antes huérfana, porque long_strategy.py sigue
+    desactivado) controle de verdad el modo demo/real de estas
+    entradas. `exchange_long` se inicializa (load_markets + Hedge Mode)
+    SIEMPRE, sin importar LONG_STRATEGY_ENABLED -- ese interruptor solo
+    sigue controlando long_strategy.py (la dirección LONG "clásica",
+    Pasos 1 y 2-14), NO el experimento REVERSAL LONG.
 
 LECTURA DE MERCADO -- QUÉ SIGUE A BINGX_DEMO_* Y QUÉ NO:
     - Universo de símbolos válidos (crypto perpetuo USDT-M) y TODO el
-      escaneo de nuevas entradas, en ambas direcciones (Pasos 2-14:
-      velas 1h/15m/5m/4h, indicadores, volumen 24h del Paso 9) se leen
-      SIEMPRE del mercado REAL de BingX, sin importar BINGX_DEMO_SHORT
-      ni BINGX_DEMO_LONG -- un patrón técnico o un volumen real no
-      cambian porque una de las dos cuentas esté operando con dinero
-      virtual. Ver build_market_data_exchange(). El seguimiento del
-      experimento REVERSAL LONG (vela A / vela B, ver long_reversal.py)
-      también lee siempre del mercado real, por el mismo motivo.
+      escaneo de nuevas entradas SHORT (Pasos 2-14: velas 1h/15m/5m/4h,
+      indicadores, volumen 24h del Paso 9) se leen SIEMPRE del mercado
+      REAL de BingX, sin importar BINGX_DEMO_SHORT ni BINGX_DEMO_LONG.
+      Ver build_market_data_exchange(). El seguimiento del experimento
+      REVERSAL LONG (vela A / vela B, ver long_reversal.py) también lee
+      siempre del mercado real, por el mismo motivo.
     - El Paso 1 (gestión de Take Profit/Stop Loss) SÍ sigue el modo
       demo/real de la cuenta DONDE VIVE cada posición -- lee sus velas
       1h de esa MISMA cuenta (exchange_short o exchange_long, según
       corresponda) -- ver process_position_tp().
     - Las acciones que dependen de la CUENTA -- leer posiciones y
       balance, colocar TP/SL (Paso 1), configurar apalancamiento/
-      margen y abrir la orden de entrada (Pasos 13-14) -- siempre van
-      contra `exchange_short` o `exchange_long` según la dirección de
-      la operación (VST/sandbox en demo, producción en real).
-    - El barrido de balance (ver arriba) SOLO aplica en modo real, y se
-      evalúa de forma INDEPENDIENTE para cada cuenta: la cuenta demo
-      (VST) tiene su propio balance virtual, transferirlo no tiene
-      ningún sentido -- ver check_and_sweep_futures_balance().
+      margen y abrir la orden de entrada -- siempre van contra
+      `exchange_short` o `exchange_long` según corresponda (VST/sandbox
+      en demo, producción en real).
+    - El barrido de balance SOLO aplica en modo real, y se evalúa de
+      forma INDEPENDIENTE para cada cuenta.
 
 Requiere las variables de entorno:
     BINGX_API_KEY
     BINGX_API_SECRET
-    BINGX_DEMO_SHORT   (antes BINGX_DEMO)
-    BINGX_DEMO_LONG    (nueva)
+    BINGX_DEMO_SHORT
+    BINGX_DEMO_LONG
 
 Dependencias: ccxt, pandas, numpy (ver utils/requirements.txt)
 """
@@ -102,11 +111,13 @@ import ccxt.async_support as ccxt
 
 import short_strategy as strat_short
 import long_reversal
-# TEMPORAL: la estrategia LONG (long_strategy.py) queda DESACTIVADA
-# mientras se prueban los cambios nuevos de short_strategy.py, para no
-# gastar minutos de GitHub Actions evaluándola (no hay posiciones LONG
-# abiertas actualmente). Para reactivarla: descomentar este import y
-# poner LONG_STRATEGY_ENABLED = True más abajo.
+# TEMPORAL: la estrategia LONG "clásica" (long_strategy.py) queda
+# DESACTIVADA mientras se prueban los cambios nuevos de
+# short_strategy.py, para no gastar minutos de GitHub Actions
+# evaluándola. Para reactivarla: descomentar este import y poner
+# LONG_STRATEGY_ENABLED = True más abajo. Esto NO afecta al
+# experimento REVERSAL LONG (ver arriba), que opera con exchange_long
+# de forma independiente de este interruptor.
 # import long_strategy as strat_long
 from utils.indicators import sma, ema
 
@@ -117,16 +128,18 @@ logging.basicConfig(
 log = logging.getLogger("bingx_bot")
 
 # ----------------------------------------------------------------------
-# TEMPORAL: interruptor general de la estrategia LONG. En False, el bot
-# NO gestiona TP/SL de la cuenta LONG (Paso 1) NI busca nuevas entradas
-# LONG (Pasos 2-14) -- así se ahorran minutos de GitHub Actions mientras
-# se prueban los cambios de short_strategy.py. No hay posiciones LONG
-# abiertas actualmente, así que apagar también el Paso 1 de esa cuenta
-# es seguro. Esto NO afecta al experimento REVERSAL LONG (ver arriba),
-# que se opera con exchange_short y corre siempre, independientemente
-# de este interruptor.
+# TEMPORAL: interruptor general de la estrategia LONG "clásica"
+# (long_strategy.py). En False, el bot NO gestiona TP/SL de la cuenta
+# LONG con ese módulo NI busca nuevas entradas LONG "clásicas" con él.
 #
-# Para reactivar la estrategia LONG más adelante:
+# ESTO NO AFECTA al experimento REVERSAL LONG (ver arriba), que opera
+# con `exchange_long` de forma INDEPENDIENTE de este interruptor -- esa
+# cuenta se inicializa (load_markets + Hedge Mode) siempre, Paso 1
+# corre siempre para ella, el barrido de balance también, y el
+# seguimiento de señales pendientes (long_reversal.process_pending_signals)
+# corre siempre que RUN_REVERSAL_CHECK esté activo.
+#
+# Para reactivar la estrategia LONG "clásica" más adelante:
 #   1) Descomentar `import long_strategy as strat_long` arriba.
 #   2) Poner LONG_STRATEGY_ENABLED = True.
 # ----------------------------------------------------------------------
@@ -209,17 +222,14 @@ def build_market_data_exchange(
     exchange_long: "ccxt.bingx", demo_long: bool,
 ) -> "ccxt.bingx":
     """
-    Conexión de MERCADO: se usa para TODA la lectura de mercado de
-    AMBAS estrategias (short y long) -- lista de símbolos, velas OHLCV
-    de cualquier temporalidad (1h, 15m, 5m, 4h) e indicadores
-    derivados, y volumen 24h (Paso 9). Esto cubre TODO el script (Paso
-    1 y Pasos 2-14, en ambas direcciones, y el seguimiento del
-    experimento REVERSAL LONG), no una parte de él.
+    Conexión de MERCADO: se usa para TODA la lectura de mercado (lista
+    de símbolos, velas OHLCV de cualquier temporalidad e indicadores
+    derivados, y volumen 24h). Esto cubre TODO el script (Paso 1, Pasos
+    2-14 SHORT, y el seguimiento del experimento REVERSAL LONG), no una
+    parte de él.
 
     Esta conexión SIEMPRE apunta al mercado REAL, sin importar si
-    alguna de las dos cuentas (short/long) corre en modo demo -- un
-    patrón técnico, un volumen, o un round alcista/bajista no cambian
-    porque una cuenta esté operando con dinero virtual.
+    alguna de las dos cuentas (short/long) corre en modo demo.
 
     - Si `exchange_short` ya apunta a producción (demo_short=False), se
       reutiliza esa misma conexión (no hace falta abrir una segunda).
@@ -227,8 +237,7 @@ def build_market_data_exchange(
       se reutiliza esa.
     - Si AMBAS cuentas están en modo demo, se abre una TERCERA
       conexión, con las mismas API keys pero SIN sandbox, dedicada
-      solo a leer mercado. Ninguna de las dos conexiones de cuenta se
-      usa para esto en ese caso.
+      solo a leer mercado.
     """
     if not demo_short:
         log.info("Conexión de mercado: se reutiliza exchange_short (ya apunta a producción).")
@@ -253,7 +262,7 @@ def build_market_data_exchange(
     log.info(
         "Ambas cuentas (short y long) están en modo demo: se abrió una conexión "
         "adicional SIN sandbox, usada para TODA la lectura de mercado (símbolos, "
-        "velas, indicadores, volumen) en los Pasos 1 a 14 -- siempre el mercado REAL."
+        "velas, indicadores, volumen) -- siempre el mercado REAL."
     )
     return market_exchange
 
@@ -474,12 +483,11 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_l
     donde se colocan las órdenes de TP/SL), nunca la conexión de
     mercado forzada a real.
 
-    Evalúa DOS gatillos INDEPENDIENTES entre sí (ver docstring completo
-    en el historial del proyecto): toque de SMA20(1h) -> Take Profit
-    (siempre), toque de EMA50(1h) -> Stop Loss en break even (solo si
-    `run_stop_loss_check` es True). Genérico por lado de posición
-    (LONG/SHORT) -- sirve igual para posiciones abiertas por la
-    estrategia short, por la long, o por el experimento REVERSAL LONG.
+    Evalúa DOS gatillos INDEPENDIENTES entre sí: toque de SMA20(1h) ->
+    Take Profit (siempre), toque de EMA50(1h) -> Stop Loss en break
+    even (solo si `run_stop_loss_check` es True). Genérico por lado de
+    posición (LONG/SHORT) -- sirve igual para posiciones abiertas por
+    la estrategia short o por el experimento REVERSAL LONG.
     """
     symbol = position["symbol"]
     try:
@@ -571,8 +579,6 @@ async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str]
 # la orden de entrada en corto (Paso 14). También reutilizados por el
 # experimento REVERSAL LONG (ver execute_long_reversal_entry() más
 # abajo) para el manejo de errores de notional/apalancamiento máximo.
-# Ver run_pasos_2_a_14_entradas y execute_entry_long() más abajo para
-# el equivalente en LONG.
 # ----------------------------------------------------------------------
 _MAX_POSITION_VALUE_RE = re.compile(
     r"maximum position value for this leverage is\s*([\d.]+)", re.IGNORECASE
@@ -673,18 +679,22 @@ async def _set_leverage_with_cap_retry(exchange: "ccxt.bingx", symbol: str, leve
             return None
 
 
-async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
+async def execute_entry(exchange: "ccxt.bingx", market_exchange: "ccxt.bingx", plan: dict) -> None:
     """
     SHORT -- combina el Paso 13 (apalancamiento y margen) con el Paso
     14 (ejecución de la orden). `exchange` aquí es SIEMPRE
     `exchange_short` (demo o real según BINGX_DEMO_SHORT).
+    `market_exchange` es la conexión de MERCADO (real) -- se necesita
+    para poder chequear el contexto del experimento REVERSAL LONG (ver
+    abajo), que lee velas 1h del mercado real.
 
     CAMBIO IMPORTANTE: cuando `plan["es_maximo_round"]` es False, YA NO
-    se fuerza esta entrada SHORT a mercado (como hacía el experimento
-    anterior). En su lugar, se registra la vela ("vela A") en el
-    experimento REVERSAL LONG (ver long_reversal.py) y se sale sin
-    operar nada por el lado short -- ver el bloque justo después de
-    validar que el símbolo no sea forex/CFD.
+    se fuerza esta entrada SHORT a mercado. En su lugar, se chequea si
+    esa vela ("vela A") cumple el contexto de recuperación del
+    experimento REVERSAL LONG (ver long_reversal.check_reversal_context()
+    y el docstring de long_reversal.py, PATRÓN 1 / PATRÓN 2) -- si lo
+    cumple, se registra la vela A; si no, no se opera nada (ni short ni
+    reversal) para este símbolo en esta corrida.
     """
     symbol = plan["symbol"]
     max_high_5m = plan["max_high_5m"]
@@ -703,21 +713,34 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     if not es_maximo_round:
         # EXPERIMENTO REVERSAL LONG (ver long_reversal.py): la
         # singularidad ocurrió FUERA del máximo del round. Ya NO se
-        # opera nada en SHORT aquí -- se registra la vela A y se deja
-        # que process_pending_signals() (llamado desde main(), en cada
-        # corrida) se encargue de vigilar la vela B y, si corresponde,
-        # ejecutar la entrada en LARGO más adelante.
-        long_reversal.register_singularity_candle(
-            symbol,
-            vela_a_ts=plan["vela_a_ts"],
-            vela_a_low=plan["vela_a_low"],
-            vela_a_high=plan["vela_a_high"],
-        )
-        log.info(
-            "%s [Paso 13][SHORT] es_maximo_round=False -> YA NO se fuerza un short a mercado (ese "
-            "experimento fue reemplazado). Se registró la vela A para el experimento REVERSAL LONG.",
-            symbol,
-        )
+        # opera nada en SHORT aquí. Se delega en
+        # long_reversal.check_reversal_context() la decisión de si
+        # esta vela A cumple el contexto de recuperación (PATRÓN 1/2,
+        # SMA20(1h) cayendo por debajo de la EMA50(1h) y luego
+        # recuperándose) -- solo si se cumple, se registra la vela A y
+        # se deja que process_pending_signals() (llamado desde main(),
+        # SOLO en el disparador externo -- ver RUN_REVERSAL_CHECK) se
+        # encargue de vigilar la vela B y, si corresponde, ejecutar la
+        # entrada en LARGO más adelante.
+        try:
+            registered = await long_reversal.check_reversal_context(plan, market_exchange)
+        except Exception as exc:
+            log.error("%s: error chequeando el contexto REVERSAL LONG: %s", symbol, exc)
+            registered = False
+
+        if registered:
+            log.info(
+                "%s [Paso 13][SHORT] es_maximo_round=False -> no se opera short (ese experimento fue "
+                "reemplazado). Contexto de recuperación confirmado -- se registró la vela A para el "
+                "experimento REVERSAL LONG.",
+                symbol,
+            )
+        else:
+            log.info(
+                "%s [Paso 13][SHORT] es_maximo_round=False -> no se opera nada (ni short ni REVERSAL "
+                "LONG: el contexto de recuperación SMA20/EMA50/EMA200(1h) no se cumplió para esta vela).",
+                symbol,
+            )
         return
 
     try:
@@ -810,30 +833,60 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
 # EXPERIMENTO REVERSAL LONG -- ejecución de la orden (ver long_reversal.py
 # para el detalle completo del patrón vela A -> vela B -> entrada en C).
 # Se llama desde long_reversal.process_pending_signals() como callback,
-# SIEMPRE con `exchange` = exchange_short (misma cuenta que el short).
+# SIEMPRE con `exchange` = exchange_long (ANTES era exchange_short).
 # ----------------------------------------------------------------------
+
+# Cantidad de velas de 1 MINUTO pedidas para calcular la SMA20(1m) que
+# decide, en la vela C, si la entrada es a MERCADO o si se coloca una
+# orden STOP-LIMIT esperando que el precio suba hasta ese nivel. Es una
+# temporalidad NUEVA, no usada en ningún otro lado del bot -- 1200 <
+# BINGX_MAX_OHLCV_PER_REQUEST (1440, ver short_strategy.py), así que
+# alcanza con una sola petición.
+OHLCV_LIMIT_1M_ENTRY = 1200
+
+
 async def execute_long_reversal_entry(
     exchange: "ccxt.bingx", symbol: str, vela_b_low: float, sma20_b: float, ema200_b: float,
 ) -> dict | None:
     """
     Se llama cuando la vela B ya confirmó el toque de la EMA50(1h) --
-    se entra a MERCADO en LARGO ahora mismo (ya estamos dentro de la
-    vela C).
+    ya estamos dentro de la vela C. `exchange` aquí es SIEMPRE
+    `exchange_long` (demo o real según BINGX_DEMO_LONG) -- ANTES de
+    este cambio se usaba `exchange_short`; ahora BINGX_DEMO_LONG deja
+    de estar huérfana y controla de verdad el modo demo/real de estas
+    entradas.
+
+    TIPO DE ENTRADA (CAMBIÓ): ya NO se entra siempre a MERCADO. Se pide
+    el historial de velas de 1 MINUTO (OHLCV_LIMIT_1M_ENTRY) y se
+    calcula la SMA20(1m):
+      - Si el precio actual YA está en o por encima de esa SMA20(1m):
+        se entra a MERCADO ya mismo.
+      - Si NO: se coloca una orden STOP-LIMIT de COMPRA (positionSide
+        LONG) en el nivel exacto de esa SMA20(1m), esperando a que el
+        precio suba hasta ahí -- mismo mecanismo que ya usa
+        short_strategy.execute_entry() para el short (espejado, en
+        LARGO).
 
     Apalancamiento: misma fórmula de siempre (LEVERAGE_BASE /
     distancia_pct), con la distancia medida desde el LOW de la vela B
-    (`vela_b_low`) hasta el precio de entrada actual.
+    (`vela_b_low`) hasta el precio de ENTRADA REAL -- el de mercado si
+    la orden fue a mercado, o el nivel de la SMA20(1m) si fue una orden
+    STOP-LIMIT -- en ambos casos en PORCENTAJE.
 
     Margen: FIJO (strat_short.FIXED_EXPERIMENT_MARGIN_USDT), igual que
-    el experimento anterior, para no arriesgar el balance completo de
-    la cuenta demo (VST) mientras se valida el patrón.
+    antes, para no arriesgar el balance completo de la cuenta mientras
+    se valida el patrón.
 
-    Take Profit: entry_price + 2 * |SMA20(1h)_B - EMA200(1h)_B| --
-    ASUNCIÓN A CONFIRMAR CON EL USUARIO, ver long_reversal.py.
+    Take Profit: entry_price + 2 * |SMA20(1h)_B - EMA200(1h)_B|. SOLO
+    se coloca cuando la entrada fue a MERCADO (la posición ya existe).
+    Si la entrada quedó como orden STOP-LIMIT pendiente, el Take Profit
+    NO se coloca todavía -- no hay posición abierta aún contra la cual
+    colocarlo. Queda pendiente para una corrida futura (igual que el
+    Stop Loss, ver abajo).
 
-    Stop Loss: AÚN NO DEFINIDO -- no se coloca ninguno todavía. Se
-    deja un log de advertencia cada vez que se ejecuta una entrada sin
-    Stop Loss, para que sea visible en las notificaciones de Telegram.
+    Stop Loss: AÚN NO DEFINIDO -- no se coloca ninguno todavía, para
+    NINGUNO de los dos tipos de entrada. Se deja un log de advertencia
+    cada vez que se ejecuta o se coloca una entrada sin Stop Loss.
     """
     market = exchange.markets.get(symbol, {})
     if _looks_like_forex_or_cfd(market):
@@ -848,15 +901,47 @@ async def execute_long_reversal_entry(
             return None
         last_price = float(last_price)
 
-        if vela_b_low <= 0 or last_price <= vela_b_low:
-            log.info(
-                "%s descartado en REVERSAL LONG: el precio actual (%.8f) no está por encima del "
-                "low de la vela B (%.8f), distancia inválida para calcular apalancamiento.",
-                symbol, last_price, vela_b_low,
+        # ---- Nueva referencia de entrada: SMA20 en velas de 1 MINUTO ----
+        raw_1m = await exchange.fetch_ohlcv(symbol, timeframe="1m", limit=OHLCV_LIMIT_1M_ENTRY)
+        closed_1m = raw_1m[:-1]  # se descarta la vela en formación
+        if len(closed_1m) < 21:
+            log.error(
+                "%s: datos insuficientes de velas 1m (%d cerradas) para calcular la SMA20(1m), "
+                "se omite la entrada REVERSAL LONG.",
+                symbol, len(closed_1m),
             )
             return None
 
-        distancia_pct = (last_price - vela_b_low) / vela_b_low * 100
+        close_1m = pd.Series([c[4] for c in closed_1m], dtype="float64")
+        sma20_1m_series = sma(close_1m, 20)
+        sma20_1m_value = float(sma20_1m_series.iloc[-1])
+
+        touched = last_price >= sma20_1m_value
+
+        if touched:
+            reference_price = last_price
+            log.info(
+                "%s [REVERSAL LONG] Entrada será a MERCADO -> precio actual=%.8f ya está en o por "
+                "encima de la SMA20(1m)=%.8f",
+                symbol, last_price, sma20_1m_value,
+            )
+        else:
+            reference_price = sma20_1m_value
+            log.info(
+                "%s [REVERSAL LONG] Entrada será STOP-LIMIT -> precio actual=%.8f todavía por debajo "
+                "de la SMA20(1m)=%.8f; se coloca la orden en ese nivel",
+                symbol, last_price, sma20_1m_value,
+            )
+
+        if vela_b_low <= 0 or reference_price <= vela_b_low:
+            log.info(
+                "%s descartado en REVERSAL LONG: el precio de entrada (%.8f) no está por encima del "
+                "low de la vela B (%.8f), distancia inválida para calcular apalancamiento.",
+                symbol, reference_price, vela_b_low,
+            )
+            return None
+
+        distancia_pct = (reference_price - vela_b_low) / vela_b_low * 100
         leverage_calc = strat_short.LEVERAGE_BASE / distancia_pct
         leverage_rounded = math.floor(leverage_calc / strat_short.LEVERAGE_ROUND_STEP) * strat_short.LEVERAGE_ROUND_STEP
         leverage_wanted_raw = max(leverage_rounded, strat_short.LEVERAGE_ROUND_STEP)
@@ -892,28 +977,54 @@ async def execute_long_reversal_entry(
         )
 
         notional = margin_usdt * leverage
-        amount = notional / last_price
+        amount = notional / reference_price
 
-        order = await _create_order_with_notional_cap_retry(
-            exchange, symbol, "market", "buy", amount, None, {"positionSide": "LONG"}, last_price,
-        )
-        log.info(
-            "[REVERSAL LONG] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
-            symbol, margin_usdt, leverage, order.get("id"),
-        )
+        if touched:
+            order = await _create_order_with_notional_cap_retry(
+                exchange, symbol, "market", "buy", amount, None, {"positionSide": "LONG"}, last_price,
+            )
+            log.info(
+                "[REVERSAL LONG] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                symbol, margin_usdt, leverage, order.get("id"),
+            )
 
-        tp_distance = abs(sma20_b - ema200_b) * long_reversal.TAKE_PROFIT_DISTANCE_MULTIPLIER
-        tp_price = last_price + tp_distance
-        pseudo_position = {"symbol": symbol, "side": "long", "contracts": amount}
-        await set_take_profit(exchange, pseudo_position, tp_price)
+            tp_distance = abs(sma20_b - ema200_b) * long_reversal.TAKE_PROFIT_DISTANCE_MULTIPLIER
+            tp_price = reference_price + tp_distance
+            pseudo_position = {"symbol": symbol, "side": "long", "contracts": amount}
+            await set_take_profit(exchange, pseudo_position, tp_price)
 
-        log.warning(
-            "%s [REVERSAL LONG]: Stop Loss AÚN NO DEFINIDO para esta posición -- no se colocó ningún "
-            "Stop Loss todavía. Pendiente de que el usuario indique dónde colocarlo.",
-            symbol,
-        )
+            log.warning(
+                "%s [REVERSAL LONG]: Stop Loss AÚN NO DEFINIDO para esta posición -- no se colocó "
+                "ningún Stop Loss todavía. Pendiente de que el usuario indique dónde colocarlo.",
+                symbol,
+            )
 
-        return {"symbol": symbol, "margin_usdt": margin_usdt, "leverage": leverage, "tp_price": tp_price}
+            return {
+                "symbol": symbol, "margin_usdt": margin_usdt, "leverage": leverage,
+                "tp_price": tp_price, "order_type": "market",
+            }
+        else:
+            order = await _create_order_with_notional_cap_retry(
+                exchange, symbol, "STOP", "buy", amount, reference_price,
+                {"stopPrice": reference_price, "positionSide": "LONG"}, last_price,
+            )
+            log.info(
+                "[REVERSAL LONG] Long STOP-LIMIT order placed at SMA20(1m)=%.6f: %s | margin=%.2f USDT | "
+                "leverage=%dx | order_id=%s",
+                reference_price, symbol, margin_usdt, leverage, order.get("id"),
+            )
+
+            log.warning(
+                "%s [REVERSAL LONG]: orden STOP-LIMIT pendiente -- NO se colocó Take Profit ni Stop "
+                "Loss todavía (la posición aún no existe). Quedan pendientes para cuando la orden "
+                "se llene.",
+                symbol,
+            )
+
+            return {
+                "symbol": symbol, "margin_usdt": margin_usdt, "leverage": leverage,
+                "tp_price": None, "order_type": "stop-limit",
+            }
 
     except Exception as exc:
         log.error("Error ejecutando entrada REVERSAL LONG para %s: %s", symbol, exc)
@@ -964,7 +1075,7 @@ async def run_pasos_2_a_14_entradas(
         )
 
     for plan in plans:
-        await execute_entry(exchange, plan)
+        await execute_entry(exchange, market_exchange, plan)
 
 
 async def ensure_hedge_mode(exchange: "ccxt.bingx", label: str) -> None:
@@ -1116,6 +1227,7 @@ async def main() -> None:
     mode = _get_bot_mode()
     run_balance_check = _env_flag("RUN_BALANCE_CHECK", "false")
     run_stop_loss_check = _env_flag("RUN_STOP_LOSS_CHECK", "false")
+    run_reversal_check = _env_flag("RUN_REVERSAL_CHECK", "false")
     log.info("Modo de ejecución: %s", mode)
     log.info(
         "Gatillo de Stop Loss (toque de EMA50(1h)) %s en esta corrida (RUN_STOP_LOSS_CHECK=%s). "
@@ -1126,47 +1238,56 @@ async def main() -> None:
 
     if not LONG_STRATEGY_ENABLED:
         log.warning(
-            "[LONG] Estrategia LONG DESACTIVADA temporalmente (LONG_STRATEGY_ENABLED=False): "
-            "no se gestiona TP/SL ni se buscan nuevas entradas en la cuenta LONG en esta corrida. "
-            "(Esto NO afecta al experimento REVERSAL LONG, que opera con exchange_short.)"
+            "[LONG] Estrategia LONG \"clásica\" (long_strategy.py) DESACTIVADA temporalmente "
+            "(LONG_STRATEGY_ENABLED=False): no se buscan nuevas entradas con ese módulo en esta "
+            "corrida. (Esto NO afecta al experimento REVERSAL LONG, que opera con exchange_long de "
+            "forma independiente de este interruptor -- ver Paso 1 y el barrido de balance más abajo, "
+            "que SIEMPRE corren para exchange_long.)"
         )
 
     try:
         # Cada cuenta necesita sus propios mercados cargados, porque
         # set_leverage/set_margin_mode/create_order y la revalidación
-        # anti-forex leen de exchange.markets. Mientras LONG está
-        # desactivada no hace falta cargar sus mercados por separado
-        # (si exchange_long termina siendo `market_exchange`, sus
-        # mercados ya se cargan dentro de get_usdt_futures_symbols).
+        # anti-forex leen de exchange.markets. exchange_long se carga
+        # SIEMPRE (ya no depende de LONG_STRATEGY_ENABLED) porque el
+        # experimento REVERSAL LONG opera con esa cuenta.
         await exchange_short.load_markets()
-        if LONG_STRATEGY_ENABLED and exchange_long is not exchange_short:
-            await exchange_long.load_markets()
+        await exchange_long.load_markets()
 
         await ensure_hedge_mode(exchange_short, "SHORT")
-        if LONG_STRATEGY_ENABLED:
-            await ensure_hedge_mode(exchange_long, "LONG")
+        await ensure_hedge_mode(exchange_long, "LONG")
 
         # Universo de símbolos: SIEMPRE contra el mercado real,
         # compartido por ambas direcciones.
         allowed_symbols = set(await get_usdt_futures_symbols(market_exchange))
 
         # EXPERIMENTO REVERSAL LONG: se revisan las señales pendientes
-        # (vela A ya registrada, esperando o confirmando la vela B) en
-        # TODAS las corridas, sin importar BOT_MODE -- así no se pierde
-        # ninguna ventana de vela B por correr solo en modo "full".
-        # Usa siempre exchange_short (cuenta) y market_exchange
-        # (lectura de mercado real), tal como pidió el usuario.
-        try:
-            reversal_results = await long_reversal.process_pending_signals(
-                market_exchange, exchange_short, execute_long_reversal_entry,
+        # (vela A ya registrada, esperando o confirmando la vela B)
+        # SOLO cuando el disparador es el EXTERNO (cronjob.org ->
+        # repository_dispatch) -- ver RUN_REVERSAL_CHECK. El cron
+        # interno de GitHub (schedule) ya NO revisa esto (antes lo
+        # hacía en todas las corridas). Usa exchange_long (cuenta,
+        # ANTES exchange_short) y market_exchange (lectura de mercado
+        # real).
+        if run_reversal_check:
+            try:
+                reversal_results = await long_reversal.process_pending_signals(
+                    market_exchange, exchange_long, execute_long_reversal_entry,
+                )
+                if reversal_results:
+                    log.info("[REVERSAL LONG] Entradas ejecutadas en esta corrida: %d", len(reversal_results))
+            except Exception as exc:
+                log.error("[REVERSAL LONG] Error procesando señales pendientes: %s", exc)
+        else:
+            log.info(
+                "[REVERSAL LONG] Se omite el seguimiento de señales pendientes en esta corrida "
+                "(RUN_REVERSAL_CHECK=false)."
             )
-            if reversal_results:
-                log.info("[REVERSAL LONG] Entradas ejecutadas en esta corrida: %d", len(reversal_results))
-        except Exception as exc:
-            log.error("[REVERSAL LONG] Error procesando señales pendientes: %s", exc)
 
         # Posiciones abiertas: acción de cuenta, una lista por cada
-        # cuenta (short y long, esta última solo si está activada).
+        # cuenta (short y long, esta última solo si la estrategia LONG
+        # "clásica" está activada -- el experimento REVERSAL LONG no
+        # necesita esta lista, se gestiona vía el JSON de estado).
         open_positions_short = await get_open_positions(exchange_short, allowed_symbols)
         symbols_with_position_short = {p["symbol"] for p in open_positions_short}
 
@@ -1175,42 +1296,47 @@ async def main() -> None:
             symbols_with_position_long = {p["symbol"] for p in open_positions_long}
 
         if mode == "tp_only":
-            # Solo Paso 1 (gestión de TP/SL). Cuenta LONG incluida solo
-            # si la estrategia LONG está activada.
-            tasks = [run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check)]
-            if LONG_STRATEGY_ENABLED:
-                tasks.append(run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check))
-            await asyncio.gather(*tasks)
-        else:
-            # Modo completo: Paso 1 (TP/SL) y Pasos 2-14 (búsqueda de
-            # nuevas entradas, leyendo siempre de `market_exchange`)
-            # corren de forma concurrente. La cuenta LONG solo se
-            # incluye si la estrategia LONG está activada.
+            # Solo Paso 1 (gestión de TP/SL). Cuenta LONG SIEMPRE
+            # incluida ahora -- el experimento REVERSAL LONG puede
+            # tener posiciones abiertas en exchange_long, y Paso 1 es
+            # genérico por lado de posición (no le importa qué
+            # estrategia la abrió). Esto es INDEPENDIENTE de
+            # LONG_STRATEGY_ENABLED (que solo controla long_strategy.py).
             tasks = [
                 run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check),
+                run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check),
+            ]
+            await asyncio.gather(*tasks)
+        else:
+            # Modo completo: Paso 1 (TP/SL) corre SIEMPRE para ambas
+            # cuentas (ver nota arriba). Los Pasos 2-14 de la
+            # estrategia LONG "clásica" (long_strategy.py) siguen
+            # dependiendo de LONG_STRATEGY_ENABLED.
+            tasks = [
+                run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check),
+                run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check),
                 run_pasos_2_a_14_entradas(exchange_short, market_exchange, allowed_symbols, symbols_with_position_short),
             ]
             if LONG_STRATEGY_ENABLED:
-                tasks.append(run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check))
                 tasks.append(run_pasos_2_a_14_entradas_long(exchange_long, market_exchange, allowed_symbols, symbols_with_position_long))
             await asyncio.gather(*tasks)
 
             # BARRIDO DE BALANCE (futuros -> fondos): se evalúa POR
             # SEPARADO para cada cuenta -- solo en mercado real (nunca
             # demo/VST) y solo cuando el disparador externo lo activó.
-            # La cuenta LONG se omite por completo mientras está
-            # desactivada.
+            # La cuenta LONG ya NO depende de LONG_STRATEGY_ENABLED: el
+            # experimento REVERSAL LONG opera con exchange_long, así
+            # que su balance también debe barrerse si corresponde.
             if run_balance_check:
                 if not demo_short:
                     await check_and_sweep_futures_balance(exchange_short, allowed_symbols, label="SHORT")
                 else:
                     log.info("[SHORT][Barrido de balance] Se omite: la cuenta short está en modo DEMO (VST).")
 
-                if LONG_STRATEGY_ENABLED:
-                    if not demo_long:
-                        await check_and_sweep_futures_balance(exchange_long, allowed_symbols, label="LONG")
-                    else:
-                        log.info("[LONG][Barrido de balance] Se omite: la cuenta long está en modo DEMO (VST).")
+                if not demo_long:
+                    await check_and_sweep_futures_balance(exchange_long, allowed_symbols, label="LONG")
+                else:
+                    log.info("[LONG][Barrido de balance] Se omite: la cuenta long está en modo DEMO (VST).")
 
     finally:
         await exchange_short.close()
