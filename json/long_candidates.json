@@ -1,1 +1,8 @@
-{}
+{
+  "KAITO/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.3266,
+    "vela_a_low": 0.3231,
+    "vela_a_ts": 1790204400000
+  }
+}
