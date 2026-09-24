@@ -1,1 +1,8 @@
-{}
+{
+  "SEI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.06059,
+    "vela_a_low": 0.05933,
+    "vela_a_ts": 1790226000000
+  }
+}
