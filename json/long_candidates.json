@@ -1,8 +1,20 @@
 {
-  "KAITO/USDT:USDT": {
+  "MMT/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.3266,
-    "vela_a_low": 0.3231,
-    "vela_a_ts": 1790204400000
+    "vela_a_high": 0.1675,
+    "vela_a_low": 0.1661,
+    "vela_a_ts": 1790208000000
+  },
+  "MOVE/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.009088,
+    "vela_a_low": 0.008919,
+    "vela_a_ts": 1790208000000
+  },
+  "XAI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.007912,
+    "vela_a_low": 0.007854,
+    "vela_a_ts": 1790208000000
   }
 }
