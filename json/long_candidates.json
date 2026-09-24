@@ -1,20 +1,14 @@
 {
-  "MMT/USDT:USDT": {
+  "AIO/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.1675,
-    "vela_a_low": 0.1661,
-    "vela_a_ts": 1790208000000
+    "vela_a_high": 0.03876,
+    "vela_a_low": 0.03839,
+    "vela_a_ts": 1790211600000
   },
-  "MOVE/USDT:USDT": {
+  "GUA/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.009088,
-    "vela_a_low": 0.008919,
-    "vela_a_ts": 1790208000000
-  },
-  "XAI/USDT:USDT": {
-    "status": "waiting_b",
-    "vela_a_high": 0.007912,
-    "vela_a_low": 0.007854,
-    "vela_a_ts": 1790208000000
+    "vela_a_high": 0.03619,
+    "vela_a_low": 0.036,
+    "vela_a_ts": 1790211600000
   }
 }
