@@ -1,14 +1,8 @@
 {
-  "AIO/USDT:USDT": {
+  "PI/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.03876,
-    "vela_a_low": 0.03839,
-    "vela_a_ts": 1790211600000
-  },
-  "GUA/USDT:USDT": {
-    "status": "waiting_b",
-    "vela_a_high": 0.03619,
-    "vela_a_low": 0.036,
-    "vela_a_ts": 1790211600000
+    "vela_a_high": 0.08892,
+    "vela_a_low": 0.08775,
+    "vela_a_ts": 1790215200000
   }
 }
