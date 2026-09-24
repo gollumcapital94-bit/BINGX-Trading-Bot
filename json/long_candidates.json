@@ -1,1 +1,20 @@
-{}
+{
+  "BANK/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.03423,
+    "vela_a_low": 0.03387,
+    "vela_a_ts": 1790233200000
+  },
+  "BEAT/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.094,
+    "vela_a_low": 0.091,
+    "vela_a_ts": 1790233200000
+  },
+  "MOVE/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.009323,
+    "vela_a_low": 0.00922,
+    "vela_a_ts": 1790233200000
+  }
+}
