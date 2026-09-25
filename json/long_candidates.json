@@ -1,8 +1,14 @@
 {
-  "BEAT/USDT:USDT": {
+  "TURBO/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.0959,
-    "vela_a_low": 0.0946,
-    "vela_a_ts": 1790323200000
+    "vela_a_high": 0.0010646,
+    "vela_a_low": 0.0010538,
+    "vela_a_ts": 1790326800000
+  },
+  "XAI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.009414,
+    "vela_a_low": 0.009168,
+    "vela_a_ts": 1790326800000
   }
 }
