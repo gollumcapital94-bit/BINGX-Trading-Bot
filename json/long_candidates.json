@@ -1,8 +1,8 @@
 {
-  "MOVE/USDT:USDT": {
+  "BEAT/USDT:USDT": {
     "status": "waiting_b",
-    "vela_a_high": 0.009587,
-    "vela_a_low": 0.009492,
-    "vela_a_ts": 1790359200000
+    "vela_a_high": 0.0931,
+    "vela_a_low": 0.092,
+    "vela_a_ts": 1790362800000
   }
 }
