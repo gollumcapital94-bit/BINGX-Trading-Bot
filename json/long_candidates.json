@@ -1,1 +1,14 @@
-{}
+{
+  "ICNT/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.102,
+    "vela_a_low": 0.101,
+    "vela_a_ts": 1790348400000
+  },
+  "SUI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 1.134,
+    "vela_a_low": 1.0901,
+    "vela_a_ts": 1790348400000
+  }
+}
