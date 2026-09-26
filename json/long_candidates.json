@@ -1,1 +1,20 @@
-{}
+{
+  "PROMPT/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.02274,
+    "vela_a_low": 0.02257,
+    "vela_a_ts": 1790398800000
+  },
+  "SEI/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.07436,
+    "vela_a_low": 0.07302,
+    "vela_a_ts": 1790398800000
+  },
+  "TA/USDT:USDT": {
+    "status": "waiting_b",
+    "vela_a_high": 0.05647,
+    "vela_a_low": 0.05623,
+    "vela_a_ts": 1790398800000
+  }
+}
