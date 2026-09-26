@@ -1,16 +1,1 @@
-{
-  "SUI/USDT:USDT": {
-    "round_start_ts": 1789632000000,
-    "status": "waiting_b",
-    "vela_a_high": 1.186,
-    "vela_a_low": 1.1745,
-    "vela_a_ts": 1790442000000
-  },
-  "TURBO/USDT:USDT": {
-    "round_start_ts": 1789639200000,
-    "status": "waiting_b",
-    "vela_a_high": 0.0010909,
-    "vela_a_low": 0.0010763,
-    "vela_a_ts": 1790442000000
-  }
-}
+{}

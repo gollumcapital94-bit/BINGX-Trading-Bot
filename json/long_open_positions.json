@@ -1,0 +1,11 @@
+{
+  "TURBO/USDT:USDT": {
+    "ema200_b": 0.0010306467045649676,
+    "entry_price": 0.0010643,
+    "order_id": null,
+    "order_type": "market",
+    "round_start_ts": 1789639200000,
+    "sma20_b": 0.00107,
+    "status": "open"
+  }
+}
