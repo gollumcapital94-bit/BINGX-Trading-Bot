@@ -1,9 +1,9 @@
 {
-  "PROMPT/USDT:USDT": {
-    "round_start_ts": 1789988400000,
+  "DRIFT/USDT:USDT": {
+    "round_start_ts": 1789624800000,
     "status": "waiting_b",
-    "vela_a_high": 0.02311,
-    "vela_a_low": 0.02298,
-    "vela_a_ts": 1790434800000
+    "vela_a_high": 0.01985,
+    "vela_a_low": 0.01966,
+    "vela_a_ts": 1790438400000
   }
 }
