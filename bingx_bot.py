@@ -146,9 +146,7 @@ log = logging.getLogger("bingx_bot")
 LONG_STRATEGY_ENABLED = False
 
 # ----------------------------------------------------------------------
-# Configuración PASO 1 (gestión de TP/SL) -- compartida por ambas
-# direcciones (SHORT y LONG), ya que process_position_tp() es genérico
-# por lado de posición.
+# Configuración PASO 1 (gestión de TP/SL) -- SOLO para exchange_short.
 # ----------------------------------------------------------------------
 TIMEFRAME_TP = "1h"
 SMA_TP_TRIGGER = 20   # toque de esta SMA(1h) dispara el Take Profit
@@ -348,8 +346,19 @@ async def get_usdt_futures_symbols(market_exchange: "ccxt.bingx") -> list[str]:
 
 # ----------------------------------------------------------------------
 # PASO 1: gestión de Take Profit y Stop Loss en posiciones abiertas.
-# Genérico por lado de posición (LONG/SHORT) y por cuenta -- se llama
-# una vez por cada exchange de cuenta (exchange_short, exchange_long).
+# CAMBIO IMPORTANTE: este Paso 1 genérico ahora SOLO corre para
+# exchange_short. Las posiciones abiertas por el experimento REVERSAL
+# LONG (exchange_long) YA NO pasan por aquí -- tienen su propia gestión
+# separada, ver long_reversal.manage_open_reversal_positions() y la
+# llamada correspondiente en main() más abajo. Motivo del cambio: este
+# Paso 1 genérico ponía el Stop Loss en break even al primer toque de
+# la EMA50(1h), incluso cuando esa EMA50 era justo el nivel que el
+# experimento REVERSAL LONG usa como GATILLO DE ENTRADA (vela B) -- en
+# la práctica, eso ponía el break even casi inmediatamente después de
+# abrir la posición, sin dejarle margen de recorrido. El experimento
+# REVERSAL LONG ahora define su propio criterio de break even (ver
+# long_reversal.py): se activa cuando el precio rompe el máximo de
+# TODO el round alcista, no con un simple toque de EMA50/SMA20.
 # ----------------------------------------------------------------------
 async def get_open_positions(exchange: "ccxt.bingx", allowed_symbols: set[str]) -> list[dict]:
     """
@@ -477,17 +486,13 @@ async def set_stop_loss_breakeven(exchange: "ccxt.bingx", position: dict) -> Non
 
 async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_loss_check: bool = True) -> None:
     """
-    PASO 1: lee el mercado según el modo demo/real de LA CUENTA DONDE
-    VIVE `position` -- usa siempre `exchange` (exchange_short o
-    exchange_long, la misma conexión con la que se leyó `position` y
-    donde se colocan las órdenes de TP/SL), nunca la conexión de
-    mercado forzada a real.
+    PASO 1 (SOLO exchange_short): lee el mercado según el modo
+    demo/real de LA CUENTA DONDE VIVE `position` -- usa siempre
+    `exchange`, nunca la conexión de mercado forzada a real.
 
     Evalúa DOS gatillos INDEPENDIENTES entre sí: toque de SMA20(1h) ->
     Take Profit (siempre), toque de EMA50(1h) -> Stop Loss en break
-    even (solo si `run_stop_loss_check` es True). Genérico por lado de
-    posición (LONG/SHORT) -- sirve igual para posiciones abiertas por
-    la estrategia short o por el experimento REVERSAL LONG.
+    even (solo si `run_stop_loss_check` es True).
     """
     symbol = position["symbol"]
     try:
@@ -847,46 +852,54 @@ OHLCV_LIMIT_1M_ENTRY = 1200
 
 async def execute_long_reversal_entry(
     exchange: "ccxt.bingx", symbol: str, vela_b_low: float, sma20_b: float, ema200_b: float,
+    round_start_ts: int,
 ) -> dict | None:
     """
     Se llama cuando la vela B ya confirmó el toque de la EMA50(1h) --
     ya estamos dentro de la vela C. `exchange` aquí es SIEMPRE
-    `exchange_long` (demo o real según BINGX_DEMO_LONG) -- ANTES de
-    este cambio se usaba `exchange_short`; ahora BINGX_DEMO_LONG deja
-    de estar huérfana y controla de verdad el modo demo/real de estas
-    entradas.
+    `exchange_long` (demo o real según BINGX_DEMO_LONG).
 
-    TIPO DE ENTRADA (CAMBIÓ): ya NO se entra siempre a MERCADO. Se pide
-    el historial de velas de 1 MINUTO (OHLCV_LIMIT_1M_ENTRY) y se
-    calcula la SMA20(1m):
+    `round_start_ts` (NUEVO): timestamp (ms) de la vela 1h donde
+    empezó el round alcista que originó esta señal (viene de
+    short_strategy.evaluate_symbol() -> plan["round_start_ts"], pasado
+    a través de long_reversal.register_singularity_candle() y
+    long_reversal.process_pending_signals()). Se necesita para poder
+    calcular, en corridas futuras, el máximo de TODO el round alcista
+    -- ver long_reversal.manage_open_reversal_positions() -- que es el
+    nuevo criterio de break even para estas posiciones (YA NO el toque
+    de EMA50(1h) del Paso 1 genérico, ver nota en ese Paso 1 más
+    arriba).
+
+    TIPO DE ENTRADA: ya NO se entra siempre a MERCADO. Se pide el
+    historial de velas de 1 MINUTO (OHLCV_LIMIT_1M_ENTRY) y se calcula
+    la SMA20(1m):
       - Si el precio actual YA está en o por encima de esa SMA20(1m):
         se entra a MERCADO ya mismo.
       - Si NO: se coloca una orden STOP-LIMIT de COMPRA (positionSide
         LONG) en el nivel exacto de esa SMA20(1m), esperando a que el
-        precio suba hasta ahí -- mismo mecanismo que ya usa
-        short_strategy.execute_entry() para el short (espejado, en
-        LARGO).
+        precio suba hasta ahí.
 
     Apalancamiento: misma fórmula de siempre (LEVERAGE_BASE /
     distancia_pct), con la distancia medida desde el LOW de la vela B
-    (`vela_b_low`) hasta el precio de ENTRADA REAL -- el de mercado si
-    la orden fue a mercado, o el nivel de la SMA20(1m) si fue una orden
-    STOP-LIMIT -- en ambos casos en PORCENTAJE.
+    (`vela_b_low`) hasta el precio de ENTRADA REAL, en PORCENTAJE.
 
-    Margen: FIJO (strat_short.FIXED_EXPERIMENT_MARGIN_USDT), igual que
-    antes, para no arriesgar el balance completo de la cuenta mientras
-    se valida el patrón.
+    Margen: FIJO (strat_short.FIXED_EXPERIMENT_MARGIN_USDT).
 
-    Take Profit: entry_price + 2 * |SMA20(1h)_B - EMA200(1h)_B|. SOLO
-    se coloca cuando la entrada fue a MERCADO (la posición ya existe).
-    Si la entrada quedó como orden STOP-LIMIT pendiente, el Take Profit
-    NO se coloca todavía -- no hay posición abierta aún contra la cual
-    colocarlo. Queda pendiente para una corrida futura (igual que el
-    Stop Loss, ver abajo).
+    Take Profit: entry_price + 2 * |SMA20(1h)_B - EMA200(1h)_B|. Si la
+    entrada fue a MERCADO, se coloca de inmediato. Si quedó como orden
+    STOP-LIMIT pendiente, el Take Profit se coloca más adelante, en
+    cuanto se detecte que la orden se llenó -- ver
+    long_reversal.manage_open_reversal_positions().
 
-    Stop Loss: AÚN NO DEFINIDO -- no se coloca ninguno todavía, para
-    NINGUNO de los dos tipos de entrada. Se deja un log de advertencia
-    cada vez que se ejecuta o se coloca una entrada sin Stop Loss.
+    Stop Loss (CAMBIÓ): YA NO lo gestiona el Paso 1 genérico. Se
+    registra la posición (o la orden pendiente) en el nuevo JSON de
+    estado de long_reversal.py (json/long_open_positions.json, ver
+    long_reversal.register_open_position()) para que
+    manage_open_reversal_positions() -- llamado SOLO desde el
+    disparador externo, igual que el Stop Loss de short_strategy -- la
+    vigile y coloque el Stop Loss en BREAK EVEN EXACTO cuando el
+    precio rompa el máximo de TODO el round alcista (no un simple
+    toque de media móvil).
     """
     market = exchange.markets.get(symbol, {})
     if _looks_like_forex_or_cfd(market):
@@ -993,9 +1006,24 @@ async def execute_long_reversal_entry(
             pseudo_position = {"symbol": symbol, "side": "long", "contracts": amount}
             await set_take_profit(exchange, pseudo_position, tp_price)
 
+            # NUEVO: se registra la posición para que
+            # manage_open_reversal_positions() (disparador externo, ver
+            # main()) vigile el nuevo criterio de break even (máximo de
+            # todo el round alcista) -- YA NO el Paso 1 genérico.
+            long_reversal.register_open_position(
+                symbol=symbol,
+                status="open",
+                round_start_ts=round_start_ts,
+                sma20_b=sma20_b,
+                ema200_b=ema200_b,
+                entry_price=reference_price,
+                order_type="market",
+            )
+
             log.warning(
-                "%s [REVERSAL LONG]: Stop Loss AÚN NO DEFINIDO para esta posición -- no se colocó "
-                "ningún Stop Loss todavía. Pendiente de que el usuario indique dónde colocarlo.",
+                "%s [REVERSAL LONG]: Stop Loss en BREAK EVEN se activará automáticamente cuando el "
+                "precio rompa el máximo de todo el round alcista (ver manage_open_reversal_positions, "
+                "solo en el disparador externo) -- no se coloca ningún Stop Loss todavía.",
                 symbol,
             )
 
@@ -1014,10 +1042,26 @@ async def execute_long_reversal_entry(
                 reference_price, symbol, margin_usdt, leverage, order.get("id"),
             )
 
+            # NUEVO: se registra como "pending_fill" -- ni el Take
+            # Profit ni el seguimiento de break even empiezan hasta que
+            # manage_open_reversal_positions() detecte que esta orden
+            # STOP-LIMIT ya se llenó (ver ese método en long_reversal.py).
+            long_reversal.register_open_position(
+                symbol=symbol,
+                status="pending_fill",
+                round_start_ts=round_start_ts,
+                sma20_b=sma20_b,
+                ema200_b=ema200_b,
+                entry_price=None,
+                order_type="stop-limit",
+                order_id=order.get("id"),
+            )
+
             log.warning(
-                "%s [REVERSAL LONG]: orden STOP-LIMIT pendiente -- NO se colocó Take Profit ni Stop "
-                "Loss todavía (la posición aún no existe). Quedan pendientes para cuando la orden "
-                "se llene.",
+                "%s [REVERSAL LONG]: orden STOP-LIMIT pendiente -- NO se colocó Take Profit ni se "
+                "empieza a vigilar el break even todavía. Se registró en el JSON de posiciones "
+                "abiertas para que, cuando la orden se llene, manage_open_reversal_positions() "
+                "coloque el Take Profit y arranque la vigilancia del break even.",
                 symbol,
             )
 
@@ -1230,8 +1274,9 @@ async def main() -> None:
     run_reversal_check = _env_flag("RUN_REVERSAL_CHECK", "false")
     log.info("Modo de ejecución: %s", mode)
     log.info(
-        "Gatillo de Stop Loss (toque de EMA50(1h)) %s en esta corrida (RUN_STOP_LOSS_CHECK=%s). "
-        "El Take Profit (toque de SMA20(1h)) se evalúa siempre, sin cambios.",
+        "Gatillo de Stop Loss (SHORT: toque de EMA50(1h); REVERSAL LONG: ruptura del máximo del "
+        "round) %s en esta corrida (RUN_STOP_LOSS_CHECK=%s). El Take Profit del SHORT (toque de "
+        "SMA20(1h)) se evalúa siempre, sin cambios.",
         "ACTIVADO" if run_stop_loss_check else "DESACTIVADO",
         run_stop_loss_check,
     )
@@ -1241,8 +1286,7 @@ async def main() -> None:
             "[LONG] Estrategia LONG \"clásica\" (long_strategy.py) DESACTIVADA temporalmente "
             "(LONG_STRATEGY_ENABLED=False): no se buscan nuevas entradas con ese módulo en esta "
             "corrida. (Esto NO afecta al experimento REVERSAL LONG, que opera con exchange_long de "
-            "forma independiente de este interruptor -- ver Paso 1 y el barrido de balance más abajo, "
-            "que SIEMPRE corren para exchange_long.)"
+            "forma independiente de este interruptor.)"
         )
 
     try:
@@ -1264,11 +1308,7 @@ async def main() -> None:
         # EXPERIMENTO REVERSAL LONG: se revisan las señales pendientes
         # (vela A ya registrada, esperando o confirmando la vela B)
         # SOLO cuando el disparador es el EXTERNO (cronjob.org ->
-        # repository_dispatch) -- ver RUN_REVERSAL_CHECK. El cron
-        # interno de GitHub (schedule) ya NO revisa esto (antes lo
-        # hacía en todas las corridas). Usa exchange_long (cuenta,
-        # ANTES exchange_short) y market_exchange (lectura de mercado
-        # real).
+        # repository_dispatch) -- ver RUN_REVERSAL_CHECK.
         if run_reversal_check:
             try:
                 reversal_results = await long_reversal.process_pending_signals(
@@ -1284,10 +1324,12 @@ async def main() -> None:
                 "(RUN_REVERSAL_CHECK=false)."
             )
 
-        # Posiciones abiertas: acción de cuenta, una lista por cada
-        # cuenta (short y long, esta última solo si la estrategia LONG
-        # "clásica" está activada -- el experimento REVERSAL LONG no
-        # necesita esta lista, se gestiona vía el JSON de estado).
+        # Posiciones abiertas: acción de cuenta. Solo se necesita la
+        # lista de exchange_short (para Paso 1 y para no re-escanear
+        # símbolos con posición SHORT ya abierta). exchange_long ya NO
+        # pasa por get_open_positions() aquí -- su gestión de TP/SL vive
+        # en manage_open_reversal_positions(), que consulta posiciones
+        # puntualmente solo cuando hace falta.
         open_positions_short = await get_open_positions(exchange_short, allowed_symbols)
         symbols_with_position_short = {p["symbol"] for p in open_positions_short}
 
@@ -1296,25 +1338,17 @@ async def main() -> None:
             symbols_with_position_long = {p["symbol"] for p in open_positions_long}
 
         if mode == "tp_only":
-            # Solo Paso 1 (gestión de TP/SL). Cuenta LONG SIEMPRE
-            # incluida ahora -- el experimento REVERSAL LONG puede
-            # tener posiciones abiertas en exchange_long, y Paso 1 es
-            # genérico por lado de posición (no le importa qué
-            # estrategia la abrió). Esto es INDEPENDIENTE de
-            # LONG_STRATEGY_ENABLED (que solo controla long_strategy.py).
-            tasks = [
-                run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check),
-                run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check),
-            ]
-            await asyncio.gather(*tasks)
+            # Solo Paso 1 (gestión de TP/SL), y SOLO para exchange_short
+            # -- ver la nota grande en la sección "PASO 1" más arriba
+            # sobre por qué exchange_long ya no pasa por aquí.
+            await run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check)
         else:
-            # Modo completo: Paso 1 (TP/SL) corre SIEMPRE para ambas
-            # cuentas (ver nota arriba). Los Pasos 2-14 de la
-            # estrategia LONG "clásica" (long_strategy.py) siguen
-            # dependiendo de LONG_STRATEGY_ENABLED.
+            # Modo completo: Paso 1 (TP/SL) corre SIEMPRE, pero SOLO
+            # para exchange_short. Los Pasos 2-14 de la estrategia LONG
+            # "clásica" (long_strategy.py) siguen dependiendo de
+            # LONG_STRATEGY_ENABLED.
             tasks = [
                 run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check),
-                run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check),
                 run_pasos_2_a_14_entradas(exchange_short, market_exchange, allowed_symbols, symbols_with_position_short),
             ]
             if LONG_STRATEGY_ENABLED:
@@ -1324,9 +1358,6 @@ async def main() -> None:
             # BARRIDO DE BALANCE (futuros -> fondos): se evalúa POR
             # SEPARADO para cada cuenta -- solo en mercado real (nunca
             # demo/VST) y solo cuando el disparador externo lo activó.
-            # La cuenta LONG ya NO depende de LONG_STRATEGY_ENABLED: el
-            # experimento REVERSAL LONG opera con exchange_long, así
-            # que su balance también debe barrerse si corresponde.
             if run_balance_check:
                 if not demo_short:
                     await check_and_sweep_futures_balance(exchange_short, allowed_symbols, label="SHORT")
@@ -1337,6 +1368,30 @@ async def main() -> None:
                     await check_and_sweep_futures_balance(exchange_long, allowed_symbols, label="LONG")
                 else:
                     log.info("[LONG][Barrido de balance] Se omite: la cuenta long está en modo DEMO (VST).")
+
+        # NUEVO -- GESTIÓN DE POSICIONES/ÓRDENES ABIERTAS DEL EXPERIMENTO
+        # REVERSAL LONG (ver long_reversal.manage_open_reversal_positions):
+        # detecta si una orden STOP-LIMIT pendiente ya se llenó (y en ese
+        # caso coloca el Take Profit y empieza a vigilar el break even),
+        # y coloca el Stop Loss en BREAK EVEN EXACTO cuando el precio
+        # rompe el máximo de TODO el round alcista. Corre SOLO en el
+        # disparador externo (RUN_STOP_LOSS_CHECK), igual que el Stop
+        # Loss de la estrategia SHORT -- este bot ya distingue entre un
+        # disparador interno (cron horario de GitHub, no puntual) y uno
+        # externo (cronjob.org -> repository_dispatch, puntual) para
+        # todo lo relacionado con Stop Loss.
+        if run_stop_loss_check:
+            try:
+                await long_reversal.manage_open_reversal_positions(
+                    exchange_long, market_exchange, set_take_profit, set_stop_loss_breakeven,
+                )
+            except Exception as exc:
+                log.error("[REVERSAL LONG] Error gestionando posiciones/órdenes abiertas: %s", exc)
+        else:
+            log.info(
+                "[REVERSAL LONG] Se omite la gestión de posiciones/órdenes abiertas (break even / "
+                "detección de llenado de STOP-LIMIT) en esta corrida (RUN_STOP_LOSS_CHECK=false)."
+            )
 
     finally:
         await exchange_short.close()
