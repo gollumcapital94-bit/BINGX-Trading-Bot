@@ -25,22 +25,28 @@ on:
     #
     # IMPORTANTE (Stop Loss): este cron interno de GitHub NO es
     # puntual -- schedule puede sufrir retrasos frente al minuto
-    # exacto configurado. Por eso el Stop Loss (Gatillo 2 del Paso 1)
-    # ya NO se coloca desde este disparador -- ver RUN_STOP_LOSS_CHECK
-    # más abajo. El Take Profit (Gatillo 1) sigue evaluándose aquí sin
-    # cambios, para ambas cuentas (short y long).
+    # exacto configurado. Por eso el Stop Loss (Gatillo 2 del Paso 1
+    # de SHORT, y TODA la gestión de break even / detección de llenado
+    # de STOP-LIMIT del experimento REVERSAL LONG) ya NO se ejecuta
+    # desde este disparador -- ver RUN_STOP_LOSS_CHECK más abajo. El
+    # Take Profit del SHORT (Gatillo 1) sigue evaluándose aquí sin
+    # cambios. El Paso 1 genérico de gestión de TP/SL ya solo corre
+    # para la cuenta SHORT (ver bingx_bot.py) -- las posiciones del
+    # experimento REVERSAL LONG (exchange_long) tienen su propia
+    # gestión separada (long_reversal.manage_open_reversal_positions),
+    # que también depende de RUN_STOP_LOSS_CHECK.
     #
-    # NOTA -- EXPERIMENTO REVERSAL LONG (CAMBIÓ): bingx_bot.py ya NO
-    # revisa las señales pendientes (vela A/vela B, ver long_reversal.py)
-    # en este cron interno -- ahora SOLO se revisan en el disparador
-    # EXTERNO (repository_dispatch, ver RUN_REVERSAL_CHECK más abajo),
-    # igual que el Stop Loss y el barrido de balance. Este cron interno
-    # solo gestiona TP/SL (Paso 1), en ambas cuentas.
+    # NOTA -- EXPERIMENTO REVERSAL LONG: bingx_bot.py ya NO revisa las
+    # señales pendientes (vela A/vela B, ver long_reversal.py) en este
+    # cron interno -- ahora SOLO se revisan en el disparador EXTERNO
+    # (repository_dispatch, ver RUN_REVERSAL_CHECK más abajo), igual
+    # que el Stop Loss y el barrido de balance. Este cron interno solo
+    # gestiona TP/SL (Paso 1) de la cuenta SHORT.
     - cron: "0 * * * *"
 
 # NUEVO: necesario para que el paso "Guardar estado de REVERSAL LONG"
-# pueda hacer `git push` de vuelta al repo con el JSON de señales
-# pendientes actualizado.
+# pueda hacer `git push` de vuelta al repo con los JSON de señales
+# pendientes / posiciones abiertas actualizados.
 permissions:
   contents: write
 
@@ -83,8 +89,8 @@ jobs:
           # afectar a long_strategy.py, que sigue desactivado.
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
           BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
-          # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1), en
-          # ambas cuentas. Cualquier otro disparador -- manual
+          # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1) de
+          # la cuenta SHORT. Cualquier otro disparador -- manual
           # (workflow_dispatch) o externo (repository_dispatch desde
           # cronjob.org) -- corre el bot completo (Pasos 1 a 14 SHORT),
           # además de (según corresponda) el seguimiento del
@@ -94,44 +100,71 @@ jobs:
           # separado para cada cuenta): SOLO debe correr cuando el
           # disparador es el EXTERNO (cronjob.org -> repository_dispatch).
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # Gatillo del Stop Loss (Gatillo 2 del Paso 1, toque de la
-          # EMA50(1h)): SOLO se activa cuando el disparador es el
-          # EXTERNO (cronjob.org -> repository_dispatch). El Take
-          # Profit (Gatillo 1) NO usa esta variable: sigue
-          # evaluándose siempre, sin importar el disparador.
+          # Gatillo de Stop Loss: SOLO se activa cuando el disparador es
+          # el EXTERNO (cronjob.org -> repository_dispatch). Controla
+          # DOS cosas, ambas exclusivas del disparador externo por el
+          # mismo motivo (el cron interno de GitHub no es puntual):
+          #   1) SHORT: el toque de la EMA50(1h) (Gatillo 2 del Paso 1).
+          #      El Take Profit (Gatillo 1) NO usa esta variable: sigue
+          #      evaluándose siempre, sin importar el disparador.
+          #   2) REVERSAL LONG (NUEVO): toda la gestión de posiciones/
+          #      órdenes abiertas de ese experimento -- detectar si una
+          #      orden STOP-LIMIT ya se llenó (y en ese caso colocar el
+          #      Take Profit) y colocar el Stop Loss en BREAK EVEN
+          #      cuando el precio rompe el máximo de todo el round
+          #      alcista -- ver long_reversal.manage_open_reversal_positions().
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # NUEVO -- EXPERIMENTO REVERSAL LONG (ver long_reversal.py):
-          # el seguimiento de señales pendientes (vela A/vela B) SOLO
-          # se activa cuando el disparador es el EXTERNO (cronjob.org
-          # -> repository_dispatch). ANTES corría en TODAS las
-          # corridas, incluido este cron interno horario -- se cambió
-          # porque el cron interno no es puntual y podía leer la vela B
-          # en un momento inconsistente.
+          # El seguimiento de señales pendientes (vela A/vela B, ver
+          # long_reversal.py) SOLO se activa cuando el disparador es el
+          # EXTERNO (cronjob.org -> repository_dispatch). El cron
+          # interno no revisa esto porque no es puntual y podía leer la
+          # vela B en un momento inconsistente.
           RUN_REVERSAL_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
 
-      - name: Guardar estado de REVERSAL LONG (json/long_candidates.json)
-        # El JSON con las señales pendientes del experimento REVERSAL
-        # LONG (ver long_reversal.py) se escribe en el disco efímero
-        # del runner, dentro de la carpeta json/ (creada sola por
-        # long_reversal._save_state() si no existe) -- si no se
-        # commitea de vuelta al repo, se pierde al terminar el job y
-        # el bot "olvidaría" las señales pendientes en la siguiente
-        # corrida. `if: always()` asegura que esto corra incluso si el
-        # paso "Ejecutar bot" falló a mitad de camino, para no perder
+      - name: Guardar estado de REVERSAL LONG (json/long_candidates.json y json/long_open_positions.json)
+        # Los DOS JSON de estado del experimento REVERSAL LONG (ver
+        # long_reversal.py) se escriben en el disco efímero del runner,
+        # dentro de la carpeta json/ (creada sola si no existe) -- si
+        # no se commitean de vuelta al repo, se pierden al terminar el
+        # job:
+        #   - long_candidates.json: señales pendientes (vela A
+        #     esperando confirmación de la vela B). Ya existía.
+        #   - long_open_positions.json (NUEVO): posiciones ya abiertas
+        #     por este experimento (o sus órdenes STOP-LIMIT todavía
+        #     sin llenar) que necesitan seguimiento en corridas futuras
+        #     para el Take Profit diferido y, sobre todo, para el
+        #     nuevo criterio de Stop Loss en break even (ruptura del
+        #     máximo del round alcista). Si este archivo se pierde, el
+        #     bot "olvidaría" que tiene que vigilar el break even de
+        #     esas posiciones.
+        # `if: always()` asegura que esto corra incluso si el paso
+        # "Ejecutar bot" falló a mitad de camino, para no perder
         # cambios de estado ya hechos.
         if: always()
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          CHANGED=0
+
           if [ -f json/long_candidates.json ] && [ -n "$(git status --porcelain json/long_candidates.json)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
             git add json/long_candidates.json
-            git commit -m "chore: actualizar estado de señales pendientes REVERSAL LONG [skip ci]"
+            CHANGED=1
+          fi
+
+          if [ -f json/long_open_positions.json ] && [ -n "$(git status --porcelain json/long_open_positions.json)" ]; then
+            git add json/long_open_positions.json
+            CHANGED=1
+          fi
+
+          if [ "$CHANGED" -eq 1 ]; then
+            git commit -m "chore: actualizar estado de señales/posiciones REVERSAL LONG [skip ci]"
             git push
           else
-            echo "Sin cambios en json/long_candidates.json, no se commitea nada."
+            echo "Sin cambios en los JSON de estado de REVERSAL LONG, no se commitea nada."
           fi
 
       - name: Enviar señales a Telegram
