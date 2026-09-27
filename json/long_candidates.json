@@ -1,1 +1,9 @@
-{}
+{
+  "XAI/USDT:USDT": {
+    "round_start_ts": 1789657200000,
+    "status": "waiting_b",
+    "vela_a_high": 0.010108,
+    "vela_a_low": 0.009701,
+    "vela_a_ts": 1790532000000
+  }
+}
