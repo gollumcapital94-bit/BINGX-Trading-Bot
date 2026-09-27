@@ -1,4 +1,13 @@
 {
+  "BEAT/USDT:USDT": {
+    "ema200_b": 0.0931976295378876,
+    "entry_price": 0.0989,
+    "order_id": null,
+    "order_type": "market",
+    "round_start_ts": 1789984800000,
+    "sma20_b": 0.10316,
+    "status": "open"
+  },
   "TURBO/USDT:USDT": {
     "ema200_b": 0.0010318291378135216,
     "entry_price": 0.0010627,
