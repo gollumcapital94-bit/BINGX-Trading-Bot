@@ -1,1 +1,16 @@
-{}
+{
+  "MOVE/USDT:USDT": {
+    "round_start_ts": 1789650000000,
+    "status": "waiting_b",
+    "vela_a_high": 0.009623,
+    "vela_a_low": 0.009535,
+    "vela_a_ts": 1790524800000
+  },
+  "SEI/USDT:USDT": {
+    "round_start_ts": 1789646400000,
+    "status": "waiting_b",
+    "vela_a_high": 0.07417,
+    "vela_a_low": 0.07286,
+    "vela_a_ts": 1790524800000
+  }
+}
