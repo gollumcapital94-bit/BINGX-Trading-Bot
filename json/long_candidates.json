@@ -1,1 +1,9 @@
-{}
+{
+  "ICNT/USDT:USDT": {
+    "round_start_ts": 1789668000000,
+    "status": "waiting_b",
+    "vela_a_high": 0.1026,
+    "vela_a_low": 0.1018,
+    "vela_a_ts": 1790467200000
+  }
+}
