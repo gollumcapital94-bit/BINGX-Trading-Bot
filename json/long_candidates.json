@@ -1,9 +1,1 @@
-{
-  "TURBO/USDT:USDT": {
-    "round_start_ts": 1789639200000,
-    "status": "waiting_b",
-    "vela_a_high": 0.001058,
-    "vela_a_low": 0.0010519,
-    "vela_a_ts": 1790460000000
-  }
-}
+{}
