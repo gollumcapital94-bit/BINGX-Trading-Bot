@@ -1,1 +1,9 @@
-{}
+{
+  "SEI/USDT:USDT": {
+    "round_start_ts": 1789646400000,
+    "status": "waiting_b",
+    "vela_a_high": 0.0782,
+    "vela_a_low": 0.076,
+    "vela_a_ts": 1790607600000
+  }
+}
