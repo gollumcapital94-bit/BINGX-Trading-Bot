@@ -8,6 +8,15 @@
     "sma20_b": 0.10316,
     "status": "open"
   },
+  "DRIFT/USDT:USDT": {
+    "ema200_b": 0.01840135874644415,
+    "entry_price": 0.01929,
+    "order_id": null,
+    "order_type": "market",
+    "round_start_ts": 1789624800000,
+    "sma20_b": 0.019758500000000002,
+    "status": "open"
+  },
   "MOVE/USDT:USDT": {
     "ema200_b": 0.009305309025928719,
     "entry_price": 0.009631,
