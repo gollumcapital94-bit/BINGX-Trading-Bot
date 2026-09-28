@@ -1,1 +1,30 @@
-{}
+{
+  "DRIFT/USDT:USDT": {
+    "round_start_ts": 1789624800000,
+    "status": "waiting_b",
+    "vela_a_high": 0.01985,
+    "vela_a_low": 0.01935,
+    "vela_a_ts": 1790571600000
+  },
+  "MOVE/USDT:USDT": {
+    "round_start_ts": 1789650000000,
+    "status": "waiting_b",
+    "vela_a_high": 0.009217,
+    "vela_a_low": 0.008988,
+    "vela_a_ts": 1790571600000
+  },
+  "SEI/USDT:USDT": {
+    "round_start_ts": 1789646400000,
+    "status": "waiting_b",
+    "vela_a_high": 0.08338,
+    "vela_a_low": 0.07993,
+    "vela_a_ts": 1790571600000
+  },
+  "TURBO/USDT:USDT": {
+    "round_start_ts": 1789639200000,
+    "status": "waiting_b",
+    "vela_a_high": 0.001042,
+    "vela_a_low": 0.0010102,
+    "vela_a_ts": 1790571600000
+  }
+}
