@@ -1,1 +1,9 @@
-{}
+{
+  "AIA/USDT:USDT": {
+    "round_start_ts": 1790362800000,
+    "status": "waiting_b",
+    "vela_a_high": 0.0732,
+    "vela_a_low": 0.07112,
+    "vela_a_ts": 1790694000000
+  }
+}
