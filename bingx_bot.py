@@ -46,8 +46,8 @@ import sys
 import pandas as pd
 import ccxt.async_support as ccxt
 
-import short_strategy as strat_short
-import testing_entries as strat_test
+from entries import short_strategy as strat_short
+from entries import testing_entries as strat_test
 # TEMPORAL: la estrategia LONG "clásica" (long_strategy.py) queda
 # DESACTIVADA. Para reactivarla: descomentar este import y poner
 # LONG_STRATEGY_ENABLED = True más abajo.
