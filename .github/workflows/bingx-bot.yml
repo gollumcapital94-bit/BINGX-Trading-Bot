@@ -11,58 +11,28 @@ on:
         type: boolean
         default: false
       demo_mode_long:
-        description: "Ejecutar el experimento REVERSAL LONG en cuenta DEMO (VST) en vez de cuenta real"
+        description: "Ejecutar la cuenta LONG en modo DEMO (VST) en vez de cuenta real"
         required: true
         type: boolean
         default: true
   schedule:
     # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE a la gestión de
-    # TP/SL (Paso 1) -- ver BOT_MODE más abajo. Corre CADA HORA, en
-    # sintonía con TIMEFRAME_TP="1h" en bingx_bot.py. NUNCA escanea ni
-    # abre nuevas entradas SHORT, así se evita duplicar una posición
-    # que el disparador externo (cronjob.org -> repository_dispatch)
-    # ya haya abierto.
+    # TP (Paso 1) -- ver BOT_MODE más abajo. Corre CADA HORA. NUNCA
+    # escanea ni abre nuevas entradas SHORT.
     #
-    # IMPORTANTE (Stop Loss): este cron interno de GitHub NO es
-    # puntual -- schedule puede sufrir retrasos frente al minuto
-    # exacto configurado. Por eso el Stop Loss (Gatillo 2 del Paso 1
-    # de SHORT, y TODA la gestión de break even / detección de llenado
-    # de STOP-LIMIT del experimento REVERSAL LONG) ya NO se ejecuta
-    # desde este disparador -- ver RUN_STOP_LOSS_CHECK más abajo. El
-    # Take Profit del SHORT (Gatillo 1) sigue evaluándose aquí sin
-    # cambios. El Paso 1 genérico de gestión de TP/SL ya solo corre
-    # para la cuenta SHORT (ver bingx_bot.py) -- las posiciones del
-    # experimento REVERSAL LONG (exchange_long) tienen su propia
-    # gestión separada (long_reversal.manage_open_reversal_positions),
-    # que también depende de RUN_STOP_LOSS_CHECK.
-    #
-    # NOTA -- EXPERIMENTO REVERSAL LONG: bingx_bot.py ya NO revisa las
-    # señales pendientes (vela A/vela B, ver long_reversal.py) en este
-    # cron interno -- ahora SOLO se revisan en el disparador EXTERNO
-    # (repository_dispatch, ver RUN_REVERSAL_CHECK más abajo), igual
-    # que el Stop Loss y el barrido de balance. Este cron interno solo
-    # gestiona TP/SL (Paso 1) de la cuenta SHORT.
+    # El Stop Loss (Gatillo 2 del Paso 1) NO se ejecuta desde este
+    # disparador porque schedule no es puntual -- ver RUN_STOP_LOSS_CHECK.
     - cron: "0 * * * *"
 
-# NUEVO: necesario para que el paso "Guardar estado de REVERSAL LONG"
-# pueda hacer `git push` de vuelta al repo con los JSON de señales
-# pendientes / posiciones abiertas actualizados.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # IMPORTANTE: serializa las ejecuciones de este workflow. Sin esto,
-    # el cron interno (schedule) y el disparador externo (cronjob.org
-    # -> repository_dispatch) podrían caer en el mismo instante y correr
-    # EN PARALELO -- ambos verificarían "¿ya existe el TP/SL?" casi al
-    # mismo tiempo, verían que no, y crearían la orden duplicada de
-    # todos modos. `cancel-in-progress: false` hace que la segunda
-    # ejecución espere en cola a que termine la primera. Esto también
-    # evita conflictos de `git push` al commitear el estado del
-    # experimento REVERSAL LONG (ver más abajo).
+    # Serializa las ejecuciones para evitar órdenes TP/SL duplicadas
+    # cuando el cron interno y el disparador externo caen a la vez.
     concurrency:
       group: bingx-trading-bot
       cancel-in-progress: false
@@ -83,89 +53,19 @@ jobs:
         env:
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
-          # BINGX_DEMO_LONG ya NO está huérfana: ahora controla el modo
-          # demo/real de la cuenta que usa el experimento REVERSAL LONG
-          # (antes usaba exchange_short/BINGX_DEMO_SHORT). Sigue sin
-          # afectar a long_strategy.py, que sigue desactivado.
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
           BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
-          # El cron interno (schedule) SOLO gestiona TP/SL (Paso 1) de
-          # la cuenta SHORT. Cualquier otro disparador -- manual
-          # (workflow_dispatch) o externo (repository_dispatch desde
-          # cronjob.org) -- corre el bot completo (Pasos 1 a 14 SHORT),
-          # además de (según corresponda) el seguimiento del
-          # experimento REVERSAL LONG.
+          # El cron interno (schedule) SOLO gestiona TP (Paso 1) de la
+          # cuenta SHORT. Cualquier otro disparador corre el bot completo.
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
-          # Barrido de balance de futuros -> fondos (evaluado por
-          # separado para cada cuenta): SOLO debe correr cuando el
-          # disparador es el EXTERNO (cronjob.org -> repository_dispatch).
+          # Barrido de balance futuros -> fondos: SOLO en disparador EXTERNO.
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # Gatillo de Stop Loss: SOLO se activa cuando el disparador es
-          # el EXTERNO (cronjob.org -> repository_dispatch). Controla
-          # DOS cosas, ambas exclusivas del disparador externo por el
-          # mismo motivo (el cron interno de GitHub no es puntual):
-          #   1) SHORT: el toque de la EMA50(1h) (Gatillo 2 del Paso 1).
-          #      El Take Profit (Gatillo 1) NO usa esta variable: sigue
-          #      evaluándose siempre, sin importar el disparador.
-          #   2) REVERSAL LONG (NUEVO): toda la gestión de posiciones/
-          #      órdenes abiertas de ese experimento -- detectar si una
-          #      orden STOP-LIMIT ya se llenó (y en ese caso colocar el
-          #      Take Profit) y colocar el Stop Loss en BREAK EVEN
-          #      cuando el precio rompe el máximo de todo el round
-          #      alcista -- ver long_reversal.manage_open_reversal_positions().
+          # Gatillo de Stop Loss (toque de EMA50(1h) del SHORT): SOLO en
+          # disparador EXTERNO. El Take Profit no depende de esta variable.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # El seguimiento de señales pendientes (vela A/vela B, ver
-          # long_reversal.py) SOLO se activa cuando el disparador es el
-          # EXTERNO (cronjob.org -> repository_dispatch). El cron
-          # interno no revisa esto porque no es puntual y podía leer la
-          # vela B en un momento inconsistente.
-          RUN_REVERSAL_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
-
-      - name: Guardar estado de REVERSAL LONG (json/long_candidates.json y json/long_open_positions.json)
-        # Los DOS JSON de estado del experimento REVERSAL LONG (ver
-        # long_reversal.py) se escriben en el disco efímero del runner,
-        # dentro de la carpeta json/ (creada sola si no existe) -- si
-        # no se commitean de vuelta al repo, se pierden al terminar el
-        # job:
-        #   - long_candidates.json: señales pendientes (vela A
-        #     esperando confirmación de la vela B). Ya existía.
-        #   - long_open_positions.json (NUEVO): posiciones ya abiertas
-        #     por este experimento (o sus órdenes STOP-LIMIT todavía
-        #     sin llenar) que necesitan seguimiento en corridas futuras
-        #     para el Take Profit diferido y, sobre todo, para el
-        #     nuevo criterio de Stop Loss en break even (ruptura del
-        #     máximo del round alcista). Si este archivo se pierde, el
-        #     bot "olvidaría" que tiene que vigilar el break even de
-        #     esas posiciones.
-        # `if: always()` asegura que esto corra incluso si el paso
-        # "Ejecutar bot" falló a mitad de camino, para no perder
-        # cambios de estado ya hechos.
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          CHANGED=0
-
-          if [ -f json/long_candidates.json ] && [ -n "$(git status --porcelain json/long_candidates.json)" ]; then
-            git add json/long_candidates.json
-            CHANGED=1
-          fi
-
-          if [ -f json/long_open_positions.json ] && [ -n "$(git status --porcelain json/long_open_positions.json)" ]; then
-            git add json/long_open_positions.json
-            CHANGED=1
-          fi
-
-          if [ "$CHANGED" -eq 1 ]; then
-            git commit -m "chore: actualizar estado de señales/posiciones REVERSAL LONG [skip ci]"
-            git push
-          else
-            echo "Sin cambios en los JSON de estado de REVERSAL LONG, no se commitea nada."
-          fi
 
       - name: Enviar señales a Telegram
         if: always()
@@ -173,14 +73,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # NOTA: el patrón de "Stop Loss" usa ".*" entre "break even" y
-          # "colocado" porque el log real dice "Stop Loss en break even
-          # EXACTO colocado (gatillo: ...)". El patrón de "Transferencia
-          # ejecutada" notifica el barrido de balance de futuros -> fondos
-          # (de cualquiera de las dos cuentas, short o long). Los patrones
-          # "Market entry executed" y "STOP-LIMIT order placed" ya cubren
-          # tanto al short (short_strategy) como al experimento REVERSAL
-          # LONG (bingx_bot.execute_long_reversal_entry), sin cambios.
           grep -E "Market entry executed|STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
