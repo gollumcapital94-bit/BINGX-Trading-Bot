@@ -104,17 +104,10 @@ MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 13)
 LEVERAGE_BASE = 80  # numerador de la fórmula de apalancamiento (antes 90)
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 
-# EXPERIMENTO REVERSAL LONG (ver long_reversal.py): cuando la vela B
-# confirma el toque de la EMA50(1h) y se entra en LARGO en la vela C,
-# se limita el margen a este valor FIJO (en vez del 10% del balance de
-# la cuenta) para no arriesgar la cuenta completa mientras se valida
-# el patrón. Se sigue respetando el límite real de notional/
-# apalancamiento de BingX (ver calculate_position_size_fixed).
-FIXED_EXPERIMENT_MARGIN_USDT = 100.0
-
 OHLCV_LIMIT_1H = 1200   # histórico fijo (~50 días) para que SMA20/EMA50/EMA200 converjan; una sola petición, sin reintentos
 OHLCV_LIMIT_4H = 1200   # mismo criterio que OHLCV_LIMIT_1H, pero en 4h (~200 días) para el Paso 10 (SMA20 vs EMA50 en 4h)
-OHLCV_LIMIT_LOWER_TF = 500  # para 15m / 5m (más margen de calentamiento para RSI/W%R)
+OHLCV_LIMIT_LOWER_TF = 500  # para 15m (más margen de calentamiento para RSI/W%R)
+OHLCV_LIMIT_5M = 1000  # para 5m: más historial para que la EMA200(5m) (stop loss del LONG) converja
 
 # BingX impone un tope real de velas por PETICIÓN INDIVIDUAL de klines,
 # sin importar el `limit` que se le pida: 1440 velas máximo (confirmado
@@ -935,27 +928,6 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
     return min(margin_20pct, max_margin_by_leverage)
 
 
-async def calculate_position_size_fixed(
-    exchange, symbol: str, leverage: int, fixed_margin: float = FIXED_EXPERIMENT_MARGIN_USDT,
-) -> float:
-    """
-    EXPERIMENTO REVERSAL LONG (ver long_reversal.py y
-    bingx_bot.execute_long_reversal_entry()): se usa un margen FIJO
-    (`fixed_margin`, por defecto 100 USDT/VST) en vez del 10% del
-    balance de la cuenta, para no arriesgar la cuenta completa mientras
-    se valida el patrón.
-
-    Igual que calculate_position_size(), sigue respetando el límite
-    real de notional/apalancamiento que impone BingX para el par: si
-    ese límite permite MENOS que `fixed_margin` (por ejemplo, solo 50
-    USDT de margen para ese apalancamiento), se usa ese límite menor.
-    """
-    max_notional = await get_max_notional_for_leverage(exchange, symbol, leverage)
-    max_margin_by_leverage = max_notional / leverage if leverage else max_notional
-
-    return min(fixed_margin, max_margin_by_leverage)
-
-
 # ----------------------------------------------------------------------
 # Paso 2: obtención de velas 1h con ventana FIJA (una sola petición).
 # ----------------------------------------------------------------------
@@ -968,6 +940,49 @@ async def fetch_1h_with_expanding_window(exchange, symbol: str):
 
     ok, info = check_step_2_3(df_1h)
     return df_1h, (ok, info)
+
+
+# ----------------------------------------------------------------------
+# Evaluación de singularidad por temporalidad (Pasos 11 y 12).
+# Antes los Pasos 5-6 (vela roja del máximo) y 7-8 (W%R) eran filtros
+# previos y separados; ahora forman parte de cada paso de singularidad.
+# ----------------------------------------------------------------------
+def _evaluate_singularidad_tf(df_closed: pd.DataFrame, tf_label: str, step_num: int, check_singularity_fn,
+                              window_start_ts: int, window_end_ts: int,
+                              expected_max_high: float, es_verde_1h: bool):
+    """
+    Para UNA temporalidad (15m o 5m), de forma independiente de la otra:
+      1) El máximo en la ventana de la vela 1h debe coincidir con el
+         high de 1h y estar en una vela ROJA.
+      2) Chequeo de bordes de W%R6/12/24 (ver check_wr_bordes), que
+         evita W%R repetidos (a=0 -> logaritmo indefinido).
+      3) Cálculo de singularidad; aprueba solo si S > 0.
+    Devuelve (ok, info). ok=True si la singularidad se pudo calcular y su
+    signo es distinto de cero: info["signo"] = "positiva" (S > 0, entrada
+    SHORT) o "negativa" (S < 0, entrada LONG a mercado). Si falla (sin
+    vela roja, W%R repetidos, k <= 0, S == 0), info lleva "reason" y
+    "failed_step".
+    """
+    ok, res_max = check_max_candle_matches_and_is_red(
+        df_closed, window_start_ts, window_end_ts, expected_max_high, tf_label, step_num=step_num,
+    )
+    if not ok:
+        return False, res_max
+    idx = res_max["idx"]
+
+    ok, res_wr = check_wr_bordes(df_closed, idx, tf_label, step_num=step_num)
+    if not ok:
+        return False, res_wr
+
+    rsi6, rsi12 = _get_rsi6_rsi12(df_closed, idx)
+    _passed, res_s = check_singularity_fn(rsi6, rsi12, res_wr["wr6"], res_wr["wr12"], es_verde_1h)
+    s = res_s.get("s")
+    if s is None or s == 0:
+        reason = res_s.get("reason") or f"[Paso {step_num}] Singularidad indefinida o igual a 0 en {tf_label}"
+        return False, {"reason": reason, "failed_step": step_num}
+
+    signo = "positiva" if s > 0 else "negativa"
+    return True, {"idx": idx, "s": s, "signo": signo}
 
 
 # ----------------------------------------------------------------------
@@ -1013,41 +1028,6 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en [Paso 4]: %s", symbol, info4["reason"])
             return None, 4
 
-        raw_15m = await exchange.fetch_ohlcv(symbol, timeframe="15m", limit=OHLCV_LIMIT_LOWER_TF)
-        df_15m = _drop_unclosed_candle(_to_dataframe(raw_15m))
-        raw_5m = await exchange.fetch_ohlcv(symbol, timeframe="5m", limit=OHLCV_LIMIT_LOWER_TF)
-        df_5m = _drop_unclosed_candle(_to_dataframe(raw_5m))
-
-        ok, res5 = check_max_candle_matches_and_is_red(
-            df_15m, window_start_ts, window_end_ts, expected_max_high, "15m", step_num=5,
-        )
-        if not ok:
-            log.info("%s descartado en %s", symbol, res5["reason"])
-            return None, 5
-        idx_15m = res5["idx"]
-
-        ok, res6 = check_max_candle_matches_and_is_red(
-            df_5m, window_start_ts, window_end_ts, expected_max_high, "5m", step_num=6,
-        )
-        if not ok:
-            log.info("%s descartado en %s", symbol, res6["reason"])
-            return None, 6
-        idx_5m = res6["idx"]
-
-        # CHEQUEO DE BORDES (reintroducido): además de la vela roja del
-        # máximo, también se chequea la vela verde previa -- ver
-        # check_wr_bordes() para la regla completa (se omite si la
-        # vela previa es roja, en vez de descartar).
-        ok, res7 = check_wr_bordes(df_15m, idx_15m, "15m", step_num=7)
-        if not ok:
-            log.info("%s descartado en %s", symbol, res7["reason"])
-            return None, 7
-
-        ok, res8 = check_wr_bordes(df_5m, idx_5m, "5m", step_num=8)
-        if not ok:
-            log.info("%s descartado en %s", symbol, res8["reason"])
-            return None, 8
-
         ok, info9_vol = await check_step_9_volume(exchange, symbol)
         if not ok:
             log.info("%s descartado en %s", symbol, info9_vol["reason"])
@@ -1063,36 +1043,41 @@ async def evaluate_symbol(exchange, symbol: str):
             symbol, info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
         )
 
-        rsi6_15m, rsi12_15m = _get_rsi6_rsi12(df_15m, idx_15m)
-        rsi6_5m, rsi12_5m = _get_rsi6_rsi12(df_5m, idx_5m)
+        # Las velas 15m/5m se descargan aquí (ya no hay Pasos 5-8 previos
+        # que descarten antes de este punto).
+        raw_15m = await exchange.fetch_ohlcv(symbol, timeframe="15m", limit=OHLCV_LIMIT_LOWER_TF)
+        df_15m = _drop_unclosed_candle(_to_dataframe(raw_15m))
+        raw_5m = await exchange.fetch_ohlcv(symbol, timeframe="5m", limit=OHLCV_LIMIT_5M)
+        df_5m = _drop_unclosed_candle(_to_dataframe(raw_5m))
 
-        info_15m = {
-            "idx": idx_15m,
-            "rsi6": rsi6_15m, "rsi12": rsi12_15m,
-            "wr6": res7["wr6"], "wr12": res7["wr12"], "wr24": res7["wr24"],
-        }
-        info_5m = {
-            "idx": idx_5m,
-            "rsi6": rsi6_5m, "rsi12": rsi12_5m,
-            "wr6": res8["wr6"], "wr12": res8["wr12"], "wr24": res8["wr24"],
-        }
-
-        ok11, res11 = check_step_11_singularidad_15m(
-            info_15m["rsi6"], info_15m["rsi12"], info_15m["wr6"], info_15m["wr12"], es_verde_1h
+        # Paso 11 (15m): la singularidad solo se evalúa si el máximo en
+        # 15m coincide con el de 1h, está en una vela ROJA y pasa el
+        # chequeo de W%R. Ver _evaluate_singularidad_tf().
+        # Singularidad POSITIVA (S > 0) -> SHORT; NEGATIVA (S < 0) -> LONG.
+        ok11, res11 = _evaluate_singularidad_tf(
+            df_15m, "15m", 11, check_step_11_singularidad_15m,
+            window_start_ts, window_end_ts, expected_max_high, es_verde_1h,
         )
+        singularidad_signo = None
         if ok11:
-            log.info("%s aprobó [Paso 11]: singularidad en 15m (S=%.6f)", symbol, res11["s"])
+            singularidad_signo = res11["signo"]
+            log.info("%s aprobó [Paso 11]: singularidad %s en 15m (S=%.6f)", symbol, singularidad_signo, res11["s"])
             singularidad_15m = True
         else:
             log.info("%s no aprobó %s -> continúa al Paso 12 (5m)", symbol, res11["reason"])
             singularidad_15m = False
 
+        # Paso 12 (5m): igual, con su PROPIA vela roja del máximo en 5m
+        # (independiente de la de 15m). Solo corre si el Paso 11 no dio
+        # ninguna singularidad (ni positiva ni negativa).
         if not singularidad_15m:
-            ok12, res12 = check_step_12_singularidad_5m(
-                info_5m["rsi6"], info_5m["rsi12"], info_5m["wr6"], info_5m["wr12"], es_verde_1h
+            ok12, res12 = _evaluate_singularidad_tf(
+                df_5m, "5m", 12, check_step_12_singularidad_5m,
+                window_start_ts, window_end_ts, expected_max_high, es_verde_1h,
             )
             if ok12:
-                log.info("%s aprobó [Paso 12]: singularidad en 5m (S=%.6f)", symbol, res12["s"])
+                singularidad_signo = res12["signo"]
+                log.info("%s aprobó [Paso 12]: singularidad %s en 5m (S=%.6f)", symbol, singularidad_signo, res12["s"])
                 singularidad_5m = True
             else:
                 log.info("%s descartado en %s (ya falló también en Paso 11)", symbol, res12["reason"])
@@ -1100,21 +1085,33 @@ async def evaluate_symbol(exchange, symbol: str):
         else:
             singularidad_5m = False
 
-        max_idx_5m = info_5m["idx"]
+        direccion = "SHORT" if singularidad_signo == "positiva" else "LONG"
+
+        # Vela del máximo en 5m (cualquier color) para max_high_5m/SMA20(5m).
+        max_idx_5m = _find_max_candle_in_window(df_5m, window_start_ts, window_end_ts)
+        if max_idx_5m is None:
+            log.info("%s descartado en [Paso 13]: sin velas de 5m en la ventana del máximo.", symbol)
+            return None, 12
         max_high_5m = float(df_5m["high"].iloc[max_idx_5m])
+
+        # EMA200(5m) de la última vela cerrada: stop loss de la entrada LONG.
+        ema200_5m_value = float(ema(df_5m["close"], 200).iloc[-1])
 
         close_5m = df_5m["close"]
         ma20_5m = sma(close_5m, 20)
         ma20_5m_value = float(ma20_5m.iloc[max_idx_5m])
 
         log.info(
-            "%s [Paso 13] Datos preparados para calcular apalancamiento en la ejecución: "
-            "max_high_5m=%.8f | ma20_5m_value=%.8f | es_maximo_round=%s",
-            symbol, max_high_5m, ma20_5m_value, es_maximo_round,
+            "%s [Paso 13] Datos preparados para la ejecución: dirección=%s (singularidad %s) | "
+            "max_high_5m=%.8f | ma20_5m_value=%.8f | ema200_5m_value=%.8f | es_maximo_round=%s",
+            symbol, direccion, singularidad_signo, max_high_5m, ma20_5m_value, ema200_5m_value, es_maximo_round,
         )
 
         plan = {
             "symbol": symbol,
+            "direccion": direccion,
+            "singularidad_signo": singularidad_signo,
+            "ema200_5m_value": ema200_5m_value,
             "ma20_5m_value": ma20_5m_value,
             "max_high_5m": max_high_5m,
             "round_start_ts": round_start_ts,
