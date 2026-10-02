@@ -55,12 +55,13 @@ jobs:
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
           BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
-          # El cron interno (schedule) SOLO gestiona TP (Paso 1) de la
-          # cuenta SHORT. Cualquier otro disparador corre el bot completo.
+          # El cron interno (schedule) SOLO gestiona TP (Paso 1) de las
+          # posiciones abiertas (cuentas short y long). Cualquier otro
+          # disparador corre el bot completo.
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
           # Barrido de balance futuros -> fondos: SOLO en disparador EXTERNO.
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # Gatillo de Stop Loss (toque de EMA50(1h) del SHORT): SOLO en
+          # Gatillo de Stop Loss (toque de EMA50(1h)): SOLO en
           # disparador EXTERNO. El Take Profit no depende de esta variable.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
@@ -73,7 +74,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
+          grep -E "Market entry executed|STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even.*colocado|Stop Loss LONG colocado|POSICIÓN LONG ABIERTA SIN STOP LOSS|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
