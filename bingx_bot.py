@@ -49,10 +49,10 @@ import pandas as pd
 import ccxt.async_support as ccxt
 
 from entries import short_strategy as strat_short
-# TEMPORAL: la estrategia LONG "clásica" (long_strategy.py) queda
-# DESACTIVADA. Para reactivarla: descomentar este import y poner
-# LONG_STRATEGY_ENABLED = True más abajo.
-# import long_strategy as strat_long
+# Estrategia LONG (entries/long_strategy.py): espejo invertido del short.
+# Singularidad positiva -> LONG (mercado o STOP en la SMA20(5m)).
+# Singularidad negativa -> SHORT a mercado con SL en la EMA200(5m).
+from entries import long_strategy as strat_long
 from utils.indicators import sma, ema
 
 logging.basicConfig(
@@ -61,7 +61,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bingx_bot")
 
-LONG_STRATEGY_ENABLED = False
+LONG_STRATEGY_ENABLED = True
 
 # ----------------------------------------------------------------------
 # Configuración PASO 1 (gestión de TP/SL) -- SOLO para exchange_short.
@@ -76,12 +76,13 @@ OHLCV_LIMIT_TP = 1000
 EMA_WARMUP_CANDLES = 400
 OHLCV_FETCH_LIMIT_TP = OHLCV_LIMIT_TP + EMA_WARMUP_CANDLES  # 1400, bajo el máximo de 1440 por petición de BingX
 
-# El Paso 1 (TP en EMA200(1h), SL break even en EMA50(1h)) está pensado
-# para posiciones SHORT. Las posiciones LONG de la singularidad negativa
-# ya llevan su propio Stop Loss en la EMA200(5m), así que por defecto el
-# Paso 1 las IGNORA (un TP en la EMA200(1h) quedaría por debajo del
-# precio y cerraría el LONG de inmediato). Poner True para gestionarlas.
-PASO1_MANAGE_LONGS = False
+# El Paso 1 gestiona SHORT y LONG normales (los de la estrategia long, que
+# entran con singularidad positiva, no llevan SL propio). Las posiciones
+# de singularidad NEGATIVA (LONG del short_strategy y SHORT del
+# long_strategy) ya llevan su propio Stop Loss STOP_MARKET en la
+# EMA200(5m): el Paso 1 detecta esa orden abierta y las IGNORA (un TP en
+# la EMA200(1h) podria quedar del lado equivocado del precio).
+PASO1_MANAGE_LONGS = True
 
 
 def _env_flag(name: str, default: str = "false") -> bool:
@@ -364,7 +365,15 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_l
     """
     symbol = position["symbol"]
     if position.get("side") == "long" and not PASO1_MANAGE_LONGS:
-        log.info("%s: posición LONG, se omite el Paso 1 (su Stop Loss ya está en la EMA200(5m)).", symbol)
+        log.info("%s: posición LONG, se omite el Paso 1 (PASO1_MANAGE_LONGS=False).", symbol)
+        return
+    own_position_side = "LONG" if position.get("side") == "long" else "SHORT"
+    if await _symbol_has_open_order(exchange, symbol, "STOP_MARKET", own_position_side):
+        log.info(
+            "%s: posición %s con Stop Loss propio en la EMA200(5m) (singularidad negativa), "
+            "se omite el Paso 1.",
+            symbol, own_position_side,
+        )
         return
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_FETCH_LIMIT_TP)
@@ -766,6 +775,272 @@ async def execute_long_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         )
 
 
+async def execute_entry_long(exchange: "ccxt.bingx", plan: dict) -> None:
+    """
+    LONG de la estrategia long (singularidad POSITIVA) en `exchange`
+    (exchange_long). Espejo de execute_entry() (SHORT):
+      - Si el precio YA tocó/cruzó la SMA20(5m) desde abajo
+        (last_price >= SMA20(5m)) -> entrada a MERCADO; la distancia del
+        apalancamiento usa el precio actual.
+      - Si todavía no la ha tocado -> orden STOP (stop-limit) tipo buy en
+        la SMA20(5m); la distancia usa la SMA20(5m).
+    Margen FIJO (strat_long.FIXED_MARGIN_USDT = 100), no el 10% de la cuenta.
+    Si es_minimo_round=False no se opera nada.
+    """
+    symbol = plan["symbol"]
+    min_low_5m = plan["min_low_5m"]
+    ma20_5m_value = plan["ma20_5m_value"]
+    es_minimo_round = plan.get("es_minimo_round", True)
+
+    market = exchange.markets.get(symbol, {})
+    if _looks_like_forex_or_cfd(market):
+        log.error("%s: BLOQUEADO -- parece ser forex/CFD/índice/acción sintética. No se ejecuta el LONG.", symbol)
+        return
+
+    if not es_minimo_round:
+        log.info("%s [Paso 13][LONG] es_minimo_round=False -> no se opera nada.", symbol)
+        return
+
+    try:
+        ticker = await exchange.fetch_ticker(symbol)
+        last_price = ticker.get("last")
+        if last_price is None:
+            log.error("%s [LONG]: no se pudo obtener el precio actual, se omite la entrada.", symbol)
+            return
+        last_price = float(last_price)
+
+        touched = last_price >= ma20_5m_value
+
+        if touched:
+            reference_price = last_price
+            log.info(
+                "%s [Paso 13][LONG] Entrada será a MERCADO -> distancia usa el precio actual=%.8f (no la SMA20)",
+                symbol, reference_price,
+            )
+        else:
+            reference_price = ma20_5m_value
+            log.info(
+                "%s [Paso 13][LONG] Entrada será STOP -> distancia usa la SMA20(5m)=%.8f",
+                symbol, reference_price,
+            )
+
+        try:
+            leverage_calc = strat_long.calculate_leverage(min_low_5m, reference_price)
+        except ValueError as exc:
+            log.info("%s descartado en [Paso 13][LONG]: %s", symbol, exc)
+            return
+
+        max_leverage_exchange = await strat_long.get_max_leverage_for_symbol(exchange, symbol)
+        if max_leverage_exchange is not None:
+            leverage_wanted = min(int(leverage_calc), max_leverage_exchange)
+        else:
+            leverage_wanted = int(leverage_calc)
+            log.warning(
+                "%s [LONG]: no se pudo confirmar el apalancamiento máximo real del exchange; "
+                "se usará el calculado (%dx) sin capar.",
+                symbol, leverage_wanted,
+            )
+
+        await exchange.set_margin_mode("isolated", symbol)
+
+        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage_wanted, side="LONG")
+        if leverage is None:
+            log.error("%s [LONG]: no se pudo configurar el apalancamiento, se omite la entrada.", symbol)
+            return
+
+        margin_usdt = await strat_long.calculate_position_size_fixed(exchange, symbol, leverage)
+        if margin_usdt <= 0:
+            log.info("%s descartado en [Paso 13][LONG]: margen calculado <= 0", symbol)
+            return
+
+        log.info(
+            "%s aprobó [Paso 13][LONG]: apalancamiento=%dx (calculado=%.1fx, máx. exchange=%s) | margen=%.2f USDT",
+            symbol, leverage, leverage_calc,
+            f"{max_leverage_exchange}x" if max_leverage_exchange is not None else "desconocido",
+            margin_usdt,
+        )
+
+        amount = (margin_usdt * leverage) / last_price
+
+        if touched:
+            order = await _create_order_with_notional_cap_retry(
+                exchange, symbol, "market", "buy", amount, None,
+                {"positionSide": "LONG"}, last_price,
+            )
+            log.info(
+                "[Paso 14][LONG] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                symbol, margin_usdt, leverage, order.get("id"),
+            )
+        else:
+            order = await _create_order_with_notional_cap_retry(
+                exchange, symbol, "STOP", "buy", amount, ma20_5m_value,
+                {"stopPrice": ma20_5m_value, "positionSide": "LONG"}, last_price,
+            )
+            log.info(
+                "[Paso 14][LONG] Long STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+                ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"),
+            )
+
+    except Exception as exc:
+        log.error("Error ejecutando entrada LONG (estrategia long) para %s: %s", symbol, exc)
+
+
+async def execute_short_entry_negativa(exchange: "ccxt.bingx", plan: dict) -> None:
+    """
+    SHORT por SINGULARIDAD NEGATIVA (S < 0) de la estrategia long --
+    entrada a MERCADO en `exchange` (exchange_short) con Stop Loss en la
+    EMA200(5m). Espejo exacto de execute_long_entry().
+
+    Apalancamiento: misma fórmula, midiendo la distancia entre el precio
+    de entrada y el Stop Loss. Margen FIJO (strat_long.FIXED_MARGIN_USDT).
+    """
+    symbol = plan["symbol"]
+    sl_price = plan["ema200_5m_value"]
+    es_minimo_round = plan.get("es_minimo_round", True)
+
+    market = exchange.markets.get(symbol, {})
+    if _looks_like_forex_or_cfd(market):
+        log.error("%s: BLOQUEADO -- parece ser forex/CFD/índice/acción sintética. No se ejecuta el SHORT.", symbol)
+        return
+
+    if not es_minimo_round:
+        log.info("%s [Paso 13][SHORT-NEG] es_minimo_round=False -> no se opera nada.", symbol)
+        return
+
+    try:
+        ticker = await exchange.fetch_ticker(symbol)
+        last_price = ticker.get("last")
+        if last_price is None:
+            log.error("%s [SHORT-NEG]: no se pudo obtener el precio actual, se omite la entrada.", symbol)
+            return
+        last_price = float(last_price)
+
+        if sl_price <= last_price:
+            log.info(
+                "%s descartado en [Paso 13][SHORT-NEG]: EMA200(5m)=%.8f está por debajo del precio actual=%.8f, "
+                "el Stop Loss quedaría inválido.",
+                symbol, sl_price, last_price,
+            )
+            return
+
+        try:
+            leverage_calc = strat_short.calculate_leverage(sl_price, last_price)
+        except ValueError as exc:
+            log.info("%s descartado en [Paso 13][SHORT-NEG]: %s", symbol, exc)
+            return
+
+        max_leverage_exchange = await strat_short.get_max_leverage_for_symbol(exchange, symbol)
+        if max_leverage_exchange is not None:
+            leverage_wanted = min(int(leverage_calc), max_leverage_exchange)
+        else:
+            leverage_wanted = int(leverage_calc)
+
+        await exchange.set_margin_mode("isolated", symbol)
+
+        leverage = await _set_leverage_with_cap_retry(exchange, symbol, leverage_wanted, side="SHORT")
+        if leverage is None:
+            log.error("%s [SHORT-NEG]: no se pudo configurar el apalancamiento, se omite la entrada.", symbol)
+            return
+
+        margin_usdt = await strat_long.calculate_position_size_fixed(exchange, symbol, leverage)
+        if margin_usdt <= 0:
+            log.info("%s descartado en [Paso 13][SHORT-NEG]: margen calculado <= 0", symbol)
+            return
+
+        log.info(
+            "%s aprobó [Paso 13][SHORT-NEG]: apalancamiento=%dx (calculado=%.1fx) | margen=%.2f USDT | SL=EMA200(5m)=%.8f",
+            symbol, leverage, leverage_calc, margin_usdt, sl_price,
+        )
+
+        amount = (margin_usdt * leverage) / last_price
+        order = await _create_order_with_notional_cap_retry(
+            exchange, symbol, "market", "sell", amount, None,
+            {"positionSide": "SHORT"}, last_price,
+        )
+        log.info(
+            "[Paso 14][SHORT-NEG] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s",
+            symbol, margin_usdt, leverage, order.get("id"),
+        )
+    except Exception as exc:
+        log.error("Error ejecutando entrada SHORT (singularidad negativa) para %s: %s", symbol, exc)
+        return
+
+    # Stop Loss en la EMA200(5m), en un bloque aparte: si la entrada ya se
+    # ejecutó y esto falla, hay que verlo claramente en el log.
+    try:
+        sl_amount = float(order.get("filled") or order.get("amount") or amount)
+        sl_order = await exchange.create_order(
+            symbol, "STOP_MARKET", "buy", sl_amount, None,
+            {"stopPrice": sl_price, "positionSide": "SHORT", "workingType": "CONTRACT_PRICE"},
+        )
+        log.info(
+            "Stop Loss SHORT colocado (EMA200(5m)): %s | SL=%.8f | orden_id=%s",
+            symbol, sl_price, sl_order.get("id"),
+        )
+    except Exception as exc:
+        log.error(
+            "%s: ¡POSICIÓN SHORT ABIERTA SIN STOP LOSS! No se pudo colocar el SL en la EMA200(5m)=%.8f: %s",
+            symbol, sl_price, exc,
+        )
+
+
+async def run_pasos_2_a_14_entradas_long(
+    exchange: "ccxt.bingx",
+    market_exchange: "ccxt.bingx",
+    allowed_symbols: set[str],
+    symbols_with_position: set[str],
+    exchange_short: "ccxt.bingx" = None,
+) -> None:
+    """
+    LONG -- escanea los pares permitidos sin posición abierta (en
+    cualquiera de las dos cuentas) con `long_strategy`.
+    Singularidad positiva -> LONG en `exchange` (exchange_long).
+    Singularidad negativa -> SHORT a mercado en `exchange_short`.
+    """
+    candidatos = [s for s in allowed_symbols if s not in symbols_with_position]
+    log.info("[Pasos 2-14][LONG] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
+
+    semaphore = asyncio.Semaphore(10)
+
+    async def _bounded_eval(symbol):
+        async with semaphore:
+            return await strat_long.evaluate_symbol(market_exchange, symbol)
+
+    results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
+
+    plans = [plan for plan, _fs in results if plan is not None]
+
+    rejection_counts: dict = {}
+    for _plan, failed_step in results:
+        if failed_step is not None:
+            rejection_counts[failed_step] = rejection_counts.get(failed_step, 0) + 1
+
+    if rejection_counts:
+        resumen = ", ".join(
+            f"Paso {paso}: {count}"
+            for paso, count in sorted(rejection_counts.items(), key=lambda x: str(x[0]))
+        )
+        log.info("[Pasos 2-14][LONG] Resumen de descartes por paso -> %s", resumen)
+
+    log.info("[Pasos 2-14][LONG] Pares que cumplen TODAS las condiciones: %d", len(plans))
+    for plan in plans:
+        log.info(
+            "  -> %s %s (singularidad %s) | mínimo(5m)=%.8f | SMA20(5m)=%.8f | EMA200(5m)=%.8f | es_minimo_round=%s",
+            plan.get("direccion", "LONG"), plan["symbol"], plan.get("singularidad_signo"),
+            plan["min_low_5m"], plan["ma20_5m_value"], plan.get("ema200_5m_value", float("nan")),
+            plan.get("es_minimo_round"),
+        )
+
+    for plan in plans:
+        if plan.get("direccion") == "SHORT":
+            if exchange_short is None:
+                log.error("%s: plan SHORT sin exchange_short disponible, se omite.", plan["symbol"])
+                continue
+            await execute_short_entry_negativa(exchange_short, plan)
+        else:
+            await execute_entry_long(exchange, plan)
+
+
 async def run_pasos_2_a_14_entradas(
     exchange: "ccxt.bingx",
     market_exchange: "ccxt.bingx",
@@ -1011,7 +1286,7 @@ async def main() -> None:
                 run_pasos_2_a_14_entradas(exchange_short, market_exchange, allowed_symbols, symbols_with_position_any, exchange_long),
             ]
             if LONG_STRATEGY_ENABLED:
-                tasks.append(run_pasos_2_a_14_entradas_long(exchange_long, market_exchange, allowed_symbols, symbols_with_position_long))
+                tasks.append(run_pasos_2_a_14_entradas_long(exchange_long, market_exchange, allowed_symbols, symbols_with_position_any, exchange_short))
             await asyncio.gather(*tasks)
 
             # BARRIDO DE BALANCE (futuros -> fondos): por separado para
