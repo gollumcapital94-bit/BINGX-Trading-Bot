@@ -101,6 +101,9 @@ log = logging.getLogger("bingx_bot.short_strategy")
 RSI_OVERBOUGHT = 90
 MIN_VOLUME_24H_USDT = 2_000_000
 MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (Paso 13)
+# LONG por singularidad negativa (en pruebas): margen FIJO en vez del 10%
+# de la cuenta. 100 VST en demo / 100 USDT en real (mismo número).
+LONG_FIXED_MARGIN_USDT = 100.0
 LEVERAGE_BASE = 80  # numerador de la fórmula de apalancamiento (antes 90)
 LEVERAGE_ROUND_STEP = 5  # redondeo por defecto a múltiplos de 5
 
@@ -926,6 +929,24 @@ async def calculate_position_size(exchange, symbol: str, leverage: int) -> float
     max_margin_by_leverage = max_notional / leverage if leverage else max_notional
 
     return min(margin_20pct, max_margin_by_leverage)
+
+
+async def calculate_position_size_fixed(
+    exchange, symbol: str, leverage: int, fixed_margin: float = LONG_FIXED_MARGIN_USDT,
+) -> float:
+    """
+    Margen FIJO (`fixed_margin`, por defecto 100 VST/USDT) en vez del 10%
+    del balance. Se usa en el LONG por singularidad negativa mientras se
+    prueba la estrategia.
+
+    Igual que calculate_position_size(), respeta el límite real de
+    notional/apalancamiento de BingX: si ese límite permite MENOS que
+    `fixed_margin` para el par, se usa el límite menor.
+    """
+    max_notional = await get_max_notional_for_leverage(exchange, symbol, leverage)
+    max_margin_by_leverage = max_notional / leverage if leverage else max_notional
+
+    return min(fixed_margin, max_margin_by_leverage)
 
 
 # ----------------------------------------------------------------------
