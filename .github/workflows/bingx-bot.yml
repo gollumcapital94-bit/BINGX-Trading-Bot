@@ -1,4 +1,4 @@
-name: BingX Trading Bot - Pasos 1 a 14
+name: Bot Execution
 
 on:
   repository_dispatch:
@@ -18,7 +18,7 @@ on:
   schedule:
     # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE a la gestión de
     # TP (Paso 1) -- ver BOT_MODE más abajo. Corre CADA HORA. NUNCA
-    # escanea ni abre nuevas entradas SHORT.
+    # escanea ni abre nuevas entradas.
     #
     # El Stop Loss (Gatillo 2 del Paso 1) NO se ejecuta desde este
     # disparador porque schedule no es puntual -- ver RUN_STOP_LOSS_CHECK.
