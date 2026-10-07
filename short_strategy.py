@@ -24,10 +24,20 @@ SUPUESTOS (confirmados con el usuario):
   - MA20 -> SMA20; EMA50/EMA200 -> exponenciales.
   - "Máximo" (round, 15m, 5m) -> HIGH (mecha) de la vela.
   - Apalancamiento calculado limitado al máximo real de BingX para el par.
-  - Paso 10: si no se encuentra evidencia de retroceso dentro de las
-    1200 velas de 4h, se aprueba. Patrón A (SMA20(4h) <= EMA50(4h) con
-    ambas aún sobre la EMA200(4h)) = retroceso DENTRO del ciclo alcista:
-    se APRUEBA. Solo B y "otro" (alguna perdió la EMA200) fallan el Paso 10.
+  - PASO 10 (ciclo alcista en 4h), regla vigente:
+      * SMA20(4h) y EMA50(4h) ambas sobre la EMA200(4h) y SMA20 > EMA50
+        -> ciclo alcista, se APRUEBA sin más condiciones (ya NO existe el
+        chequeo de "retroceso" que descartaba pares sanos como MAGIC).
+      * SMA20 <= EMA50 con ambas sobre la EMA200 (patrón A) -> se APRUEBA.
+      * Patrón B (SMA20 bajo la EMA200, EMA50 sobre ella) u "otro" (alguna
+        perdió la EMA200) -> falla el Paso 10 (LONG invertido si
+        PASO10_INVERTIR_SI_FALLA).
+      * Secuencia B -> A: cuando en la racha actual de la EMA50 sobre la
+        EMA200 se dio un patrón B y después un patrón A, y la SMA20 se
+        recompone (SMA20 > EMA50, ambas sobre la EMA200), se considera que
+        arrancó un ciclo alcista nuevo -> SHORT. Hoy esto coincide con la
+        regla general de arriba; se detecta y se registra en el log
+        ("secuencia_B_luego_A") para poder verificarlo en las pruebas.
   - Pasos 7/8, CHEQUEO DE BORDES de W%R: W%R6/12/24 distintos entre sí
     en la vela roja del máximo (descarta siempre si falla); además, en
     la vela inmediatamente anterior: si es VERDE se le exige lo mismo
@@ -402,36 +412,8 @@ async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_li
 # ----------------------------------------------------------------------
 # Paso 10: SMA20/EMA50/EMA200 en 4H (ciclo alcista)
 # ----------------------------------------------------------------------
-def _find_last_cross_up_index(fast: pd.Series, slow: pd.Series, idx_max: int):
-    """Cruce MÁS RECIENTE de `fast` sobre `slow` hacia arriba, buscando hacia atrás."""
-    i = idx_max
-    while i > 0:
-        crossed_now = fast.iloc[i] > slow.iloc[i]
-        was_below_or_eq = fast.iloc[i - 1] <= slow.iloc[i - 1]
-        if crossed_now and was_below_or_eq:
-            return i
-        i -= 1
-    return None
-
-
-def _find_cycle_start_index(sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h: pd.Series, idx_max: int):
-    """
-    Inicio del ciclo alcista ACTUAL (4h): el más reciente entre
-      1) SMA20 cruzando hacia arriba la EMA50, y
-      2) EMA50 cruzando hacia arriba la EMA200.
-    None si no se encuentra ninguno.
-    """
-    a = _find_last_cross_up_index(sma20_4h, ema50_4h, idx_max)
-    b = _find_last_cross_up_index(ema50_4h, ema200_4h, idx_max)
-
-    candidates = [i for i in (a, b) if i is not None]
-    if not candidates:
-        return None
-    return max(candidates)
-
-
 def _classify_fin_ciclo_alcista(sma20_value: float, ema50_value: float, ema200_value: float) -> str:
-    """Solo diagnóstico (cuando SMA20(4h) <= EMA50(4h))."""
+    """Se usa cuando SMA20(4h) <= EMA50(4h)."""
     if ema50_value > ema200_value and sma20_value > ema200_value:
         return "A"
     if ema50_value > ema200_value and sma20_value <= ema200_value:
@@ -439,48 +421,38 @@ def _classify_fin_ciclo_alcista(sma20_value: float, ema50_value: float, ema200_v
     return "otro"
 
 
-def _check_retroceso_ciclo_alcista(sma20_4h: pd.Series, ema50_4h: pd.Series, ema200_4h: pd.Series):
+def _detectar_secuencia_B_luego_A(sma20: pd.Series, ema50: pd.Series, ema200: pd.Series):
     """
-    Devuelve (ok, info). ok=False si el ciclo alcista actual se reinició
-    después de que la SMA20 ya había cruzado sobre la EMA200 en un ciclo
-    anterior (retroceso).
+    Dentro de la racha ACTUAL de la EMA50 sobre la EMA200, busca un patrón B
+    (SMA20 <= EMA200 con la EMA50 sobre la EMA200) y, DESPUÉS, un patrón A
+    (SMA20 <= EMA50 con ambas sobre la EMA200).
+    Devuelve (encontrada, idx_B, idx_A). Solo diagnóstico: la decisión del
+    Paso 10 no depende de esto (ver docstring del módulo).
     """
-    last_idx = len(sma20_4h) - 1
+    ema50_sobre = (ema50 > ema200).to_numpy()
+    if not len(ema50_sobre) or not bool(ema50_sobre[-1]):
+        return False, None, None
 
-    cycle_start_idx = _find_cycle_start_index(sma20_4h, ema50_4h, ema200_4h, last_idx)
+    no_sobre = np.flatnonzero(~ema50_sobre)
+    start = int(no_sobre[-1]) + 1 if len(no_sobre) else 0
 
-    if cycle_start_idx is None:
-        return True, {
-            "cycle_start_found": False,
-            "note": (
-                "Ni la SMA20(4h) cruzó la EMA50(4h) ni la EMA50(4h) cruzó la EMA200(4h) "
-                "dentro de la ventana consultada -- sin evidencia de ningún reinicio de "
-                "ciclo ni de ningún retroceso, se aprueba por defecto"
-            ),
-        }
+    s20 = sma20.to_numpy()
+    e50 = ema50.to_numpy()
+    e200 = ema200.to_numpy()
 
-    ema200_cross_idx = _find_last_cross_up_index(sma20_4h, ema200_4h, last_idx)
+    idx_b = None
+    for i in range(start, len(s20)):
+        if np.isnan(s20[i]):
+            continue
+        es_b = e50[i] > e200[i] and s20[i] <= e200[i]
+        es_a = s20[i] <= e50[i] and s20[i] > e200[i] and e50[i] > e200[i]
+        if idx_b is None:
+            if es_b:
+                idx_b = i
+        elif es_a:
+            return True, idx_b, i
 
-    if ema200_cross_idx is not None and ema200_cross_idx >= cycle_start_idx:
-        return True, {
-            "cycle_start_found": True,
-            "cycle_start_idx": cycle_start_idx,
-            "ema200_cross_idx": ema200_cross_idx,
-        }
-
-    return False, {
-        "cycle_start_found": True,
-        "cycle_start_idx": cycle_start_idx,
-        "ema200_cross_idx": ema200_cross_idx,
-        "reason": (
-            f"[Paso 10] Retroceso detectado -- el ciclo alcista actual se reinició en "
-            f"la vela idx={cycle_start_idx} (cruce SMA20->EMA50 o EMA50 recuperando la "
-            f"EMA200, ver _find_cycle_start_index), después de que la SMA20(4h) ya "
-            f"había cruzado sobre la EMA200(4h) en un ciclo anterior. El ciclo alcista "
-            f"actual todavía no ha confirmado un cruce propio y limpio de la SMA20 "
-            f"sobre la EMA200(4h) -- se descarta"
-        ),
-    }
+    return False, idx_b, None
 
 
 async def check_step_10(exchange, symbol: str):
@@ -511,12 +483,23 @@ async def check_step_10(exchange, symbol: str):
 
     base_info = {"sma20_4h": sma20_value, "ema50_4h": ema50_value, "ema200_4h": ema200_value}
 
+    # --- Secuencia B -> A en la racha actual (diagnóstico para pruebas) ---
+    seq_ok, idx_b, idx_a = _detectar_secuencia_B_luego_A(sma20_4h, ema50_4h, ema200_4h)
+    base_info["secuencia_B_luego_A"] = seq_ok
+    if seq_ok:
+        log.info(
+            "%s [Paso 10] Secuencia detectada en 4h: patrón B (idx=%d) y luego patrón A (idx=%d) "
+            "dentro de la racha actual de la EMA50 sobre la EMA200.",
+            symbol, idx_b, idx_a,
+        )
+
+    # --- SMA20 <= EMA50: puede ser patrón A (se aprueba) o B/otro (falla) ---
     if sma20_value <= ema50_value:
         fin_patron = _classify_fin_ciclo_alcista(sma20_value, ema50_value, ema200_value)
+
         if fin_patron == "A":
-            # Retroceso DENTRO del ciclo alcista: la SMA20(4h) bajó de la EMA50(4h)
-            # pero ninguna de las dos ha perdido la EMA200(4h) -> el ciclo sigue
-            # vivo, se APRUEBA (entra SHORT, no LONG invertido).
+            # Retroceso DENTRO del ciclo alcista: ninguna de las dos perdió la
+            # EMA200(4h) -> el ciclo sigue vivo, se APRUEBA (entra SHORT).
             log.info(
                 "%s [Paso 10] Patrón A (retroceso dentro del ciclo alcista): SMA20(4h)=%.8f <= "
                 "EMA50(4h)=%.8f pero ambas sobre la EMA200(4h)=%.8f -> se APRUEBA como ciclo alcista.",
@@ -524,12 +507,7 @@ async def check_step_10(exchange, symbol: str):
             )
             return True, {**base_info, "patron_A_retroceso": True}
 
-        if fin_patron == "A":
-            detalle_patron = (
-                "Patrón A de fin de ciclo alcista, en 4h: la SMA20(4h) cayó por debajo de "
-                "la EMA50(4h) mientras ambas siguen por encima de la EMA200(4h) (sin tocarla)."
-            )
-        elif fin_patron == "B":
+        if fin_patron == "B":
             detalle_patron = (
                 "Patrón B de fin de ciclo alcista, en 4h (retroceso profundo): la "
                 "SMA20(4h) cayó por debajo de la EMA50(4h) Y también por debajo de la "
@@ -551,24 +529,38 @@ async def check_step_10(exchange, symbol: str):
             **base_info,
         }
 
+    # --- SMA20 > EMA50 ---
     both_above_ema200 = sma20_value > ema200_value and ema50_value > ema200_value
 
     if both_above_ema200:
-        ok_no_dip, dip_info = _check_retroceso_ciclo_alcista(sma20_4h, ema50_4h, ema200_4h)
-        if not ok_no_dip:
-            log.info("%s descartado en %s", symbol, dip_info["reason"])
-            return False, {"reason": dip_info["reason"], "failed_step": 10, **base_info}
-        if dip_info.get("cycle_start_found"):
+        # Ciclo alcista confirmado: ambas sobre la EMA200 y SMA20 > EMA50.
+        # Sin chequeo de "retroceso" (corregido: descartaba pares sanos).
+        not_both = ((sma20_4h <= ema200_4h) | (ema50_4h <= ema200_4h)).to_numpy()
+        idx_last_not_both = np.flatnonzero(not_both)
+        if len(idx_last_not_both):
+            velas = len(sma20_4h) - 1 - int(idx_last_not_both[-1])
             log.info(
-                "%s [Paso 10] Chequeo de retroceso OK: el ciclo alcista actual empezó en la "
-                "vela idx=%d y el cruce de la SMA20(4h) sobre la EMA200(4h) (vela idx=%s) "
-                "ocurrió dentro de ese mismo ciclo -- sin retroceso.",
-                symbol, dip_info["cycle_start_idx"], dip_info.get("ema200_cross_idx"),
+                "%s [Paso 10] Ciclo alcista 4h confirmado: ambas sobre la EMA200 desde hace %d velas%s.",
+                symbol, velas,
+                " (ciclo recompuesto tras secuencia B -> A)" if seq_ok else "",
             )
         else:
-            log.info("%s [Paso 10] Chequeo de retroceso: %s", symbol, dip_info["note"])
+            log.info(
+                "%s [Paso 10] Ciclo alcista 4h: ambas sobre la EMA200 en toda la ventana.", symbol,
+            )
+        return True, base_info
 
-    return True, base_info
+    # SMA20 > EMA50 pero alguna de las dos NO está sobre la EMA200:
+    # no es ciclo alcista (se mantiene el comportamiento original: aprueba
+    # solo si ambas están sobre la EMA200 o es patrón A).
+    return False, {
+        "reason": (
+            f"[Paso 10] SMA20(4h)={sma20_value:.8f} > EMA50(4h)={ema50_value:.8f} pero "
+            f"no están ambas sobre la EMA200(4h)={ema200_value:.8f} -> fuera de ciclo alcista"
+        ),
+        "failed_step": 10,
+        **base_info,
+    }
 
 
 # ----------------------------------------------------------------------
