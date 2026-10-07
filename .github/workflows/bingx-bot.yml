@@ -16,16 +16,16 @@ on:
         type: boolean
         default: true
   schedule:
-    # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE a la gestión de
-    # TP (Paso 1) -- ver BOT_MODE más abajo. Corre CADA HORA. NUNCA
-    # escanea ni abre nuevas entradas.
-    #
-    # El Stop Loss (Gatillo 2 del Paso 1) NO se ejecuta desde este
-    # disparador porque schedule no es puntual -- ver RUN_STOP_LOSS_CHECK.
+    # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE al Paso 1 -- ver
+    # BOT_MODE más abajo. Corre CADA HORA. NUNCA escanea ni abre nuevas
+    # entradas. Es el ÚNICO disparador que revisa el Stop Loss en break
+    # even del LONG (RUN_LONG_SL_TRACKING). Como schedule no es puntual, el
+    # Stop Loss del SHORT (toque de EMA50(1h)) NO se ejecuta desde aquí --
+    # ver RUN_STOP_LOSS_CHECK.
     - cron: "0 * * * *"
 
 permissions:
-  contents: read
+  contents: write  # necesario para guardar los JSON de seguimiento del long en json/
 
 jobs:
   run-bot:
@@ -64,9 +64,25 @@ jobs:
           # Gatillo de Stop Loss (toque de EMA50(1h)): SOLO en
           # disparador EXTERNO. El Take Profit no depende de esta variable.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
+          # Seguimiento del Stop Loss en break even del LONG (se coloca al
+          # romper el precio el máximo): SOLO en disparador INTERNO (schedule).
+          # El seguimiento del Take Profit del long corre en TODOS los disparadores.
+          RUN_LONG_SL_TRACKING: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
         run: |
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
+
+      - name: Guardar seguimiento del long (JSON)
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain json/)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add json/long_take_profit_tracking.json json/long_stop_loss_tracking.json
+            git commit -m "chore: actualizar seguimiento del long [skip ci]"
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push || echo "No se pudo hacer push del registro"
+          fi
 
       - name: Enviar señales a Telegram
         if: always()
@@ -74,7 +90,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|STOP-LIMIT order placed|Take Profit colocado|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
+          grep -E "Market entry executed|STOP-LIMIT order placed|Long LIMIT order placed|Orden LIMIT cancelada|Take Profit colocado|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
