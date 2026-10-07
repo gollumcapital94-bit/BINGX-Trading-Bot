@@ -11,6 +11,10 @@ fuera del ciclo alcista de 4h (Paso 10), el LONG INVERTIDO a mercado.
 La ejecución (Paso 14) vive en bingx_bot.execute_entry() y
 bingx_bot.execute_entry_invertida().
 
+El plan incluye ademas sma20_1h y ema200_1h (vela 1h cerrada del maximo):
+el LONG invertido las usa para calcular su Take Profit (distancia %
+SMA20(1h)->EMA200(1h) proyectada hacia arriba desde la entrada).
+
 SOLO SINGULARIDAD POSITIVA: S > 0 -> entrada. Si S <= 0 (o indefinida) en
 15m se intenta en 5m; si tampoco, se descarta.
 
@@ -902,11 +906,17 @@ async def evaluate_symbol(exchange, symbol: str):
         ma20_5m = sma(df_5m["close"], 20)
         ma20_5m_value = float(ma20_5m.iloc[max_idx_5m])
 
+        # SMA20(1h) y EMA200(1h) en la vela 1h cerrada del máximo: base del
+        # Take Profit del LONG invertido (distancia % SMA20 -> EMA200).
+        sma20_1h = float(sma(df_1h["close"], 20).iloc[last_idx])
+        ema200_1h = float(ema(df_1h["close"], 200).iloc[last_idx])
+
         log.info(
             "%s [Paso 13] Datos preparados para la ejecución: %s | "
-            "max_high_5m=%.8f | ma20_5m_value=%.8f | es_maximo_round=%s",
+            "max_high_5m=%.8f | ma20_5m_value=%.8f | es_maximo_round=%s | "
+            "SMA20(1h)=%.8f | EMA200(1h)=%.8f",
             symbol, "LONG (invertido, fuera de ciclo 4h)" if fuera_ciclo_4h else "SHORT",
-            max_high_5m, ma20_5m_value, es_maximo_round,
+            max_high_5m, ma20_5m_value, es_maximo_round, sma20_1h, ema200_1h,
         )
 
         plan = {
@@ -923,6 +933,8 @@ async def evaluate_symbol(exchange, symbol: str):
             "vela_a_ts": window_start_ts,
             "vela_a_low": expected_max_low,
             "vela_a_high": expected_max_high,
+            "sma20_1h": sma20_1h,
+            "ema200_1h": ema200_1h,
         }
         return plan, None
 
