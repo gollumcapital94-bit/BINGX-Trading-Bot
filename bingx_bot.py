@@ -17,11 +17,12 @@ PASO 1  -> Gestión de posiciones abiertas con DOS gatillos INDEPENDIENTES
            Corre para exchange_short y exchange_long.
            PASO 1 (parte LONG) -> seguimiento del long invertido con 2 JSON
            (ver SEGUIMIENTO DEL LONG INVERTIDO). DISPARADORES:
-             - Take Profit (long_take_profit_tracking.json): se revisa en TODAS
-               las corridas, tanto el disparador INTERNO (cron de GitHub) como
-               el EXTERNO (cronjob.org).
+             - Take Profit (long_take_profit_tracking.json): SOLO con el
+               disparador INTERNO (cron de GitHub; RUN_LONG_TP_TRACKING=true).
+               No es urgente: solo define dónde se cierra la operación.
              - Stop Loss en break even (long_stop_loss_tracking.json): SOLO con
-               el disparador INTERNO (RUN_LONG_SL_TRACKING=true).
+               el disparador EXTERNO (cronjob.org, puntual;
+               RUN_LONG_SL_TRACKING=true), porque la operación se puede virar.
              - El gatillo de Stop Loss por toque de EMA50(1h) del SHORT no
                cambia (solo disparador externo).
 PASOS 2-14 -> Escáner de nuevas entradas con UNA sola estrategia,
@@ -1046,22 +1047,29 @@ async def _run_tracking_list(path: str, demo: bool, handler) -> None:
 
 
 async def gestionar_seguimiento_long(exchange_long: "ccxt.bingx", market_exchange: "ccxt.bingx",
-                                     run_sl_tracking: bool = False) -> None:
+                                     run_tp_tracking: bool = False, run_sl_tracking: bool = False) -> None:
     """
     PASO 1 (parte LONG), AL INICIO de cada corrida (modos full y tp_only).
-    - Archivo de TP: SIEMPRE (disparador interno y externo).
-    - Archivo de SL (break even al romper el máximo): solo si `run_sl_tracking`
+    - Archivo de TP (LIMIT pendientes y longs sin TP): solo si `run_tp_tracking`
       (disparador INTERNO).
+    - Archivo de SL (break even al romper el máximo): solo si `run_sl_tracking`
+      (disparador EXTERNO, el puntual).
     """
     ensure_long_json_files()
     demo = _es_sandbox(exchange_long)
-    await _run_tracking_list(LONG_TP_TRACKING_FILE, demo, lambda it: _handle_tp_tracking(exchange_long, market_exchange, it))
+    if run_tp_tracking:
+        await _run_tracking_list(LONG_TP_TRACKING_FILE, demo, lambda it: _handle_tp_tracking(exchange_long, market_exchange, it))
+    else:
+        log.info(
+            "%s Seguimiento de Take Profit omitido: esta corrida no vino del disparador INTERNO "
+            "(RUN_LONG_TP_TRACKING=false).", _SEG,
+        )
     if run_sl_tracking:
         await _run_tracking_list(LONG_SL_TRACKING_FILE, demo, lambda it: _handle_sl_tracking(exchange_long, market_exchange, it))
     else:
         log.info(
             "%s Seguimiento de Stop Loss (break even al romper el máximo) omitido: esta corrida no vino "
-            "del disparador INTERNO (RUN_LONG_SL_TRACKING=false).", _SEG,
+            "del disparador EXTERNO (RUN_LONG_SL_TRACKING=false).", _SEG,
         )
 
 
@@ -1419,6 +1427,7 @@ async def main() -> None:
     run_balance_check = _env_flag("RUN_BALANCE_CHECK", "false")
     run_stop_loss_check = _env_flag("RUN_STOP_LOSS_CHECK", "false")
     run_long_sl_tracking = _env_flag("RUN_LONG_SL_TRACKING", "false")
+    run_long_tp_tracking = _env_flag("RUN_LONG_TP_TRACKING", "false")
     log.info("Modo de ejecución: %s", mode)
     log.info(
         "Gatillo de Stop Loss (toque de EMA50(1h)) %s en esta corrida "
@@ -1435,11 +1444,11 @@ async def main() -> None:
         await ensure_hedge_mode(exchange_short, "SHORT")
         await ensure_hedge_mode(exchange_long, "LONG")
 
-        # PASO 1 (parte LONG): seguimiento del long invertido (2 JSON): TP en
-        # ambos disparadores, SL break even solo en el interno. Antes de todo
-        # lo demás (y en secuencia, para no pisar los JSON con las entradas nuevas).
+        # PASO 1 (parte LONG): seguimiento del long invertido (2 JSON): TP solo
+        # con el disparador interno, SL break even solo con el externo. Antes de
+        # todo lo demás (y en secuencia, para no pisar los JSON con las entradas nuevas).
         try:
-            await gestionar_seguimiento_long(exchange_long, market_exchange, run_long_sl_tracking)
+            await gestionar_seguimiento_long(exchange_long, market_exchange, run_long_tp_tracking, run_long_sl_tracking)
         except Exception as exc:
             log.error("%s Error revisando el seguimiento de los longs: %s", _SEG, exc)
 
