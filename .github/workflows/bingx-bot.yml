@@ -18,10 +18,9 @@ on:
   schedule:
     # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE al Paso 1 -- ver
     # BOT_MODE más abajo. Corre CADA HORA. NUNCA escanea ni abre nuevas
-    # entradas. Es el ÚNICO disparador que revisa el Stop Loss en break
-    # even del LONG (RUN_LONG_SL_TRACKING). Como schedule no es puntual, el
-    # Stop Loss del SHORT (toque de EMA50(1h)) NO se ejecuta desde aquí --
-    # ver RUN_STOP_LOSS_CHECK.
+    # entradas. Es el ÚNICO disparador que coloca el Take Profit del LONG
+    # (RUN_LONG_TP_TRACKING). Como schedule no es puntual, NINGÚN Stop Loss
+    # se ejecuta desde aquí (ver RUN_STOP_LOSS_CHECK y RUN_LONG_SL_TRACKING).
     - cron: "0 * * * *"
 
 permissions:
@@ -64,10 +63,13 @@ jobs:
           # Gatillo de Stop Loss (toque de EMA50(1h)): SOLO en
           # disparador EXTERNO. El Take Profit no depende de esta variable.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
+          # Seguimiento del Take Profit del LONG (LIMIT pendientes y longs sin
+          # TP): SOLO en disparador INTERNO (schedule). No es urgente.
+          RUN_LONG_TP_TRACKING: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
           # Seguimiento del Stop Loss en break even del LONG (se coloca al
-          # romper el precio el máximo): SOLO en disparador INTERNO (schedule).
-          # El seguimiento del Take Profit del long corre en TODOS los disparadores.
-          RUN_LONG_SL_TRACKING: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+          # romper el precio el máximo): SOLO en disparador EXTERNO (cronjob.org),
+          # que es el puntual -- la operación se puede virar.
+          RUN_LONG_SL_TRACKING: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
