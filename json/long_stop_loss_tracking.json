@@ -1,1 +1,12 @@
-[]
+[
+  {
+    "symbol": "ICNT/USDT:USDT",
+    "entry_price": 0.101,
+    "max_high": 0.1041,
+    "tp_pct": 3.2416837793152085,
+    "leverage": 20,
+    "since_ts": 1791637317497,
+    "max_broken": false,
+    "demo": true
+  }
+]
