@@ -1,12 +1,1 @@
-[
-  {
-    "symbol": "HYPERLANE/USDT:USDT",
-    "entry_price": 0.07466,
-    "max_high": 0.07629,
-    "tp_pct": 1.6112672102636998,
-    "leverage": 30,
-    "since_ts": 1791752531995,
-    "max_broken": false,
-    "demo": true
-  }
-]
+[]
