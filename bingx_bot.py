@@ -1,49 +1,43 @@
 """
 Bot de trading para BingX
 --------------------------
-PASO 1  -> Gestión de posiciones abiertas con DOS gatillos INDEPENDIENTES
-           en temporalidad 1h:
+PASO 1  -> Gestión de posiciones abiertas.
              - SHORT: toque de SMA20(1h) -> Take Profit en la EMA200(1h).
+                      toque de EMA50(1h) -> Stop Loss en break even.
              - LONG invertido: Take Profit a entrada * (1 + distancia%
-               SMA20(1h)->EMA200(1h)), colocado tras la entrada a mercado o,
-               si fue LIMIT, al llenarse. Stop Loss del LONG: break even al
-               romper el precio el máximo de la vela de 1h. Todo se sigue con
-               DOS archivos en json/ (los crea el script):
-                 long_take_profit_tracking.json -> LIMIT sin llenar o long sin TP
-                 long_stop_loss_tracking.json   -> con TP, falta el SL break even
-               (el gatillo de EMA50(1h) del Paso 1 YA NO aplica al LONG).
-             - Toque de EMA50(1h) -> coloca el Stop Loss en break even
-               (precio de entrada exacto).
-           Corre para exchange_short y exchange_long.
-           PASO 1 (parte LONG) -> seguimiento del long invertido con 2 JSON
-           (ver SEGUIMIENTO DEL LONG INVERTIDO). DISPARADORES:
-             - Take Profit (long_take_profit_tracking.json): SOLO con el
-               disparador INTERNO (cron de GitHub; RUN_LONG_TP_TRACKING=true).
-               No es urgente: solo define dónde se cierra la operación.
-             - Stop Loss en break even (long_stop_loss_tracking.json): SOLO con
-               el disparador EXTERNO (cronjob.org, puntual;
-               RUN_LONG_SL_TRACKING=true), porque la operación se puede virar.
-             - El gatillo de Stop Loss por toque de EMA50(1h) del SHORT no
-               cambia (solo disparador externo).
+               SMA20(1h)->EMA200(1h)). Stop Loss INICIAL en la EMA200(5m)
+               (STOP_MARKET). Cuando el precio sube desde la entrada una
+               distancia igual a |entrada - EMA50(1h)| se CANCELA ese Stop
+               Loss inicial y se coloca el Stop Loss en break even (precio de
+               entrada exacto). Seguimiento con DOS archivos en json/:
+                 long_take_profit_tracking.json -> LIMIT sin llenar o long sin TP/SL
+                 long_stop_loss_tracking.json   -> con TP y SL, falta el break even
+             DISPARADORES:
+               - Take Profit / SL inicial del long (long_take_profit_tracking):
+                 SOLO disparador INTERNO (RUN_LONG_TP_TRACKING=true).
+               - Break even del long (long_stop_loss_tracking): SOLO disparador
+                 EXTERNO (RUN_LONG_SL_TRACKING=true).
+               - Gatillo de EMA50(1h) del SHORT: solo disparador externo.
 PASOS 2-14 -> Escáner de nuevas entradas con UNA sola estrategia,
-           short_strategy.py (en la raíz del repo, singularidad positiva):
-           - Par dentro del ciclo alcista de 4h -> SHORT (stop-limit o
-             mercado) en exchange_short, con el 10% de la cuenta.
-           - TEMPORAL (PASO10_INVERTIR_SI_FALLA en short_strategy): par
-             FUERA del ciclo de 4h con singularidad positiva -> LONG
-             INVERTIDO en exchange_long (a mercado si el precio ya tocó la
-             SMA20(5m); si no, orden LIMIT en la SMA20(5m)), sin SL propio, con
-             margen fijo de 100 USDT/VST o el máximo que permita el
-             apalancamiento calculado para el par, el que sea menor.
-             TAKE PROFIT del LONG invertido: distancia % entre la SMA20(1h)
-             y la EMA200(1h), proyectada hacia ARRIBA desde el precio de
-             entrada. Ganancia sobre margen = esa distancia % x apalancamiento.
+           short_strategy.py (en la raíz del repo). La DIRECCIÓN sale del
+           Paso 10 (ciclo en 4h) y del RSI6 de sobrecompra (1h/15m/5m):
+             ciclo alcista / inicio de ciclo: RSI6<=90 -> SHORT ; >90 -> LONG
+             fin de ciclo:                    RSI6<=90 -> LONG  ; >90 -> SHORT
+           - SHORT (10% de la cuenta): stop-limit o mercado en exchange_short.
+           - LONG invertido: exchange_long, mercado si el precio ya tocó la
+             SMA20(5m) o LIMIT en la SMA20(5m); margen fijo de 100 USDT/VST
+             (o el máximo que permita el apalancamiento). Stop Loss y
+             apalancamiento comparten la distancia entrada -> EMA200(5m)
+             (apalancamiento = 80 / distancia %). Si la EMA200(5m) está en o
+             sobre la entrada NO se abre la operación.
+           - SEGUIMIENTO DEL SHORT (json/short_tracking.json): si en la OTRA
+             temporalidad (la que no dio la singularidad) el W%R6 y el W%R12
+             del máximo son iguales, NO se entra: el par queda en seguimiento
+             hasta que el precio rompa ese máximo y vuelve al escáner normal.
            Cuando es_maximo_round es False NO se opera.
-           long_strategy.py YA NO SE USA ni se importa.
-BARRIDO DE BALANCE (solo mercado real, solo disparador externo) -> se
-           revisa el balance de CADA cuenta de futuros (short y long) y,
-           si supera FUTURES_BALANCE_CAP_USDT, se transfiere el excedente
-           a su cuenta de FONDOS.
+BARRIDO DE BALANCE (solo mercado real, solo disparador externo) -> si el
+           balance de CADA cuenta supera FUTURES_BALANCE_CAP_USDT se transfiere
+           el excedente a su cuenta de FONDOS.
 
 DOS CUENTAS/CONEXIONES INDEPENDIENTES (SHORT y LONG):
     BINGX_DEMO_SHORT -> controla exchange_short.
@@ -86,9 +80,9 @@ log = logging.getLogger("bingx_bot")
 # Configuración PASO 1 (gestión de TP/SL)
 # ----------------------------------------------------------------------
 TIMEFRAME_TP = "1h"
-SMA_TP_TRIGGER = 20   # toque de esta SMA(1h) dispara el Take Profit
-EMA_FAST = 50         # toque de esta EMA(1h) dispara el Stop Loss en break even
-EMA_SLOW = 200        # precio donde se coloca el Take Profit
+SMA_TP_TRIGGER = 20   # toque de esta SMA(1h) dispara el Take Profit (SHORT)
+EMA_FAST = 50         # toque de esta EMA(1h) dispara el Stop Loss en break even (SHORT)
+EMA_SLOW = 200        # precio donde se coloca el Take Profit (SHORT)
 
 OHLCV_LIMIT_TP = 1000
 
@@ -97,13 +91,6 @@ OHLCV_FETCH_LIMIT_TP = OHLCV_LIMIT_TP + EMA_WARMUP_CANDLES  # 1400, bajo el máx
 
 # El Paso 1 gestiona SHORT y LONG (los LONG invertidos también).
 PASO1_MANAGE_LONGS = True
-
-# LONG invertido: su Take Profit NO usa el gatillo de la SMA20(1h) ni la
-# EMA200 como precio. Se coloca con la MISMA orden TAKE_PROFIT_MARKET del
-# SHORT (set_take_profit) a entrada * (1 + distancia% SMA20(1h)->EMA200(1h)):
-#   - justo tras la entrada a MERCADO, y
-#   - en el Paso 1 para cualquier LONG que aún no tenga TP (p. ej. una
-#     orden LIMIT que se acaba de llenar).
 
 
 def _env_flag(name: str, default: str = "false") -> bool:
@@ -297,6 +284,35 @@ async def _symbol_has_open_order(exchange: "ccxt.bingx", symbol: str, raw_order_
     return False
 
 
+async def _cancel_open_orders(exchange: "ccxt.bingx", symbol: str, raw_order_type: str, position_side: str) -> bool:
+    """
+    Cancela las órdenes abiertas del símbolo con ese tipo y lado de posición.
+    Devuelve True si no quedó ninguna sin cancelar (también si no había ninguna).
+    """
+    try:
+        open_orders = await exchange.fetch_open_orders(symbol)
+    except Exception as exc:
+        log.warning("%s: no se pudieron leer las órdenes abiertas para cancelar (%s).", symbol, exc)
+        return False
+
+    todo_ok = True
+    for order in open_orders:
+        info = order.get("info", {}) or {}
+        o_type = str(info.get("type") or order.get("type") or "").upper()
+        o_position_side = str(info.get("positionSide") or order.get("positionSide") or "").upper()
+        if o_type == raw_order_type and o_position_side == position_side:
+            try:
+                await exchange.cancel_order(str(order.get("id")), symbol)
+                log.info(
+                    "%s: Stop Loss inicial cancelado (orden %s, tipo %s) para colocar el break even.",
+                    symbol, order.get("id"), raw_order_type,
+                )
+            except Exception as exc:
+                log.error("%s: error cancelando la orden %s (%s): %s", symbol, order.get("id"), raw_order_type, exc)
+                todo_ok = False
+    return todo_ok
+
+
 async def set_take_profit(exchange: "ccxt.bingx", position: dict, tp_price: float,
                           motivo: str = "toque de SMA20(1h)") -> bool:
     """Devuelve True si el TP quedó colocado (o ya existía), False si falló."""
@@ -331,6 +347,42 @@ async def set_take_profit(exchange: "ccxt.bingx", position: dict, tp_price: floa
         return True
     except Exception as exc:
         log.error("Error colocando Take Profit para %s: %s", symbol, exc)
+        return False
+
+
+async def set_stop_loss_inicial_long(exchange: "ccxt.bingx", position: dict, sl_price: float,
+                                     motivo: str = "EMA200(5m)") -> bool:
+    """
+    Stop Loss INICIAL del LONG invertido: orden STOP_MARKET en `sl_price`
+    (EMA200(5m)). Devuelve True si quedó colocado (o ya existía), False si falló.
+    """
+    symbol = position["symbol"]
+    amount = abs(float(position.get("contracts") or 0))
+
+    if amount <= 0:
+        log.warning("Cantidad de contratos inválida para %s, se omite el Stop Loss inicial.", symbol)
+        return False
+
+    if await _symbol_has_open_order(exchange, symbol, "STOP_MARKET", "LONG"):
+        log.info("%s: ya existe un Stop Loss inicial abierto para LONG, se omite (evita duplicados).", symbol)
+        return True
+
+    sl_params = {
+        "stopPrice": sl_price,
+        "positionSide": "LONG",
+        "workingType": "CONTRACT_PRICE",
+    }
+    try:
+        sl_order = await exchange.create_order(
+            symbol, "STOP_MARKET", "sell", amount, None, sl_params,
+        )
+        log.info(
+            "Stop Loss inicial (%s) colocado: %s | LONG | SL=%.8f | orden_id=%s",
+            motivo, symbol, sl_price, sl_order.get("id"),
+        )
+        return True
+    except Exception as exc:
+        log.error("Error colocando el Stop Loss inicial para %s: %s", symbol, exc)
         return False
 
 
@@ -379,11 +431,12 @@ async def set_stop_loss_breakeven(exchange: "ccxt.bingx", position: dict,
 
 async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_loss_check: bool = True) -> None:
     """
-    PASO 1: DOS gatillos INDEPENDIENTES:
-    SHORT: toque de SMA20(1h) -> Take Profit en la EMA200(1h).
+    PASO 1:
+    SHORT: toque de SMA20(1h) -> Take Profit en la EMA200(1h); toque de
+    EMA50(1h) -> Stop Loss en break even (solo si `run_stop_loss_check`).
     LONG invertido: Take Profit a entrada * (1 + distancia% SMA20->EMA200),
-    sin esperar toque. Ambos: toque de EMA50(1h) -> Stop Loss en break
-    even (solo si `run_stop_loss_check` es True).
+    sin esperar toque. Su Stop Loss (inicial en la EMA200(5m) y break even)
+    se maneja con los JSON de seguimiento.
     """
     symbol = position["symbol"]
     if position.get("side") == "long" and not PASO1_MANAGE_LONGS:
@@ -452,11 +505,11 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_l
                     symbol, float(sma20_series.iloc[-1]),
                 )
 
-        # ---- Gatillo 2: toque de EMA50(1h) -> Stop Loss en break even ----
+        # ---- Gatillo 2: toque de EMA50(1h) -> Stop Loss en break even (solo SHORT) ----
         if position.get("side") == "long":
             log.info(
-                "%s: LONG, se omite el gatillo de EMA50(1h). Su Stop Loss en break even se coloca al "
-                "romper el precio el máximo (json/long_stop_loss_tracking.json).",
+                "%s: LONG, se omite el gatillo de EMA50(1h). Su Stop Loss en break even se coloca al subir el "
+                "precio la distancia entrada->EMA50(1h) (json/long_stop_loss_tracking.json).",
                 symbol,
             )
         elif not run_stop_loss_check:
@@ -728,16 +781,17 @@ def calcular_tp_long_invertido(plan: dict, entry_price: float):
     return tp_price, distancia_pct
 
 
-async def _colocar_tp_tras_entrada_market(exchange: "ccxt.bingx", symbol: str, tp_price: float, tp_pct: float):
+async def _colocar_protecciones_tras_entrada_market(exchange: "ccxt.bingx", symbol: str, tp_price: float,
+                                                    tp_pct: float, sl_price: float):
     """
     Tras una entrada LONG a mercado: busca la posición recién abierta y le
-    coloca el TP con set_take_profit (misma orden que el SHORT).
-    Devuelve (tp_ok, entry_price_real | None).
+    coloca el TP y el Stop Loss inicial (EMA200(5m)).
+    Devuelve (todo_ok, entry_price_real | None).
     """
     try:
         positions = await exchange.fetch_positions([symbol])
     except Exception as exc:
-        log.warning("%s: no se pudo leer la posición para colocar el TP (%s); quedará en el seguimiento de TP.", symbol, exc)
+        log.warning("%s: no se pudo leer la posición para colocar TP/SL (%s); quedará en el seguimiento de TP.", symbol, exc)
         return False, None
 
     for pos in positions:
@@ -746,49 +800,59 @@ async def _colocar_tp_tras_entrada_market(exchange: "ccxt.bingx", symbol: str, t
         except (TypeError, ValueError):
             contracts = 0
         if contracts != 0 and pos.get("side") == "long":
-            ok = await set_take_profit(
+            ok_tp = await set_take_profit(
                 exchange, pos, tp_price,
                 motivo=f"LONG invertido, +{tp_pct:.2f}% desde la entrada (distancia SMA20(1h)->EMA200(1h))",
             )
+            ok_sl = await set_stop_loss_inicial_long(exchange, pos, sl_price)
             entry = pos.get("entryPrice")
-            return ok, (float(entry) if entry is not None else None)
+            return (ok_tp and ok_sl), (float(entry) if entry is not None else None)
 
     log.warning("%s: la posición LONG aún no aparece tras la entrada a mercado; quedará en el seguimiento de TP.", symbol)
     return False, None
 
 
 # ----------------------------------------------------------------------
-# SEGUIMIENTO DEL LONG INVERTIDO: DOS archivos JSON en json/ (los crea el script)
+# SEGUIMIENTO: TRES archivos JSON en json/ (los crea el script)
 # ----------------------------------------------------------------------
-#  1) long_take_profit_tracking.json -> todo lo que espera que se coloque el TP.
-#     Cada entrada lleva un campo "status":
+#  1) long_take_profit_tracking.json -> todo lo que espera que se coloque el TP
+#     y el Stop Loss inicial (EMA200(5m)) del long. Campo "status":
 #       "pending_limit": orden LIMIT que aún no se llena.
-#           Se llenó -> se coloca el TP (entrada REAL * (1 + tp_pct/100)) y pasa
-#                       a long_stop_loss_tracking. Si el TP falló, la entrada se
-#                       queda aquí con status "filled" y se reintenta.
+#           Se llenó -> se colocan el TP (entrada REAL * (1 + tp_pct/100)) y el
+#                       SL inicial y pasa a long_stop_loss_tracking. Si algo
+#                       falló, la entrada se queda aquí con status "filled".
 #           Sigue abierta y el precio ROMPIÓ el máximo de la vela de 1h antes
 #                       de llenarse -> se CANCELA y se borra.
 #           Ya no está abierta y no hay posición -> se borra.
-#       "filled": long ya abierto al que aún le falta el TP (entrada a mercado
-#           sin posición visible, o TP que falló). Al colocarse el TP pasa a
-#           long_stop_loss_tracking.
-#  2) long_stop_loss_tracking.json   -> longs abiertos con TP, esperando que el
-#       precio rompa el máximo para colocar el Stop Loss en break even (precio
-#       de entrada exacto). Se borra al colocarse el SL o al cerrarse la
-#       posición. Si el precio rompió el máximo pero ya está POR DEBAJO de la
-#       entrada, NO se coloca el SL (se reintenta en la próxima corrida).
+#       "filled": long ya abierto al que aún le falta el TP o el SL inicial.
+#  2) long_stop_loss_tracking.json   -> longs abiertos con TP y SL inicial,
+#       esperando que el precio suba desde la entrada una distancia igual a
+#       |entrada - EMA50(1h)|. Entonces se CANCELA el SL inicial y se coloca el
+#       break even (precio de entrada exacto). Se borra al colocarse o al
+#       cerrarse la posición. Si el nivel ya se alcanzó pero el precio está
+#       por DEBAJO de la entrada, NO se coloca (se reintenta; el SL inicial
+#       sigue protegiendo).
+#  3) short_tracking.json -> pares con SHORT aprobado cuyo W%R6 y W%R12 de la
+#       OTRA temporalidad eran iguales. No se entra; el escáner los salta hasta
+#       que el precio rompa el máximo guardado (o pasen SHORT_TRACKING_EXPIRE_MS).
 # En GitHub Actions los archivos solo persisten si el workflow hace commit y
 # push de ellos al terminar la corrida (ver bot.yml).
 JSON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "json")
 LONG_TP_TRACKING_FILE = os.path.join(JSON_DIR, "long_take_profit_tracking.json")
 LONG_SL_TRACKING_FILE = os.path.join(JSON_DIR, "long_stop_loss_tracking.json")
-LONG_JSON_FILES = (LONG_TP_TRACKING_FILE, LONG_SL_TRACKING_FILE)
+SHORT_TRACKING_FILE = os.path.join(JSON_DIR, "short_tracking.json")
+JSON_FILES = (LONG_TP_TRACKING_FILE, LONG_SL_TRACKING_FILE, SHORT_TRACKING_FILE)
 
 # Tiempo que se espera a que aparezca la posición de un long a mercado antes
 # de darlo por inexistente y borrarlo del seguimiento de TP.
 LONG_TRACKING_NO_POSITION_GRACE_MS = 15 * 60 * 1000
 
+# Un par en short_tracking.json que no rompe su máximo en este tiempo se libera
+# (vuelve al escáner normal) para que no quede bloqueado indefinidamente.
+SHORT_TRACKING_EXPIRE_MS = 24 * 60 * 60 * 1000
+
 _SEG = "[Paso 1][Seguimiento LONG]"
+_SEG_SHORT = "[Seguimiento SHORT]"
 
 
 def _es_sandbox(exchange: "ccxt.bingx") -> bool:
@@ -815,9 +879,9 @@ def _save_json_list(path: str, items: list[dict]) -> None:
     os.replace(tmp_path, path)
 
 
-def ensure_long_json_files() -> None:
+def ensure_json_files() -> None:
     """Crea los tres archivos (con una lista vacía) si no existen."""
-    for path in LONG_JSON_FILES:
+    for path in JSON_FILES:
         if not os.path.exists(path):
             try:
                 _save_json_list(path, [])
@@ -844,22 +908,29 @@ def registrar_orden_limit_pendiente(entry: dict) -> None:
     _add_to_json_list(LONG_TP_TRACKING_FILE, {**entry, "status": "pending_limit"})
 
 
-def _registrar_long_abierto(exchange: "ccxt.bingx", plan: dict, symbol: str, tp_ok: bool,
-                            entry_price: float, tp_pct: float, leverage: int) -> None:
-    """Long a mercado ya abierto: con TP puesto -> seguimiento de SL; si no -> seguimiento de TP."""
+def registrar_short_en_seguimiento(entry: dict) -> None:
+    _add_to_json_list(SHORT_TRACKING_FILE, entry)
+
+
+def _registrar_long_abierto(exchange: "ccxt.bingx", plan: dict, symbol: str, todo_ok: bool,
+                            entry_price: float, tp_pct: float, leverage: int, sl_price: float) -> None:
+    """Long a mercado ya abierto: con TP y SL puestos -> seguimiento del break even; si no -> seguimiento de TP."""
     now = int(exchange.milliseconds())
     max_high = float(plan.get("vela_a_high", plan["max_high_5m"]))
+    ema50_1h = plan.get("ema50_1h")
     demo = _es_sandbox(exchange)
-    if tp_ok:
+    if todo_ok:
         _add_to_json_list(LONG_SL_TRACKING_FILE, {
             "symbol": symbol, "entry_price": entry_price, "max_high": max_high,
+            "ema50_1h": ema50_1h, "sl_price": sl_price,
             "tp_pct": tp_pct, "leverage": leverage, "since_ts": now,
-            "max_broken": False, "demo": demo,
+            "trigger_hit": False, "demo": demo,
         })
     else:
         _add_to_json_list(LONG_TP_TRACKING_FILE, {
             "symbol": symbol, "tp_pct": tp_pct, "leverage": leverage,
-            "max_high": max_high, "created_ts": now, "demo": demo, "status": "filled",
+            "max_high": max_high, "ema50_1h": ema50_1h, "sl_price": sl_price,
+            "created_ts": now, "demo": demo, "status": "filled",
         })
 
 
@@ -886,30 +957,64 @@ async def _price_broke_max(market_exchange: "ccxt.bingx", symbol: str, since_ts:
     return max(float(c[2]) for c in candles) > float(max_high)
 
 
-async def _try_place_tp(exchange: "ccxt.bingx", symbol: str, position: dict, tp_pct: float, leverage):
-    """Coloca el TP del long desde el precio de entrada REAL. Devuelve (ok, entry_price | None)."""
+async def _price_reached_level(market_exchange: "ccxt.bingx", symbol: str, since_ts: int, level: float) -> bool:
+    """True si desde `since_ts` algún high de 5m (incluida la vela en curso) alcanzó `level`."""
+    candles = await market_exchange.fetch_ohlcv(
+        symbol, timeframe="5m", since=int(since_ts) - 5 * 60 * 1000, limit=1000,
+    )
+    if not candles:
+        return False
+    return max(float(c[2]) for c in candles) >= float(level)
+
+
+def _nivel_break_even(it: dict, entry_price: float) -> float:
+    """
+    Nivel de precio donde el long pasa a break even: entrada + |entrada - EMA50(1h)|
+    (espejo del short, que lo coloca al tocar la EMA50(1h)). Entradas antiguas
+    sin ema50_1h usan el máximo de la vela de 1h.
+    """
+    ema50_1h = it.get("ema50_1h")
+    if ema50_1h is not None:
+        return entry_price + abs(entry_price - float(ema50_1h))
+    return float(it["max_high"])
+
+
+async def _try_place_protections(exchange: "ccxt.bingx", symbol: str, position: dict, it: dict):
+    """
+    Coloca el TP del long (desde el precio de entrada REAL) y su Stop Loss
+    inicial (EMA200(5m), si la entrada lo trae). Devuelve (todo_ok, entry_price | None).
+    """
     entry_price = position.get("entryPrice")
     if entry_price is None:
         log.warning("%s %s: posición sin precio de entrada legible; se reintenta.", _SEG, symbol)
         return False, None
     entry_price = float(entry_price)
+    tp_pct = float(it["tp_pct"])
+    leverage = it.get("leverage")
+
     tp_price = float(exchange.price_to_precision(symbol, entry_price * (1 + tp_pct / 100)))
     log.info(
         "%s %s: entrada real=%.8f -> TP=%.8f (+%.2f%% precio, %.1f%% sobre margen).",
         _SEG, symbol, entry_price, tp_price, tp_pct, tp_pct * float(leverage or 1),
     )
-    ok = await set_take_profit(
+    ok_tp = await set_take_profit(
         exchange, position, tp_price,
         motivo=f"LONG invertido, +{tp_pct:.2f}% desde la entrada (distancia SMA20(1h)->EMA200(1h))",
     )
-    return ok, entry_price
+
+    ok_sl = True
+    if it.get("sl_price") is not None:
+        ok_sl = await set_stop_loss_inicial_long(exchange, position, float(it["sl_price"]))
+
+    return (ok_tp and ok_sl), entry_price
 
 
 def _sl_entry(exchange: "ccxt.bingx", it: dict, entry_price: float) -> dict:
     return {
         "symbol": it["symbol"], "entry_price": entry_price, "max_high": float(it["max_high"]),
+        "ema50_1h": it.get("ema50_1h"), "sl_price": it.get("sl_price"),
         "tp_pct": float(it["tp_pct"]), "leverage": it.get("leverage"),
-        "since_ts": int(exchange.milliseconds()), "max_broken": False, "demo": bool(it.get("demo")),
+        "since_ts": int(exchange.milliseconds()), "trigger_hit": False, "demo": bool(it.get("demo")),
     }
 
 
@@ -929,14 +1034,14 @@ async def _handle_pending_limit(exchange, market_exchange, it: dict) -> str:
             return "resuelta"
 
         log.info("%s %s: la orden LIMIT %s SE LLENÓ.", tag, symbol, order_id)
-        ok, entry_price = await _try_place_tp(exchange, symbol, position, float(it["tp_pct"]), it.get("leverage"))
+        ok, entry_price = await _try_place_protections(exchange, symbol, position, it)
         if entry_price is None:
             return "pendiente"
         if ok:
             _add_to_json_list(LONG_SL_TRACKING_FILE, _sl_entry(exchange, it, entry_price))
             return "resuelta"
-        # El TP falló: la orden ya es posición; la entrada se queda en este mismo
-        # archivo como 'filled' y se reintenta en la próxima corrida.
+        # Falló el TP o el SL inicial: la orden ya es posición; la entrada se
+        # queda en este mismo archivo como 'filled' y se reintenta.
         it["status"] = "filled"
         it["created_ts"] = int(exchange.milliseconds())
         return "pendiente"
@@ -958,7 +1063,7 @@ async def _handle_pending_limit(exchange, market_exchange, it: dict) -> str:
 
 
 async def _handle_filled_without_tp(exchange, market_exchange, it: dict) -> str:
-    """status 'filled': long abierto al que aún le falta el TP."""
+    """status 'filled': long abierto al que aún le falta el TP o el SL inicial."""
     symbol = it["symbol"]
     tag = f"{_SEG}[long_take_profit_tracking]"
 
@@ -970,7 +1075,7 @@ async def _handle_filled_without_tp(exchange, market_exchange, it: dict) -> str:
         log.info("%s %s: la posición LONG aún no aparece; se reintenta.", tag, symbol)
         return "pendiente"
 
-    ok, entry_price = await _try_place_tp(exchange, symbol, position, float(it["tp_pct"]), it.get("leverage"))
+    ok, entry_price = await _try_place_protections(exchange, symbol, position, it)
     if ok and entry_price is not None:
         _add_to_json_list(LONG_SL_TRACKING_FILE, _sl_entry(exchange, it, entry_price))
         return "resuelta"
@@ -985,7 +1090,11 @@ async def _handle_tp_tracking(exchange, market_exchange, it: dict) -> str:
 
 
 async def _handle_sl_tracking(exchange, market_exchange, it: dict) -> str:
-    """long_stop_loss_tracking.json: longs con TP, esperando romper el máximo para el SL en break even."""
+    """
+    long_stop_loss_tracking.json: longs con TP y SL inicial, esperando que el
+    precio suba entrada + |entrada - EMA50(1h)| para cancelar el SL inicial y
+    colocar el Stop Loss en break even.
+    """
     symbol = it["symbol"]
     tag = f"{_SEG}[long_stop_loss_tracking]"
 
@@ -994,15 +1103,21 @@ async def _handle_sl_tracking(exchange, market_exchange, it: dict) -> str:
         log.info("%s %s: la posición LONG ya no está abierta (cerrada); se borra.", tag, symbol)
         return "resuelta"
 
-    if not it.get("max_broken"):
-        if not await _price_broke_max(market_exchange, symbol, int(it["since_ts"]), float(it["max_high"])):
-            log.info("%s %s: el precio aún no rompe el máximo (%.8f); SL en break even pendiente.", tag, symbol, float(it["max_high"]))
-            return "pendiente"
-        it["max_broken"] = True
-        log.info("%s %s: el precio ROMPIÓ el máximo (%.8f).", tag, symbol, float(it["max_high"]))
-
     entry_raw = position.get("entryPrice")
     entry_price = float(entry_raw) if entry_raw is not None else float(it["entry_price"])
+    nivel = _nivel_break_even(it, entry_price)
+
+    trigger_hit = bool(it.get("trigger_hit", it.get("max_broken", False)))
+    if not trigger_hit:
+        if not await _price_reached_level(market_exchange, symbol, int(it["since_ts"]), nivel):
+            log.info(
+                "%s %s: el precio aún no alcanza el nivel de break even (%.8f = entrada %.8f + distancia a la EMA50(1h)).",
+                tag, symbol, nivel, entry_price,
+            )
+            return "pendiente"
+        it["trigger_hit"] = True
+        log.info("%s %s: el precio ALCANZÓ el nivel de break even (%.8f).", tag, symbol, nivel)
+
     ticker = await exchange.fetch_ticker(symbol)
     last_price = ticker.get("last")
     if last_price is None:
@@ -1010,16 +1125,43 @@ async def _handle_sl_tracking(exchange, market_exchange, it: dict) -> str:
         return "pendiente"
     if float(last_price) <= entry_price:
         log.info(
-            "%s %s: el máximo ya se rompió pero el precio (%.8f) está por debajo de la entrada (%.8f); "
-            "no se coloca el SL en break even todavía.",
+            "%s %s: el nivel ya se alcanzó pero el precio (%.8f) está por debajo de la entrada (%.8f); "
+            "no se coloca el break even todavía (el Stop Loss inicial sigue activo).",
             tag, symbol, float(last_price), entry_price,
         )
         return "pendiente"
 
+    # Cancela el Stop Loss inicial (STOP_MARKET en la EMA200(5m)) y coloca el break even.
+    if not await _cancel_open_orders(exchange, symbol, "STOP_MARKET", "LONG"):
+        log.warning("%s %s: no se pudo cancelar el Stop Loss inicial; se reintenta (no se coloca el break even).", tag, symbol)
+        return "pendiente"
+
     ok = await set_stop_loss_breakeven(
-        exchange, position, motivo="LONG invertido: el precio rompió el máximo",
+        exchange, position, motivo="LONG invertido: el precio alcanzó la distancia entrada->EMA50(1h)",
     )
     return "resuelta" if ok else "pendiente"
+
+
+async def _handle_short_tracking(exchange_short, market_exchange, it: dict) -> str:
+    """short_tracking.json: se libera cuando el precio rompe el máximo guardado (o vence)."""
+    symbol = it["symbol"]
+    max_high = float(it["max_high"])
+    created_ts = int(it["created_ts"])
+
+    if int(exchange_short.milliseconds()) - created_ts > SHORT_TRACKING_EXPIRE_MS:
+        log.info("%s %s: el seguimiento venció sin romper el máximo (%.8f); el par vuelve al escáner.", _SEG_SHORT, symbol, max_high)
+        return "resuelta"
+
+    if await _price_broke_max(market_exchange, symbol, created_ts, max_high):
+        log.info(
+            "%s %s: el precio ROMPIÓ el máximo guardado (%.8f); el par sale del seguimiento y vuelve al "
+            "escáner normal para entrar en SHORT si vuelve a cumplir todos los pasos.",
+            _SEG_SHORT, symbol, max_high,
+        )
+        return "resuelta"
+
+    log.info("%s %s: el precio aún no rompe el máximo (%.8f); sigue en seguimiento.", _SEG_SHORT, symbol, max_high)
+    return "pendiente"
 
 
 async def _run_tracking_list(path: str, demo: bool, handler) -> None:
@@ -1050,56 +1192,66 @@ async def gestionar_seguimiento_long(exchange_long: "ccxt.bingx", market_exchang
                                      run_tp_tracking: bool = False, run_sl_tracking: bool = False) -> None:
     """
     PASO 1 (parte LONG), AL INICIO de cada corrida (modos full y tp_only).
-    - Archivo de TP (LIMIT pendientes y longs sin TP): solo si `run_tp_tracking`
-      (disparador INTERNO).
-    - Archivo de SL (break even al romper el máximo): solo si `run_sl_tracking`
-      (disparador EXTERNO, el puntual).
+    - Archivo de TP/SL inicial (LIMIT pendientes y longs sin TP/SL): solo si
+      `run_tp_tracking` (disparador INTERNO).
+    - Archivo de break even: solo si `run_sl_tracking` (disparador EXTERNO).
     """
-    ensure_long_json_files()
     demo = _es_sandbox(exchange_long)
     if run_tp_tracking:
         await _run_tracking_list(LONG_TP_TRACKING_FILE, demo, lambda it: _handle_tp_tracking(exchange_long, market_exchange, it))
     else:
         log.info(
-            "%s Seguimiento de Take Profit omitido: esta corrida no vino del disparador INTERNO "
-            "(RUN_LONG_TP_TRACKING=false).", _SEG,
+            "%s Seguimiento de Take Profit / Stop Loss inicial omitido: esta corrida no vino del "
+            "disparador INTERNO (RUN_LONG_TP_TRACKING=false).", _SEG,
         )
     if run_sl_tracking:
         await _run_tracking_list(LONG_SL_TRACKING_FILE, demo, lambda it: _handle_sl_tracking(exchange_long, market_exchange, it))
     else:
         log.info(
-            "%s Seguimiento de Stop Loss (break even al romper el máximo) omitido: esta corrida no vino "
+            "%s Seguimiento del break even omitido: esta corrida no vino "
             "del disparador EXTERNO (RUN_LONG_SL_TRACKING=false).", _SEG,
         )
 
 
+async def gestionar_seguimiento_short(exchange_short: "ccxt.bingx", market_exchange: "ccxt.bingx") -> None:
+    """Revisa short_tracking.json (no coloca órdenes): libera los pares cuyo máximo ya se rompió. En todas las corridas."""
+    demo = _es_sandbox(exchange_short)
+    await _run_tracking_list(SHORT_TRACKING_FILE, demo, lambda it: _handle_short_tracking(exchange_short, market_exchange, it))
+
+
+def _symbols_en_seguimiento_short(demo: bool) -> set[str]:
+    return {
+        it["symbol"] for it in _load_json_list(SHORT_TRACKING_FILE)
+        if it.get("symbol") and bool(it.get("demo")) == demo
+    }
+
+
 async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
     """
-    LONG INVERTIDO TEMPORAL (Paso 10 fuera de ciclo + singularidad
-    positiva, plan de short_strategy). Abre en `exchange` (exchange_long).
-    Proceso espejo de execute_entry() (SHORT):
+    LONG INVERTIDO (plan de short_strategy con direccion="LONG"). Abre en
+    `exchange` (exchange_long).
       - Si last_price <= SMA20(5m) (el precio YA tocó la media) -> entrada
-        a MERCADO; la distancia del apalancamiento usa el precio actual.
-      - Si no (precio aún por encima de la SMA20(5m)) -> orden LIMIT de
-        compra en la SMA20(5m), esperando que el precio baje a tocarla; la
-        distancia del apalancamiento usa la SMA20(5m).
-    Apalancamiento: strat_short.calculate_leverage(max_high_5m, referencia).
-    Margen: 100 USDT/VST fijos o el máximo por apalancamiento para el par
-    (el menor), sin Stop Loss inicial: el break even se coloca cuando el
-    precio rompe el máximo (json/long_stop_loss_tracking.json).
-    TAKE PROFIT: orden TAKE_PROFIT_MARKET (la misma del SHORT) en
-    entrada * (1 + distancia% SMA20(1h)->EMA200(1h)). Entrada a mercado ->
-    se coloca justo después. Entrada LIMIT -> se anota en
-    json/long_take_profit_tracking.json y se coloca cuando la orden se llene (no
-    hay posición todavía). Ganancia sobre el margen =
-    distancia% * apalancamiento.
+        a MERCADO; la referencia de la distancia es el precio actual.
+      - Si no -> orden LIMIT de compra en la SMA20(5m); la referencia es la
+        SMA20(5m).
+    STOP LOSS Y APALANCAMIENTO: comparten la distancia
+        (referencia - EMA200(5m)) / referencia. Apalancamiento = 80 / distancia %.
+    El Stop Loss inicial es una orden STOP_MARKET en la EMA200(5m). Si la
+    EMA200(5m) está en o sobre la referencia NO se abre la operación (no hay
+    punto para el stop). Cuando el precio sube entrada + |entrada - EMA50(1h)|
+    se cancela ese stop y se coloca el break even (ver _handle_sl_tracking).
+    Margen: 100 USDT/VST fijos o el máximo por apalancamiento (el menor).
+    TAKE PROFIT: TAKE_PROFIT_MARKET en entrada * (1 + distancia% SMA20(1h)->EMA200(1h)).
+    Entrada a mercado -> TP y SL se colocan justo después. Entrada LIMIT ->
+    se anota en json/long_take_profit_tracking.json y se colocan al llenarse.
     Si es_maximo_round es False no se opera nada.
     """
     symbol = plan["symbol"]
     tag = "[Paso 13][LONG-INV]"
-    max_high_5m = plan["max_high_5m"]
     ma20_5m_value = plan["ma20_5m_value"]
     es_maximo_round = plan.get("es_maximo_round", True)
+    ema200_5m = plan.get("ema200_5m")
+    ema50_1h = plan.get("ema50_1h")
 
     market = exchange.markets.get(symbol, {})
     if _looks_like_forex_or_cfd(market):
@@ -1108,6 +1260,10 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
 
     if not es_maximo_round:
         log.info("%s %s es_maximo_round=False -> no se opera nada.", symbol, tag)
+        return
+
+    if ema200_5m is None:
+        log.error("%s %s: el plan no trae la EMA200(5m), no hay punto para el Stop Loss; se omite la entrada.", symbol, tag)
         return
 
     try:
@@ -1127,13 +1283,13 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
         if touched:
             reference_price = last_price
             log.info(
-                "%s %s Entrada será a MERCADO (el precio ya tocó la SMA20(5m)) -> distancia usa el precio actual=%.8f",
+                "%s %s Entrada será a MERCADO (el precio ya tocó la SMA20(5m)) -> referencia = precio actual=%.8f",
                 symbol, tag, reference_price,
             )
         else:
             reference_price = ma20_5m_value
             log.info(
-                "%s %s Entrada será LIMIT (precio aún no toca la SMA20(5m)) -> distancia usa la SMA20(5m)=%.8f",
+                "%s %s Entrada será LIMIT (precio aún no toca la SMA20(5m)) -> referencia = SMA20(5m)=%.8f",
                 symbol, tag, reference_price,
             )
 
@@ -1148,11 +1304,17 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
             return
         tp_price = float(exchange.price_to_precision(symbol, tp_price))
 
+        # STOP LOSS INICIAL en la EMA200(5m). Si queda en o sobre la entrada NO se abre.
+        sl_price = float(exchange.price_to_precision(symbol, ema200_5m))
         try:
-            leverage_calc = strat_short.calculate_leverage(max_high_5m, reference_price)
+            leverage_calc = strat_short.calculate_leverage_long(reference_price, sl_price)
         except ValueError as exc:
-            log.info("%s descartado en %s: %s", symbol, tag, exc)
+            log.info(
+                "%s descartado en %s: %s (EMA200(5m)=%.8f, referencia de entrada=%.8f). No se abre la operación.",
+                symbol, tag, exc, sl_price, reference_price,
+            )
             return
+        sl_dist_pct = (reference_price - sl_price) / reference_price * 100
 
         max_leverage_exchange = await strat_short.get_max_leverage_for_symbol(exchange, symbol)
         if max_leverage_exchange is not None:
@@ -1175,8 +1337,10 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
         roe_pct = tp_pct * leverage
         log.info(
             "%s aprobó %s: apalancamiento=%dx (calculado=%.1fx) | margen=%.2f USDT | "
-            "TP=%.8f (+%.2f%% de precio = %.1f%% sobre margen)",
-            symbol, tag, leverage, leverage_calc, margin_usdt, tp_price, tp_pct, roe_pct,
+            "SL inicial=EMA200(5m)=%.8f (-%.2f%% de precio = -%.1f%% sobre margen) | "
+            "TP=%.8f (+%.2f%% de precio = +%.1f%% sobre margen)",
+            symbol, tag, leverage, leverage_calc, margin_usdt,
+            sl_price, sl_dist_pct, sl_dist_pct * leverage, tp_price, tp_pct, roe_pct,
         )
 
         notional = margin_usdt * leverage
@@ -1190,13 +1354,15 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
             )
             log.info(
                 "[Paso 14][LONG-INV] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | "
-                "TP=%.8f (+%.2f%% precio, %.1f%% sobre margen) | order_id=%s",
-                symbol, margin_usdt, leverage, tp_price, tp_pct, roe_pct, order.get("id"),
+                "TP=%.8f (+%.2f%% precio, %.1f%% sobre margen) | SL=%.8f | order_id=%s",
+                symbol, margin_usdt, leverage, tp_price, tp_pct, roe_pct, sl_price, order.get("id"),
             )
-            tp_ok, entry_real = await _colocar_tp_tras_entrada_market(exchange, symbol, tp_price, tp_pct)
+            todo_ok, entry_real = await _colocar_protecciones_tras_entrada_market(
+                exchange, symbol, tp_price, tp_pct, sl_price,
+            )
             _registrar_long_abierto(
-                exchange, plan, symbol, tp_ok,
-                entry_real if entry_real is not None else reference_price, tp_pct, leverage,
+                exchange, plan, symbol, todo_ok,
+                entry_real if entry_real is not None else reference_price, tp_pct, leverage, sl_price,
             )
         else:
             amount = notional / ma20_5m_value
@@ -1206,8 +1372,8 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
             )
             log.info(
                 "[Paso 14][LONG-INV] Long LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | "
-                "TP previsto=%.8f (+%.2f%% precio, %.1f%% sobre margen; se coloca al llenarse la orden) | order_id=%s",
-                ma20_5m_value, symbol, margin_usdt, leverage, tp_price, tp_pct, roe_pct, order.get("id"),
+                "TP previsto=%.8f (+%.2f%% precio, %.1f%% sobre margen) y SL previsto=%.8f (se colocan al llenarse la orden) | order_id=%s",
+                ma20_5m_value, symbol, margin_usdt, leverage, tp_price, tp_pct, roe_pct, sl_price, order.get("id"),
             )
             registrar_orden_limit_pendiente({
                 "symbol": symbol,
@@ -1215,7 +1381,9 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
                 "limit_price": ma20_5m_value,
                 "tp_pct": tp_pct,
                 "leverage": leverage,
-                "max_high": float(plan.get("vela_a_high", max_high_5m)),
+                "max_high": float(plan.get("vela_a_high", plan["max_high_5m"])),
+                "ema50_1h": ema50_1h,
+                "sl_price": sl_price,
                 "created_ts": int(exchange.milliseconds()),
                 "demo": _es_sandbox(exchange),
             })
@@ -1224,8 +1392,8 @@ async def execute_entry_invertida(exchange: "ccxt.bingx", plan: dict) -> None:
 
 
 async def _scan_and_collect_plans(strategy, label: str, market_exchange: "ccxt.bingx",
-                                  allowed_symbols: set[str], symbols_with_position: set[str]) -> list[dict]:
-    candidatos = [s for s in allowed_symbols if s not in symbols_with_position]
+                                  allowed_symbols: set[str], symbols_excluidos: set[str]) -> list[dict]:
+    candidatos = [s for s in allowed_symbols if s not in symbols_excluidos]
     log.info("[Pasos 2-14][%s] Escaneando %d pares candidatos para nuevas entradas...", label, len(candidatos))
 
     semaphore = asyncio.Semaphore(10)
@@ -1258,22 +1426,24 @@ async def run_pasos_2_a_14_entradas(
     exchange: "ccxt.bingx",
     market_exchange: "ccxt.bingx",
     allowed_symbols: set[str],
-    symbols_with_position: set[str],
+    symbols_excluidos: set[str],
     exchange_long: "ccxt.bingx" = None,
 ) -> None:
     """
-    Escanea los pares permitidos sin posición abierta (en cualquiera de
-    las dos cuentas) con `short_strategy` y abre SHORT en `exchange`
-    (exchange_short). Si el plan viene INVERTIDO (fuera del ciclo alcista
-    en 4h, direccion="LONG"), abre LONG (mercado o LIMIT en la SMA20(5m)) en `exchange_long`.
+    Escanea los pares permitidos que no estén excluidos (posición abierta en
+    cualquiera de las dos cuentas o en seguimiento SHORT) con `short_strategy`.
+      - direccion "SHORT": abre SHORT en `exchange` (exchange_short), salvo que el plan
+        traiga seguimiento_short=True (W%R6 = W%R12 en la otra temporalidad): entonces el
+        par se anota en json/short_tracking.json y NO se entra.
+      - direccion "LONG": abre LONG invertido (mercado o LIMIT en la SMA20(5m)) en `exchange_long`.
     """
-    plans = await _scan_and_collect_plans(strat_short, "SHORT", market_exchange, allowed_symbols, symbols_with_position)
+    plans = await _scan_and_collect_plans(strat_short, "SHORT", market_exchange, allowed_symbols, symbols_excluidos)
     for plan in plans:
         log.info(
-            "  -> %s %s%s | máximo(5m)=%.8f | SMA20(5m)=%.8f | es_maximo_round=%s",
-            plan.get("direccion", "SHORT"), plan["symbol"],
-            " (INVERTIDO, fuera de ciclo 4h)" if plan.get("fuera_ciclo_4h") else "",
+            "  -> %s %s | %s | máximo(5m)=%.8f | SMA20(5m)=%.8f | es_maximo_round=%s%s",
+            plan.get("direccion", "SHORT"), plan["symbol"], plan.get("motivo_direccion", ""),
             plan["max_high_5m"], plan["ma20_5m_value"], plan.get("es_maximo_round"),
+            " | EN SEGUIMIENTO (W%R6=W%R12 en otra temporalidad)" if plan.get("seguimiento_short") else "",
         )
     for plan in plans:
         if plan.get("direccion") == "LONG":
@@ -1281,6 +1451,21 @@ async def run_pasos_2_a_14_entradas(
                 log.error("%s: plan LONG invertido sin exchange_long disponible, se omite.", plan["symbol"])
                 continue
             await execute_entry_invertida(exchange_long, plan)
+        elif plan.get("seguimiento_short"):
+            if not plan.get("es_maximo_round", True):
+                log.info("%s [SHORT] es_maximo_round=False -> no se opera ni se anota en seguimiento.", plan["symbol"])
+                continue
+            registrar_short_en_seguimiento({
+                "symbol": plan["symbol"],
+                "max_high": float(plan["max_high_seguimiento"]),
+                "tf_seguimiento": plan.get("tf_seguimiento"),
+                "created_ts": int(exchange.milliseconds()),
+                "demo": _es_sandbox(exchange),
+            })
+            log.info(
+                "%s %s: SHORT en seguimiento (W%%R6=W%%R12 en %s). No se entra hasta que el precio rompa %.8f.",
+                plan["symbol"], _SEG_SHORT, plan.get("tf_seguimiento"), float(plan["max_high_seguimiento"]),
+            )
         else:
             await execute_entry(exchange, plan)
 
@@ -1444,9 +1629,18 @@ async def main() -> None:
         await ensure_hedge_mode(exchange_short, "SHORT")
         await ensure_hedge_mode(exchange_long, "LONG")
 
-        # PASO 1 (parte LONG): seguimiento del long invertido (2 JSON): TP solo
-        # con el disparador interno, SL break even solo con el externo. Antes de
-        # todo lo demás (y en secuencia, para no pisar los JSON con las entradas nuevas).
+        ensure_json_files()
+
+        # Seguimiento del SHORT (json/short_tracking.json): libera los pares cuyo
+        # máximo ya se rompió. No coloca órdenes; corre en todas las corridas.
+        try:
+            await gestionar_seguimiento_short(exchange_short, market_exchange)
+        except Exception as exc:
+            log.error("%s Error revisando el seguimiento de los shorts: %s", _SEG_SHORT, exc)
+
+        # PASO 1 (parte LONG): TP y SL inicial solo con el disparador interno,
+        # break even solo con el externo. Antes de todo lo demás (y en
+        # secuencia, para no pisar los JSON con las entradas nuevas).
         try:
             await gestionar_seguimiento_long(exchange_long, market_exchange, run_long_tp_tracking, run_long_sl_tracking)
         except Exception as exc:
@@ -1462,6 +1656,12 @@ async def main() -> None:
         symbols_with_position_long = {p["symbol"] for p in open_positions_long}
         symbols_with_position_any = symbols_with_position_short | symbols_with_position_long
 
+        # Pares en seguimiento SHORT: el escáner los salta hasta que rompan el máximo.
+        tracked_short = _symbols_en_seguimiento_short(_es_sandbox(exchange_short))
+        if tracked_short:
+            log.info("%s Pares que el escáner salta por estar en seguimiento: %s", _SEG_SHORT, sorted(tracked_short))
+        symbols_excluidos = symbols_with_position_any | tracked_short
+
         if mode == "tp_only":
             await run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check)
             await run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check)
@@ -1471,7 +1671,7 @@ async def main() -> None:
                 run_paso1_gestion_tp(exchange_long, allowed_symbols, run_stop_loss_check),
                 run_pasos_2_a_14_entradas(
                     exchange_short, market_exchange, allowed_symbols,
-                    symbols_with_position_any, exchange_long,
+                    symbols_excluidos, exchange_long,
                 ),
             )
 
