@@ -1,1 +1,15 @@
-[]
+[
+  {
+    "symbol": "ICNT/USDT:USDT",
+    "order_id": "2110868779320741888",
+    "limit_price": 0.13895,
+    "tp_pct": 13.374661173200062,
+    "leverage": 5,
+    "max_high": 0.1427,
+    "ema50_1h": 0.11641228815636018,
+    "sl_price": 0.1254,
+    "created_ts": 1792105309824,
+    "demo": true,
+    "status": "pending_limit"
+  }
+]
