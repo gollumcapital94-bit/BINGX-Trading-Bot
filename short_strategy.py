@@ -1,53 +1,57 @@
 """
-Motor de la estrategia de ENTRADA EN CORTO (SHORT) -- Pasos 2 a 14.
+Motor de la estrategia de ENTRADA -- Pasos 2 a 14.
 
 Este archivo vive en la RAÍZ del repo (junto a bingx_bot.py) y es la ÚNICA
 estrategia activa: long_strategy.py ya no se usa.
 
 Recibe un símbolo ya filtrado como futuro perpetuo USDT-M y evalúa toda
 la cascada de condiciones. Si pasa todos los filtros devuelve un plan
-(dict) para ejecutar el SHORT (stop-limit o mercado) o, si el par está
-fuera del ciclo alcista de 4h (Paso 10), el LONG INVERTIDO a mercado.
-La ejecución (Paso 14) vive en bingx_bot.execute_entry() y
-bingx_bot.execute_entry_invertida().
-
-El plan incluye ademas sma20_1h y ema200_1h (vela 1h cerrada del maximo):
-el LONG invertido las usa para calcular su Take Profit (distancia %
-SMA20(1h)->EMA200(1h) proyectada hacia arriba desde la entrada).
+(dict) con la dirección: SHORT (stop-limit o mercado) o LONG INVERTIDO
+(mercado o LIMIT en la SMA20(5m)). La ejecución (Paso 14) vive en
+bingx_bot.execute_entry() y bingx_bot.execute_entry_invertida().
 
 SOLO SINGULARIDAD POSITIVA: S > 0 -> entrada. Si S <= 0 (o indefinida) en
 15m se intenta en 5m; si tampoco, se descarta.
 
 LECTURA DE MERCADO SIEMPRE REAL: evaluate_symbol y sus pasos reciben la
-conexión de MERCADO (build_market_data_exchange). Excepciones:
-get_max_leverage_for_symbol(), calculate_position_size() y
-calculate_position_size_inverted() se llaman con la conexión de CUENTA
-(exchange_short para el SHORT; exchange_long para el LONG invertido).
+conexión de MERCADO. Excepciones: get_max_leverage_for_symbol(),
+calculate_position_size() y calculate_position_size_inverted() se llaman
+con la conexión de CUENTA.
 
-SUPUESTOS (confirmados con el usuario):
-  - MA20 -> SMA20; EMA50/EMA200 -> exponenciales.
-  - "Máximo" (round, 15m, 5m) -> HIGH (mecha) de la vela.
-  - Apalancamiento calculado limitado al máximo real de BingX para el par.
-  - PASO 10 (ciclo alcista en 4h), regla vigente:
-      * SMA20(4h) y EMA50(4h) ambas sobre la EMA200(4h) y SMA20 > EMA50
-        -> ciclo alcista, se APRUEBA sin más condiciones (ya NO existe el
-        chequeo de "retroceso" que descartaba pares sanos como MAGIC).
-      * SMA20 <= EMA50 con ambas sobre la EMA200 (patrón A) -> se APRUEBA.
-      * Patrón B (SMA20 bajo la EMA200, EMA50 sobre ella) u "otro" (alguna
-        perdió la EMA200) -> falla el Paso 10 (LONG invertido si
-        PASO10_INVERTIR_SI_FALLA).
-      * Secuencia B -> A: cuando en la racha actual de la EMA50 sobre la
-        EMA200 se dio un patrón B y después un patrón A, y la SMA20 se
-        recompone (SMA20 > EMA50, ambas sobre la EMA200), se considera que
-        arrancó un ciclo alcista nuevo -> SHORT. Hoy esto coincide con la
-        regla general de arriba; se detecta y se registra en el log
-        ("secuencia_B_luego_A") para poder verificarlo en las pruebas.
-  - Pasos 7/8, CHEQUEO DE BORDES de W%R: W%R6/12/24 distintos entre sí
-    en la vela roja del máximo (descarta siempre si falla); además, en
-    la vela inmediatamente anterior: si es VERDE se le exige lo mismo
-    (si falla, se descarta); si es ROJA se omite el chequeo.
-  - Paso 3: NO descarta; solo anota es_maximo_round. Si es False, no se
-    opera nada (ver bingx_bot.execute_entry()).
+DIRECCIÓN (Paso 10 en 4h + RSI6 de sobrecompra en 1h/15m/5m):
+  - Ciclo alcista / inicio de ciclo (Paso 10 aprobado):
+        RSI6 <= 90 en las tres temporalidades -> SHORT
+        RSI6 >  90 en ALGUNA                  -> LONG invertido
+  - FIN de ciclo (dos patrones, ver check_step_10):
+        RSI6 <= 90 en las tres temporalidades -> LONG invertido
+        RSI6 >  90 en ALGUNA                  -> SHORT (10% de la cuenta)
+  El RSI6 YA NO descarta pares: solo cambia la dirección. Se mide en la
+  vela del máximo si es VERDE; si es ROJA, en la vela verde que la
+  antecede (si esa también es roja, no hay medición en esa temporalidad).
+
+PASO 10 (ciclo en 4h), reglas vigentes (check_step_10):
+  LONG invertido (fin de ciclo, solo dos patrones):
+    L1) SMA20 y EMA50 sobre la EMA200; la SMA20 se metió bajo la EMA50 y
+        ya se recuperó por encima (retroceso recuperado).
+    L2) SMA20 y EMA50 bajo la EMA200 con SMA20 <= EMA50.
+  SHORT:
+    S1) SMA20 > EMA50 > EMA200 sin retroceso previo (ciclo alcista).
+    S2) Patrón A: SMA20 <= EMA50, ambas sobre la EMA200, sin recuperar.
+    S3) Patrón B (antes fin de ciclo, ahora INICIO de ciclo): SMA20 bajo la
+        EMA200 con la EMA50 sobre ella.
+    S4) Inicio de ciclo: SMA20 > EMA50 con ambas bajo la EMA200.
+    S5) SMA20 sobre la EMA200 y EMA50 aún bajo ella (SMA20 > EMA50).
+
+CHEQUEO W%R EN LA OTRA TEMPORALIDAD (solo SHORT): si la singularidad la dio
+la de 15m se revisa la de 5m (y viceversa). En la vela del máximo de esa
+otra temporalidad, W%R6 y W%R12 deben ser distintos. Si son iguales el plan
+sale con seguimiento_short=True y el bot NO entra: el par queda en
+json/short_tracking.json hasta que el precio rompa ese máximo.
+
+Pasos 7/8, CHEQUEO DE BORDES de W%R: W%R6/12/24 distintos entre sí
+en la vela roja del máximo; además, en la vela inmediatamente anterior: si
+es VERDE se le exige lo mismo; si es ROJA se omite.
+Paso 3: NO descarta; solo anota es_maximo_round. Si es False, no se opera.
 
 NOTA: abre posiciones apalancadas de forma 100% automática.
 Prueba en demo o con montos pequeños antes de usar dinero real.
@@ -68,14 +72,13 @@ log = logging.getLogger("bingx_bot.short_strategy")
 # ----------------------------------------------------------------------
 RSI_OVERBOUGHT = 90
 MIN_VOLUME_24H_USDT = 2_000_000
-MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (SHORT convencional)
+MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (SHORT)
 LEVERAGE_BASE = 80
 LEVERAGE_ROUND_STEP = 5
 
 # Entrada LONG invertida: margen FIJO de 100 USDT (100 VST en demo), o el
-# máximo que permita el apalancamiento calculado para ese par si es menor
-# (ej.: si a ese apalancamiento solo caben 50, entra con 50). Nunca más que
-# el margen libre de la cuenta.
+# máximo que permita el apalancamiento calculado para ese par si es menor.
+# Nunca más que el margen libre de la cuenta.
 MARGIN_FIXED_INVERTED = 100.0
 
 OHLCV_LIMIT_1H = 1200
@@ -83,12 +86,10 @@ OHLCV_LIMIT_4H = 1200
 OHLCV_LIMIT_LOWER_TF = 500  # 15m
 OHLCV_LIMIT_5M = 1000       # 5m
 
-# TEMPORAL -- Paso 10 en modo "invertir": si el par NO está en ciclo
-# alcista en 4h (falla el patrón del Paso 10), en vez de descartarlo se
-# sigue con los Pasos 11/12 (la singularidad positiva SIGUE siendo
-# obligatoria) y, si hay singularidad, el plan sale como LONG a mercado
-# (direccion="LONG", fuera_ciclo_4h=True). Poner False para volver al
-# comportamiento normal (descartar en el Paso 10).
+# Paso 10 en modo "invertir": si el par está en FIN de ciclo, en vez de
+# descartarlo se sigue con los Pasos 11/12 (la singularidad positiva SIGUE
+# siendo obligatoria) y la dirección sale del RSI (ver docstring). Poner
+# False para descartar los pares en fin de ciclo en el Paso 10.
 PASO10_INVERTIR_SI_FALLA = True
 
 # Tope real de BingX: 1440 velas por petición individual de klines.
@@ -113,6 +114,10 @@ def _is_green(row) -> bool:
 
 def _is_red(row) -> bool:
     return row["close"] < row["open"]
+
+
+def _fmt(value) -> str:
+    return "n/d" if value is None else f"{value:.2f}"
 
 
 # ----------------------------------------------------------------------
@@ -216,29 +221,33 @@ def check_step_2_3(df_1h_closed: pd.DataFrame):
 
 
 # ----------------------------------------------------------------------
-# Paso 4: filtro de sobrecompra RSI6 en 1h
+# RSI6 de sobrecompra (Paso 4 en 1h y medición equivalente en 15m / 5m).
+# YA NO DESCARTA: solo informa y decide la dirección.
 # ----------------------------------------------------------------------
-def check_step_4(df_1h_closed: pd.DataFrame, last_idx: int):
-    close = df_1h_closed["close"]
-    rsi6 = rsi(close, 6)
+def medir_rsi6_vela_verde(df_closed: pd.DataFrame, idx: int):
+    """
+    RSI6 de la vela del máximo (`idx`) si es VERDE; si es ROJA, el de la
+    vela verde que la antecede. Devuelve (rsi6, idx_medido) o (None, None)
+    si no hay vela verde que medir.
+    """
+    rsi6 = rsi(df_closed["close"], 6)
 
-    last_candle = df_1h_closed.iloc[last_idx]
-
-    if _is_green(last_candle):
-        check_idx = last_idx
+    if _is_green(df_closed.iloc[idx]):
+        check_idx = idx
+    elif idx > 0 and _is_green(df_closed.iloc[idx - 1]):
+        check_idx = idx - 1
     else:
-        if last_idx == 0:
-            return False, {"reason": "No hay vela previa para evaluar (paso 4)"}
-        prev_candle = df_1h_closed.iloc[last_idx - 1]
-        if not _is_green(prev_candle):
-            return False, {"reason": "La vela máxima es roja y la anterior también es roja"}
-        check_idx = last_idx - 1
+        return None, None
 
-    rsi_value = float(rsi6.iloc[check_idx])
-    if rsi_value > RSI_OVERBOUGHT:
-        return False, {"reason": f"RSI6(1h)={rsi_value:.2f} > 90, sobrecomprado"}
+    return float(rsi6.iloc[check_idx]), check_idx
 
-    return True, {"rsi6_1h": rsi_value}
+
+def check_step_4(df_1h_closed: pd.DataFrame, last_idx: int):
+    """Paso 4 (1h): mide el RSI6; NUNCA descarta. Devuelve siempre (True, info)."""
+    rsi_value, _idx = medir_rsi6_vela_verde(df_1h_closed, last_idx)
+    if rsi_value is None:
+        return True, {"rsi6_1h": None, "sobrecomprado_1h": False}
+    return True, {"rsi6_1h": rsi_value, "sobrecomprado_1h": rsi_value > RSI_OVERBOUGHT}
 
 
 # ----------------------------------------------------------------------
@@ -348,6 +357,31 @@ def check_wr_bordes(df_closed: pd.DataFrame, idx: int, tf_label: str, step_num: 
     return True, info
 
 
+def check_wr6_wr12_distintos_otra_tf(df_closed: pd.DataFrame, window_start_ts: int, window_end_ts: int):
+    """
+    Chequeo de la OTRA temporalidad (la que no dio la singularidad) para los
+    SHORT: en la vela del máximo dentro de la ventana de la vela 1h (verde o
+    roja, da igual), W%R6 y W%R12 deben ser DISTINTOS.
+    Devuelve (distintos | None, info). None = no hubo velas para verificar.
+    """
+    idx = _find_max_candle_in_window(df_closed, window_start_ts, window_end_ts)
+    if idx is None:
+        return None, {}
+
+    wr6 = williams_r(df_closed["high"], df_closed["low"], df_closed["close"], 6)
+    wr12 = williams_r(df_closed["high"], df_closed["low"], df_closed["close"], 12)
+    v6 = float(wr6.iloc[idx])
+    v12 = float(wr12.iloc[idx])
+
+    distintos = not math.isclose(v6, v12, rel_tol=1e-9, abs_tol=1e-12)
+    return distintos, {
+        "idx": idx,
+        "max_high": float(df_closed["high"].iloc[idx]),
+        "wr6": v6,
+        "wr12": v12,
+    }
+
+
 def _get_rsi6_rsi12(df_closed: pd.DataFrame, idx: int) -> tuple[float, float]:
     close = df_closed["close"]
     rsi6 = rsi(close, 6)
@@ -414,53 +448,32 @@ async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_li
 
 
 # ----------------------------------------------------------------------
-# Paso 10: SMA20/EMA50/EMA200 en 4H (ciclo alcista)
+# Paso 10: SMA20/EMA50/EMA200 en 4H (ciclo)
+# Devuelve (True, info) -> ciclo alcista / inicio de ciclo.
+#          (False, info) -> FIN de ciclo (dos patrones) o datos insuficientes.
 # ----------------------------------------------------------------------
-def _classify_fin_ciclo_alcista(sma20_value: float, ema50_value: float, ema200_value: float) -> str:
-    """Se usa cuando SMA20(4h) <= EMA50(4h)."""
-    if ema50_value > ema200_value and sma20_value > ema200_value:
-        return "A"
-    if ema50_value > ema200_value and sma20_value <= ema200_value:
-        return "B"
-    return "otro"
-
-
-def _detectar_secuencia_B_luego_A(sma20: pd.Series, ema50: pd.Series, ema200: pd.Series):
+def _hubo_retroceso_recuperado(sma20: pd.Series, ema50: pd.Series, ema200: pd.Series) -> bool:
     """
-    Dentro de la racha ACTUAL de la EMA50 sobre la EMA200, busca un patrón B
-    (SMA20 <= EMA200 con la EMA50 sobre la EMA200) y, DESPUÉS, un patrón A
-    (SMA20 <= EMA50 con ambas sobre la EMA200).
-    Devuelve (encontrada, idx_B, idx_A). Solo diagnóstico: la decisión del
-    Paso 10 no depende de esto (ver docstring del módulo).
+    En la racha ACTUAL con SMA20 y EMA50 ambas sobre la EMA200, True si la
+    SMA20 estuvo en algún momento <= EMA50 (retroceso). Se usa solo cuando
+    ahora SMA20 > EMA50, o sea, cuando el retroceso ya se recuperó.
     """
-    ema50_sobre = (ema50 > ema200).to_numpy()
-    if not len(ema50_sobre) or not bool(ema50_sobre[-1]):
-        return False, None, None
-
-    no_sobre = np.flatnonzero(~ema50_sobre)
-    start = int(no_sobre[-1]) + 1 if len(no_sobre) else 0
-
     s20 = sma20.to_numpy()
     e50 = ema50.to_numpy()
     e200 = ema200.to_numpy()
 
-    idx_b = None
-    for i in range(start, len(s20)):
-        if np.isnan(s20[i]):
-            continue
-        es_b = e50[i] > e200[i] and s20[i] <= e200[i]
-        es_a = s20[i] <= e50[i] and s20[i] > e200[i] and e50[i] > e200[i]
-        if idx_b is None:
-            if es_b:
-                idx_b = i
-        elif es_a:
-            return True, idx_b, i
+    ambas_sobre = (s20 > e200) & (e50 > e200)  # NaN -> False
+    if not len(ambas_sobre) or not bool(ambas_sobre[-1]):
+        return False
 
-    return False, idx_b, None
+    no_sobre = np.flatnonzero(~ambas_sobre)
+    start = int(no_sobre[-1]) + 1 if len(no_sobre) else 0
+
+    return bool(np.any(s20[start:] <= e50[start:]))
 
 
 async def check_step_10(exchange, symbol: str):
-    """Devuelve (passed, info)."""
+    """Devuelve (passed, info). passed=True -> ciclo/inicio de ciclo; False -> FIN de ciclo."""
     raw_4h = await _fetch_ohlcv_paginated(exchange, symbol, "4h", OHLCV_LIMIT_4H + 1)
     closed_4h = raw_4h[:-1]
 
@@ -481,89 +494,57 @@ async def check_step_10(exchange, symbol: str):
     ema50_4h = ema(close_4h, 50)
     ema200_4h = ema(close_4h, 200)
 
-    sma20_value = float(sma20_4h.iloc[-1])
-    ema50_value = float(ema50_4h.iloc[-1])
-    ema200_value = float(ema200_4h.iloc[-1])
+    s20 = float(sma20_4h.iloc[-1])
+    e50 = float(ema50_4h.iloc[-1])
+    e200 = float(ema200_4h.iloc[-1])
 
-    base_info = {"sma20_4h": sma20_value, "ema50_4h": ema50_value, "ema200_4h": ema200_value}
+    base = {"sma20_4h": s20, "ema50_4h": e50, "ema200_4h": e200}
+    ambas_sobre = s20 > e200 and e50 > e200
+    ambas_bajo = s20 <= e200 and e50 <= e200
 
-    # --- Secuencia B -> A en la racha actual (diagnóstico para pruebas) ---
-    seq_ok, idx_b, idx_a = _detectar_secuencia_B_luego_A(sma20_4h, ema50_4h, ema200_4h)
-    base_info["secuencia_B_luego_A"] = seq_ok
-    if seq_ok:
+    if s20 > e50:
+        if ambas_sobre:
+            if _hubo_retroceso_recuperado(sma20_4h, ema50_4h, ema200_4h):
+                return False, {
+                    "reason": (
+                        f"[Paso 10] FIN de ciclo alcista (4h): ambas sobre la EMA200({e200:.8f}); la SMA20 "
+                        f"se metió bajo la EMA50 y ya se recuperó (SMA20={s20:.8f} > EMA50={e50:.8f})."
+                    ),
+                    "failed_step": 10, "fin_ciclo_patron": "L1_retroceso_recuperado", **base,
+                }
+            log.info("%s [Paso 10] Ciclo alcista 4h normal (SMA20 > EMA50 > EMA200, sin retroceso previo).", symbol)
+            return True, {**base, "patron": "S1_ciclo_alcista"}
+        if ambas_bajo:
+            log.info(
+                "%s [Paso 10] INICIO de ciclo (4h): SMA20=%.8f > EMA50=%.8f, ambas bajo la EMA200=%.8f.",
+                symbol, s20, e50, e200,
+            )
+            return True, {**base, "patron": "S4_inicio_ciclo"}
         log.info(
-            "%s [Paso 10] Secuencia detectada en 4h: patrón B (idx=%d) y luego patrón A (idx=%d) "
-            "dentro de la racha actual de la EMA50 sobre la EMA200.",
-            symbol, idx_b, idx_a,
+            "%s [Paso 10] SMA20(4h)=%.8f sobre la EMA200=%.8f y la EMA50=%.8f aún bajo ella -> inicio de ciclo.",
+            symbol, s20, e200, e50,
         )
+        return True, {**base, "patron": "S5_sma20_sobre_ema200_ema50_bajo"}
 
-    # --- SMA20 <= EMA50: puede ser patrón A (se aprueba) o B/otro (falla) ---
-    if sma20_value <= ema50_value:
-        fin_patron = _classify_fin_ciclo_alcista(sma20_value, ema50_value, ema200_value)
+    # SMA20 <= EMA50
+    if ambas_sobre:
+        log.info("%s [Paso 10] Patrón A (SMA20 bajo la EMA50, ambas sobre la EMA200, sin recuperar).", symbol)
+        return True, {**base, "patron": "S2_patron_A"}
 
-        if fin_patron == "A":
-            # Retroceso DENTRO del ciclo alcista: ninguna de las dos perdió la
-            # EMA200(4h) -> el ciclo sigue vivo, se APRUEBA (entra SHORT).
-            log.info(
-                "%s [Paso 10] Patrón A (retroceso dentro del ciclo alcista): SMA20(4h)=%.8f <= "
-                "EMA50(4h)=%.8f pero ambas sobre la EMA200(4h)=%.8f -> se APRUEBA como ciclo alcista.",
-                symbol, sma20_value, ema50_value, ema200_value,
-            )
-            return True, {**base_info, "patron_A_retroceso": True}
+    if e50 > e200 and s20 <= e200:
+        log.info(
+            "%s [Paso 10] Patrón B = INICIO de ciclo: SMA20(4h)=%.8f bajo la EMA200=%.8f con la "
+            "EMA50=%.8f sobre ella.",
+            symbol, s20, e200, e50,
+        )
+        return True, {**base, "patron": "S3_patron_B_inicio_ciclo"}
 
-        if fin_patron == "B":
-            detalle_patron = (
-                "Patrón B de fin de ciclo alcista, en 4h (retroceso profundo): la "
-                "SMA20(4h) cayó por debajo de la EMA50(4h) Y también por debajo de la "
-                "EMA200(4h), mientras la EMA50(4h) se mantiene por encima de la EMA200(4h)."
-            )
-        else:
-            detalle_patron = (
-                "La SMA20(4h) y la EMA50(4h) están además por debajo de la EMA200(4h) "
-                "(retroceso aún más profundo, en 4h)."
-            )
-
-        return False, {
-            "reason": (
-                f"[Paso 10] SMA20(4h)={sma20_value:.8f} no está por encima de la "
-                f"EMA50(4h)={ema50_value:.8f}. {detalle_patron}"
-            ),
-            "failed_step": 10,
-            "fin_ciclo_patron": fin_patron,
-            **base_info,
-        }
-
-    # --- SMA20 > EMA50 ---
-    both_above_ema200 = sma20_value > ema200_value and ema50_value > ema200_value
-
-    if both_above_ema200:
-        # Ciclo alcista confirmado: ambas sobre la EMA200 y SMA20 > EMA50.
-        # Sin chequeo de "retroceso" (corregido: descartaba pares sanos).
-        not_both = ((sma20_4h <= ema200_4h) | (ema50_4h <= ema200_4h)).to_numpy()
-        idx_last_not_both = np.flatnonzero(not_both)
-        if len(idx_last_not_both):
-            velas = len(sma20_4h) - 1 - int(idx_last_not_both[-1])
-            log.info(
-                "%s [Paso 10] Ciclo alcista 4h confirmado: ambas sobre la EMA200 desde hace %d velas%s.",
-                symbol, velas,
-                " (ciclo recompuesto tras secuencia B -> A)" if seq_ok else "",
-            )
-        else:
-            log.info(
-                "%s [Paso 10] Ciclo alcista 4h: ambas sobre la EMA200 en toda la ventana.", symbol,
-            )
-        return True, base_info
-
-    # SMA20 > EMA50 pero alguna de las dos NO está sobre la EMA200:
-    # no es ciclo alcista (se mantiene el comportamiento original: aprueba
-    # solo si ambas están sobre la EMA200 o es patrón A).
     return False, {
         "reason": (
-            f"[Paso 10] SMA20(4h)={sma20_value:.8f} > EMA50(4h)={ema50_value:.8f} pero "
-            f"no están ambas sobre la EMA200(4h)={ema200_value:.8f} -> fuera de ciclo alcista"
+            f"[Paso 10] FIN de ciclo (4h): SMA20={s20:.8f} <= EMA50={e50:.8f}, ambas bajo la "
+            f"EMA200={e200:.8f}."
         ),
-        "failed_step": 10,
-        **base_info,
+        "failed_step": 10, "fin_ciclo_patron": "L2_ambas_bajo_ema200", **base,
     }
 
 
@@ -626,6 +607,7 @@ def check_step_12_singularidad_5m(rsi6_5m: float, rsi12_5m: float, wr6_5m: float
 # ----------------------------------------------------------------------
 def calculate_leverage(max_high_5m: float, reference_price: float) -> float:
     """
+    SHORT. Distancia = del máximo (5m) al precio de referencia.
     reference_price: SMA20(5m) para una orden STOP, o el precio actual
     para una entrada a MERCADO.
     """
@@ -635,6 +617,30 @@ def calculate_leverage(max_high_5m: float, reference_price: float) -> float:
     distancia_pct = (max_high_5m - reference_price) / max_high_5m * 100
     if distancia_pct <= 0:
         raise ValueError("El precio de referencia está por encima del máximo, distancia inválida")
+
+    leverage = LEVERAGE_BASE / distancia_pct
+    leverage_rounded = math.floor(leverage / LEVERAGE_ROUND_STEP) * LEVERAGE_ROUND_STEP
+    return max(leverage_rounded, LEVERAGE_ROUND_STEP)
+
+
+def calculate_leverage_long(reference_price: float, sl_price: float) -> float:
+    """
+    LONG invertido. La distancia del Stop Loss y la del apalancamiento son la
+    MISMA: del precio de entrada (mercado = precio actual; LIMIT = SMA20(5m))
+    a la EMA200(5m), que es donde se coloca el Stop Loss.
+        distancia % = (entrada - EMA200(5m)) / entrada * 100
+        apalancamiento = 80 / distancia %   (redondeado hacia abajo a pasos de 5)
+    Si la EMA200(5m) está en o sobre la entrada no hay punto para el stop:
+    lanza ValueError y NO se abre la operación.
+    """
+    if reference_price <= 0:
+        raise ValueError("precio de referencia inválido")
+
+    distancia_pct = (reference_price - sl_price) / reference_price * 100
+    if distancia_pct <= 0:
+        raise ValueError(
+            "la EMA200(5m) está en o sobre el precio de entrada: no hay punto para el Stop Loss"
+        )
 
     leverage = LEVERAGE_BASE / distancia_pct
     leverage_rounded = math.floor(leverage / LEVERAGE_ROUND_STEP) * LEVERAGE_ROUND_STEP
@@ -723,8 +729,8 @@ def _get_free_balance(balance: dict) -> float:
 
 async def calculate_position_size(exchange, symbol: str, leverage: int) -> float:
     """
-    SHORT convencional: el MENOR entre el 10% del margen total de la
-    cuenta y el margen máximo que permite el apalancamiento elegido.
+    SHORT: el MENOR entre el 10% del margen total de la cuenta y el margen
+    máximo que permite el apalancamiento elegido.
     """
     balance = await exchange.fetch_balance()
     total_balance = _get_available_balance(balance)
@@ -836,24 +842,28 @@ async def evaluate_symbol(exchange, symbol: str):
         expected_max_high = float(info["last_candle"]["high"])
         expected_max_low = float(info["last_candle"]["low"])
 
-        ok, info4 = check_step_4(df_1h, last_idx)
-        if not ok:
-            log.info("%s descartado en [Paso 4]: %s", symbol, info4["reason"])
-            return None, 4
+        # Paso 4: RSI6(1h). YA NO descarta: solo se registra y decide la dirección.
+        _ok4, info4 = check_step_4(df_1h, last_idx)
+        rsi_1h = info4["rsi6_1h"]
+        sobre_1h = info4["sobrecomprado_1h"]
+        log.info(
+            "%s [Paso 4] RSI6(1h)=%s -> %s (informativo, ya NO descarta).",
+            symbol, _fmt(rsi_1h), "SOBRECOMPRADO (>90)" if sobre_1h else "sin sobrecompra",
+        )
 
         ok, info9_vol = await check_step_9_volume(exchange, symbol)
         if not ok:
             log.info("%s descartado en %s", symbol, info9_vol["reason"])
             return None, 9
 
-        fuera_ciclo_4h = False
+        fin_ciclo_4h = False
         ok10, info10 = await check_step_10(exchange, symbol)
         if not ok10:
             if PASO10_INVERTIR_SI_FALLA and not info10.get("datos_insuficientes"):
-                fuera_ciclo_4h = True
+                fin_ciclo_4h = True
                 log.info(
-                    "%s fuera del ciclo alcista en 4h (%s) -> MODO INVERTIDO: continúa a la "
-                    "singularidad; si existe, entrará en LONG a mercado.",
+                    "%s en FIN de ciclo en 4h (%s) -> continúa a la singularidad; la dirección "
+                    "dependerá del RSI6 (sobrecompra -> SHORT; si no -> LONG invertido).",
                     symbol, info10["reason"],
                 )
             else:
@@ -861,14 +871,33 @@ async def evaluate_symbol(exchange, symbol: str):
                 return None, 10
         else:
             log.info(
-                "%s aprobó [Paso 10]: SMA20(4h)=%.8f | EMA50(4h)=%.8f | EMA200(4h)=%.8f",
-                symbol, info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
+                "%s aprobó [Paso 10] (%s): SMA20(4h)=%.8f | EMA50(4h)=%.8f | EMA200(4h)=%.8f",
+                symbol, info10.get("patron"), info10["sma20_4h"], info10["ema50_4h"], info10["ema200_4h"],
             )
 
         raw_15m = await exchange.fetch_ohlcv(symbol, timeframe="15m", limit=OHLCV_LIMIT_LOWER_TF)
         df_15m = _drop_unclosed_candle(_to_dataframe(raw_15m))
         raw_5m = await exchange.fetch_ohlcv(symbol, timeframe="5m", limit=OHLCV_LIMIT_5M)
         df_5m = _drop_unclosed_candle(_to_dataframe(raw_5m))
+
+        # RSI6 de sobrecompra en 15m y 5m (vela del máximo dentro de la ventana
+        # de la vela 1h; si es roja, la verde que la antecede). Solo informa.
+        rsi_15m = None
+        idx_max_15m = _find_max_candle_in_window(df_15m, window_start_ts, window_end_ts)
+        if idx_max_15m is not None:
+            rsi_15m, _ = medir_rsi6_vela_verde(df_15m, idx_max_15m)
+        sobre_15m = rsi_15m is not None and rsi_15m > RSI_OVERBOUGHT
+
+        rsi_5m = None
+        max_idx_5m = _find_max_candle_in_window(df_5m, window_start_ts, window_end_ts)
+        if max_idx_5m is not None:
+            rsi_5m, _ = medir_rsi6_vela_verde(df_5m, max_idx_5m)
+        sobre_5m = rsi_5m is not None and rsi_5m > RSI_OVERBOUGHT
+
+        log.info(
+            "%s [RSI6 sobrecompra] 1h=%s | 15m=%s | 5m=%s (umbral %d, informativo)",
+            symbol, _fmt(rsi_1h), _fmt(rsi_15m), _fmt(rsi_5m), RSI_OVERBOUGHT,
+        )
 
         # Paso 11 (15m)
         ok11, res11 = _evaluate_singularidad_tf(
@@ -897,7 +926,6 @@ async def evaluate_symbol(exchange, symbol: str):
         else:
             singularidad_5m = False
 
-        max_idx_5m = _find_max_candle_in_window(df_5m, window_start_ts, window_end_ts)
         if max_idx_5m is None:
             log.info("%s descartado en [Paso 13]: sin velas de 5m en la ventana del máximo.", symbol)
             return None, 12
@@ -906,23 +934,48 @@ async def evaluate_symbol(exchange, symbol: str):
         ma20_5m = sma(df_5m["close"], 20)
         ma20_5m_value = float(ma20_5m.iloc[max_idx_5m])
 
-        # SMA20(1h) y EMA200(1h) en la vela 1h cerrada del máximo: base del
-        # Take Profit del LONG invertido (distancia % SMA20 -> EMA200).
+        # EMA200(5m) (última vela 5m cerrada): punto del Stop Loss y de la
+        # distancia del apalancamiento del LONG invertido.
+        ema200_5m = float(ema(df_5m["close"], 200).iloc[-1])
+
+        # SMA20(1h), EMA200(1h) y EMA50(1h) en la vela 1h cerrada del máximo:
+        # Take Profit del LONG (SMA20->EMA200) y distancia del break even (EMA50).
         sma20_1h = float(sma(df_1h["close"], 20).iloc[last_idx])
         ema200_1h = float(ema(df_1h["close"], 200).iloc[last_idx])
+        ema50_1h = float(ema(df_1h["close"], 50).iloc[last_idx])
+
+        # ---- DIRECCIÓN ----
+        sobrecompra = sobre_1h or sobre_15m or sobre_5m
+        tfs_sobre = [lbl for lbl, flag in (("1h", sobre_1h), ("15m", sobre_15m), ("5m", sobre_5m)) if flag]
+        if fin_ciclo_4h:
+            direccion = "SHORT" if sobrecompra else "LONG"
+            motivo = (
+                f"fin de ciclo 4h + RSI6>{RSI_OVERBOUGHT} en {','.join(tfs_sobre)} -> SHORT"
+                if sobrecompra else "fin de ciclo 4h sin sobrecompra -> LONG invertido"
+            )
+        else:
+            direccion = "LONG" if sobrecompra else "SHORT"
+            motivo = (
+                f"ciclo alcista 4h + RSI6>{RSI_OVERBOUGHT} en {','.join(tfs_sobre)} -> LONG invertido"
+                if sobrecompra else "ciclo alcista 4h sin sobrecompra -> SHORT"
+            )
 
         log.info(
-            "%s [Paso 13] Datos preparados para la ejecución: %s | "
-            "max_high_5m=%.8f | ma20_5m_value=%.8f | es_maximo_round=%s | "
-            "SMA20(1h)=%.8f | EMA200(1h)=%.8f",
-            symbol, "LONG (invertido, fuera de ciclo 4h)" if fuera_ciclo_4h else "SHORT",
-            max_high_5m, ma20_5m_value, es_maximo_round, sma20_1h, ema200_1h,
+            "%s [Paso 13] Datos preparados: %s (%s) | max_high_5m=%.8f | ma20_5m_value=%.8f | "
+            "EMA200(5m)=%.8f | es_maximo_round=%s | SMA20(1h)=%.8f | EMA200(1h)=%.8f | EMA50(1h)=%.8f",
+            symbol, direccion, motivo, max_high_5m, ma20_5m_value, ema200_5m,
+            es_maximo_round, sma20_1h, ema200_1h, ema50_1h,
         )
 
         plan = {
             "symbol": symbol,
-            "direccion": "LONG" if fuera_ciclo_4h else "SHORT",
-            "fuera_ciclo_4h": fuera_ciclo_4h,
+            "direccion": direccion,
+            "motivo_direccion": motivo,
+            "fuera_ciclo_4h": fin_ciclo_4h,
+            "sobrecompra": sobrecompra,
+            "rsi6_1h": rsi_1h,
+            "rsi6_15m": rsi_15m,
+            "rsi6_5m": rsi_5m,
             "ma20_5m_value": ma20_5m_value,
             "max_high_5m": max_high_5m,
             "round_start_ts": round_start_ts,
@@ -935,9 +988,37 @@ async def evaluate_symbol(exchange, symbol: str):
             "vela_a_high": expected_max_high,
             "sma20_1h": sma20_1h,
             "ema200_1h": ema200_1h,
+            "ema50_1h": ema50_1h,
+            "ema200_5m": ema200_5m,
+            "seguimiento_short": False,
         }
+
+        # ---- SOLO SHORT: W%R6 y W%R12 distintos en la OTRA temporalidad ----
+        if direccion == "SHORT":
+            otra_df, otra_lbl = (df_5m, "5m") if singularidad_15m else (df_15m, "15m")
+            distintos, wr_info = check_wr6_wr12_distintos_otra_tf(otra_df, window_start_ts, window_end_ts)
+            if distintos is None:
+                log.warning(
+                    "%s [SHORT] sin velas de %s en la ventana del máximo: no se pudo verificar W%%R6/W%%R12 "
+                    "en la otra temporalidad; se continúa sin ese chequeo.", symbol, otra_lbl,
+                )
+            elif distintos:
+                log.info(
+                    "%s [SHORT] W%%R6/W%%R12 distintos en %s (6=%.2f, 12=%.2f) -> sin seguimiento, puede entrar.",
+                    symbol, otra_lbl, wr_info["wr6"], wr_info["wr12"],
+                )
+            else:
+                plan["seguimiento_short"] = True
+                plan["tf_seguimiento"] = otra_lbl
+                plan["max_high_seguimiento"] = wr_info["max_high"]
+                log.info(
+                    "%s [SHORT] W%%R6 y W%%R12 IGUALES en %s (6=%.2f, 12=%.2f) -> NO entra; pasa a "
+                    "seguimiento (json/short_tracking.json) hasta que el precio rompa el máximo %.8f.",
+                    symbol, otra_lbl, wr_info["wr6"], wr_info["wr12"], wr_info["max_high"],
+                )
+
         return plan, None
 
     except Exception as exc:
-        log.error("Error evaluando %s en el pipeline de entrada SHORT: %s", symbol, exc)
+        log.error("Error evaluando %s en el pipeline de entrada: %s", symbol, exc)
         return None, "exception"
