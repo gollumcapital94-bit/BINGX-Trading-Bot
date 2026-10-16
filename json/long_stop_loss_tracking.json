@@ -1,14 +1,1 @@
-[
-  {
-    "symbol": "ICNT/USDT:USDT",
-    "entry_price": 0.139,
-    "max_high": 0.1427,
-    "ema50_1h": 0.11641228815636018,
-    "sl_price": 0.1254,
-    "tp_pct": 13.374661173200062,
-    "leverage": 5,
-    "since_ts": 1792106754064,
-    "trigger_hit": false,
-    "demo": true
-  }
-]
+[]
