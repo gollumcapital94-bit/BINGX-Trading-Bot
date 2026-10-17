@@ -10,22 +10,15 @@ on:
         required: true
         type: boolean
         default: false
-      demo_mode_long:
-        description: "Ejecutar la cuenta LONG en modo DEMO (VST) en vez de cuenta real"
-        required: true
-        type: boolean
-        default: true
   schedule:
-    # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE al Paso 1 -- ver
-    # BOT_MODE más abajo. Corre CADA HORA. NUNCA escanea ni abre nuevas
-    # entradas. Es el ÚNICO disparador que coloca el Take Profit y el Stop
-    # Loss inicial (EMA200 5m) del LONG (RUN_LONG_TP_TRACKING). Como schedule
-    # no es puntual, NINGÚN Stop Loss en break even se ejecuta desde aquí (ver
-    # RUN_STOP_LOSS_CHECK y RUN_LONG_SL_TRACKING).
+    # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE al Paso 1 (Take Profit
+    # del SHORT) -- ver BOT_MODE más abajo. Corre CADA HORA. NUNCA escanea ni
+    # abre nuevas entradas. Como schedule no es puntual, el Stop Loss en break
+    # even NO se ejecuta desde aquí (ver RUN_STOP_LOSS_CHECK).
     - cron: "0 * * * *"
 
 permissions:
-  contents: write  # necesario para guardar los JSON de seguimiento (long y short) en json/
+  contents: write  # necesario para guardar json/short_tracking.json
 
 jobs:
   run-bot:
@@ -54,36 +47,26 @@ jobs:
           BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
-          BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
           # El cron interno (schedule) SOLO gestiona TP (Paso 1) de las
-          # posiciones abiertas (cuentas short y long). Cualquier otro
-          # disparador corre el bot completo.
+          # posiciones abiertas. Cualquier otro disparador corre el bot completo.
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
           # Barrido de balance futuros -> fondos: SOLO en disparador EXTERNO.
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
           # Gatillo de Stop Loss del SHORT (toque de EMA50(1h)): SOLO en
           # disparador EXTERNO. El Take Profit no depende de esta variable.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # Seguimiento del Take Profit y del Stop Loss inicial (EMA200 5m) del
-          # LONG (LIMIT pendientes y longs sin TP/SL): SOLO en disparador
-          # INTERNO (schedule). No es urgente.
-          RUN_LONG_TP_TRACKING: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
-          # Seguimiento del Stop Loss en break even del LONG (se coloca al subir
-          # el precio la distancia entrada->EMA50(1h)): SOLO en disparador
-          # EXTERNO (cronjob.org), que es el puntual -- la operación se puede virar.
-          RUN_LONG_SL_TRACKING: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
           python bingx_bot.py 2>&1 | tee bot_output.log
 
-      - name: Guardar seguimiento (JSON de long y short)
+      - name: Guardar seguimiento (JSON del short)
         if: always()
         run: |
           if [ -n "$(git status --porcelain json/)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add json/
-            git commit -m "chore: actualizar seguimiento long/short [skip ci]"
+            git commit -m "chore: actualizar seguimiento short [skip ci]"
             git pull --rebase origin "${{ github.ref_name }}" || true
             git push || echo "No se pudo hacer push del registro"
           fi
@@ -94,7 +77,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|STOP-LIMIT order placed|Long LIMIT order placed|Orden LIMIT cancelada|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
+          grep -E "Market entry executed|STOP-LIMIT order placed|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
