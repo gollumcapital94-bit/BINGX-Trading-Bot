@@ -7,11 +7,9 @@ PASO 1  -> Gestión de posiciones SHORT abiertas:
 PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py (raíz del
            repo). Todo par que pase los filtros y dé singularidad positiva
            entra en SHORT (10% de la cuenta): stop-limit o mercado.
-           - SEGUIMIENTO DEL SHORT (json/short_tracking.json): si en la OTRA
-             temporalidad (la que no dio la singularidad) el W%R6 y el W%R12
-             del máximo son iguales, NO se entra: el par queda en seguimiento
-             hasta que el precio rompa ese máximo y vuelve al escáner normal.
-           Cuando es_maximo_round es False NO se opera.
+           Si en la OTRA temporalidad (la que no dio la singularidad) el
+           W%R6 y el W%R12 del máximo son iguales, el par se DESCARTA (ese
+           filtro vive en short_strategy.py).
 BARRIDO DE BALANCE (solo mercado real, solo disparador externo) -> si el
            balance supera FUTURES_BALANCE_CAP_USDT se transfiere el excedente
            a la cuenta de FONDOS.
@@ -731,21 +729,16 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
 
 
 # ----------------------------------------------------------------------
-# SEGUIMIENTO DEL SHORT: json/short_tracking.json (lo crea el script)
-#   Pares con SHORT aprobado cuyo W%R6 y W%R12 de la OTRA temporalidad eran
-#   iguales. No se entra; el escáner los salta hasta que el precio rompa el
-#   máximo guardado (o pasen SHORT_TRACKING_EXPIRE_MS).
+# REGISTRO DE TP / BREAK EVEN COLOCADOS: json/protective_orders.json
+#   Segunda capa contra duplicados: anota la orden en cuanto se coloca. Se
+#   borra solo cuando la posición ya no está abierta, o si la orden quedó
+#   cancelada/expirada (entonces se puede volver a crear).
 #   En GitHub Actions el archivo solo persiste si el workflow hace commit y
 #   push al terminar la corrida (ver bot.yml).
 # ----------------------------------------------------------------------
 JSON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "json")
-SHORT_TRACKING_FILE = os.path.join(JSON_DIR, "short_tracking.json")
 PROTECTORS_FILE = os.path.join(JSON_DIR, "protective_orders.json")
-JSON_FILES = (SHORT_TRACKING_FILE, PROTECTORS_FILE)
-
-SHORT_TRACKING_EXPIRE_MS = 24 * 60 * 60 * 1000
-
-_SEG_SHORT = "[Seguimiento SHORT]"
+JSON_FILES = (PROTECTORS_FILE,)
 
 
 def _es_sandbox(exchange: "ccxt.bingx") -> bool:
@@ -760,7 +753,7 @@ def _load_json_list(path: str) -> list[dict]:
     except FileNotFoundError:
         return []
     except Exception as exc:
-        log.error("%s No se pudo leer %s (%s); se usa una lista vacía.", _SEG_SHORT, os.path.basename(path), exc)
+        log.error("No se pudo leer %s (%s); se usa una lista vacía.", os.path.basename(path), exc)
         return []
 
 
@@ -778,32 +771,11 @@ def ensure_json_files() -> None:
         if not os.path.exists(path):
             try:
                 _save_json_list(path, [])
-                log.info("%s Archivo creado: json/%s", _SEG_SHORT, os.path.basename(path))
+                log.info("Archivo creado: json/%s", os.path.basename(path))
             except Exception as exc:
-                log.error("%s No se pudo crear json/%s: %s", _SEG_SHORT, os.path.basename(path), exc)
+                log.error("No se pudo crear json/%s: %s", os.path.basename(path), exc)
 
 
-def registrar_short_en_seguimiento(entry: dict) -> None:
-    """Agrega `entry`; reemplaza cualquier entrada previa del mismo símbolo y modalidad (demo/real)."""
-    path = SHORT_TRACKING_FILE
-    try:
-        items = [
-            o for o in _load_json_list(path)
-            if not (o.get("symbol") == entry["symbol"] and bool(o.get("demo")) == bool(entry.get("demo")))
-        ]
-        items.append(entry)
-        _save_json_list(path, items)
-        log.info("%s %s anotado en json/%s", _SEG_SHORT, entry["symbol"], os.path.basename(path))
-    except Exception as exc:
-        log.error("%s No se pudo anotar %s en json/%s: %s", _SEG_SHORT, entry.get("symbol"), os.path.basename(path), exc)
-
-
-# ----------------------------------------------------------------------
-# REGISTRO DE TP / BREAK EVEN COLOCADOS: json/protective_orders.json
-#   Segunda capa contra duplicados: anota la orden en cuanto se coloca. Se
-#   borra solo cuando la posición ya no está abierta, o si la orden quedó
-#   cancelada/expirada (entonces se puede volver a crear).
-# ----------------------------------------------------------------------
 def _buscar_protector(symbol: str, kind: str, demo: bool):
     for it in _load_json_list(PROTECTORS_FILE):
         if it.get("symbol") == symbol and it.get("kind") == kind and bool(it.get("demo")) == demo:
@@ -854,71 +826,6 @@ def limpiar_protectores_sin_posicion(exchange: "ccxt.bingx", symbols_abiertos: s
         log.error("No se pudo limpiar json/protective_orders.json: %s", exc)
 
 
-async def _price_broke_max(market_exchange: "ccxt.bingx", symbol: str, since_ts: int, max_high: float) -> bool:
-    """True si desde `since_ts` algún high de 5m (incluida la vela en curso) superó `max_high`."""
-    candles = await market_exchange.fetch_ohlcv(
-        symbol, timeframe="5m", since=int(since_ts) - 5 * 60 * 1000, limit=1000,
-    )
-    if not candles:
-        return False
-    return max(float(c[2]) for c in candles) > float(max_high)
-
-
-async def _handle_short_tracking(exchange_short, market_exchange, it: dict) -> str:
-    """Se libera cuando el precio rompe el máximo guardado (o vence). Devuelve 'pendiente' o 'resuelta'."""
-    symbol = it["symbol"]
-    max_high = float(it["max_high"])
-    created_ts = int(it["created_ts"])
-
-    if int(exchange_short.milliseconds()) - created_ts > SHORT_TRACKING_EXPIRE_MS:
-        log.info("%s %s: el seguimiento venció sin romper el máximo (%.8f); el par vuelve al escáner.", _SEG_SHORT, symbol, max_high)
-        return "resuelta"
-
-    if await _price_broke_max(market_exchange, symbol, created_ts, max_high):
-        log.info(
-            "%s %s: el precio ROMPIÓ el máximo guardado (%.8f); el par sale del seguimiento y vuelve al "
-            "escáner normal para entrar en SHORT si vuelve a cumplir todos los pasos.",
-            _SEG_SHORT, symbol, max_high,
-        )
-        return "resuelta"
-
-    log.info("%s %s: el precio aún no rompe el máximo (%.8f); sigue en seguimiento.", _SEG_SHORT, symbol, max_high)
-    return "pendiente"
-
-
-async def gestionar_seguimiento_short(exchange_short: "ccxt.bingx", market_exchange: "ccxt.bingx") -> None:
-    """Revisa short_tracking.json (no coloca órdenes): libera los pares cuyo máximo ya se rompió. En todas las corridas."""
-    demo = _es_sandbox(exchange_short)
-    items = _load_json_list(SHORT_TRACKING_FILE)
-    if not items:
-        return
-    before = json.dumps(items, sort_keys=True)
-    conservar: list[dict] = []
-    for it in items:
-        if bool(it.get("demo")) != demo:
-            conservar.append(it)  # pertenece a la otra modalidad (demo/real)
-            continue
-        try:
-            resultado = await _handle_short_tracking(exchange_short, market_exchange, it)
-        except Exception as exc:
-            log.error("%s %s: error revisando el seguimiento (%s); se reintenta en la próxima corrida.", _SEG_SHORT, it.get("symbol"), exc)
-            resultado = "pendiente"
-        if resultado == "pendiente":
-            conservar.append(it)
-    if json.dumps(conservar, sort_keys=True) != before:
-        try:
-            _save_json_list(SHORT_TRACKING_FILE, conservar)
-        except Exception as exc:
-            log.error("%s No se pudo guardar json/%s: %s", _SEG_SHORT, os.path.basename(SHORT_TRACKING_FILE), exc)
-
-
-def _symbols_en_seguimiento_short(demo: bool) -> set[str]:
-    return {
-        it["symbol"] for it in _load_json_list(SHORT_TRACKING_FILE)
-        if it.get("symbol") and bool(it.get("demo")) == demo
-    }
-
-
 async def _scan_and_collect_plans(market_exchange: "ccxt.bingx", allowed_symbols: set[str],
                                   symbols_excluidos: set[str]) -> list[dict]:
     candidatos = [s for s in allowed_symbols if s not in symbols_excluidos]
@@ -957,37 +864,18 @@ async def run_pasos_2_a_14_entradas(
     symbols_excluidos: set[str],
 ) -> None:
     """
-    Escanea los pares permitidos que no estén excluidos (posición abierta o en
-    seguimiento SHORT). Abre SHORT en `exchange`, salvo que el plan traiga
-    seguimiento_short=True: entonces el par se anota en json/short_tracking.json
-    y NO se entra.
+    Escanea los pares permitidos que no estén excluidos (posición abierta) y
+    abre SHORT en `exchange` con cada par que cumpla todos los filtros.
     """
     plans = await _scan_and_collect_plans(market_exchange, allowed_symbols, symbols_excluidos)
     for plan in plans:
         log.info(
-            "  -> SHORT %s | patrón 4h=%s | máximo(5m)=%.8f | SMA20(5m)=%.8f | es_maximo_round=%s%s",
+            "  -> SHORT %s | patrón 4h=%s | máximo(5m)=%.8f | SMA20(5m)=%.8f | es_maximo_round=%s",
             plan["symbol"], plan.get("patron_4h"),
             plan["max_high_5m"], plan["ma20_5m_value"], plan.get("es_maximo_round"),
-            " | EN SEGUIMIENTO (W%R6=W%R12 en otra temporalidad)" if plan.get("seguimiento_short") else "",
         )
     for plan in plans:
-        if plan.get("seguimiento_short"):
-            if not plan.get("es_maximo_round", True):
-                log.info("%s [SHORT] es_maximo_round=False -> no se opera ni se anota en seguimiento.", plan["symbol"])
-                continue
-            registrar_short_en_seguimiento({
-                "symbol": plan["symbol"],
-                "max_high": float(plan["max_high_seguimiento"]),
-                "tf_seguimiento": plan.get("tf_seguimiento"),
-                "created_ts": int(exchange.milliseconds()),
-                "demo": _es_sandbox(exchange),
-            })
-            log.info(
-                "%s %s: SHORT en seguimiento (W%%R6=W%%R12 en %s). No se entra hasta que el precio rompa %.8f.",
-                plan["symbol"], _SEG_SHORT, plan.get("tf_seguimiento"), float(plan["max_high_seguimiento"]),
-            )
-        else:
-            await execute_entry(exchange, plan)
+        await execute_entry(exchange, plan)
 
 
 async def ensure_hedge_mode(exchange: "ccxt.bingx", label: str) -> None:
@@ -1140,22 +1028,12 @@ async def main() -> None:
 
         ensure_json_files()
 
-        # Seguimiento del SHORT: libera los pares cuyo máximo ya se rompió.
-        try:
-            await gestionar_seguimiento_short(exchange_short, market_exchange)
-        except Exception as exc:
-            log.error("%s Error revisando el seguimiento de los shorts: %s", _SEG_SHORT, exc)
-
         # Universo de símbolos: SIEMPRE contra el mercado real.
         allowed_symbols = set(await get_usdt_futures_symbols(market_exchange))
 
         open_positions = await get_open_positions(exchange_short, allowed_symbols)
         symbols_with_position = {p["symbol"] for p in open_positions}
-
-        tracked_short = _symbols_en_seguimiento_short(_es_sandbox(exchange_short))
-        if tracked_short:
-            log.info("%s Pares que el escáner salta por estar en seguimiento: %s", _SEG_SHORT, sorted(tracked_short))
-        symbols_excluidos = symbols_with_position | tracked_short
+        symbols_excluidos = symbols_with_position
 
         if mode == "tp_only":
             await run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check)
