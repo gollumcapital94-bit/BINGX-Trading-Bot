@@ -2,15 +2,15 @@
   {
     "symbol": "PUMP/USDT:USDT",
     "demo": true,
-    "status": "pending",
+    "status": "filled",
     "entry_type": "limit",
     "order_id": "2113028168513228800",
-    "entry_price": 0.0051258,
+    "entry_price": 0.005126,
     "max_high_5m": 0.00522,
     "leverage": 15,
     "amount": 969974.0,
     "created_ts": 1792620148314,
-    "filled_ts": null,
+    "filled_ts": 1792621086000,
     "tp_price": null,
     "tp_distance_pct": null,
     "tp_order_id": null
