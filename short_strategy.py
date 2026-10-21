@@ -13,6 +13,10 @@ LECTURA DE MERCADO SIEMPRE REAL: evaluate_symbol recibe la conexión de
 MERCADO. get_max_leverage_for_symbol() y calculate_position_size() se
 llaman con la conexión de CUENTA.
 
+PASO 2 (1h): debe existir un round alcista activo. Si no, se DESCARTA.
+PASO 3 (1h): la última vela 1h cerrada debe ser el MÁXIMO de todo el round
+alcista. Si no lo es, se DESCARTA de inmediato (antes de pedir 4h/15m/5m).
+
 PASO 4 (RSI6 de sobrecompra, SOLO 1h): se mide en la vela del máximo si es
 VERDE; si es ROJA, en la verde que la antecede (si no hay vela verde, no se
 mide). Si RSI6(1h) > 90 el par se DESCARTA. En 15m y 5m el RSI6 se mide y se
@@ -32,16 +36,14 @@ VELAS: todas las temporalidades se piden con paginación (BingX capa a 1440
 por petición) y se exige un mínimo de velas para que las medias estén bien
 calculadas; si llegan menos, el par se descarta en vez de medir mal.
 
-CHEQUEO W%R EN LA OTRA TEMPORALIDAD: si la singularidad la dio la de 15m se
+FILTRO W%R EN LA OTRA TEMPORALIDAD: si la singularidad la dio la de 15m se
 revisa la de 5m (y viceversa). En la vela del máximo de esa otra
-temporalidad, W%R6 y W%R12 deben ser distintos. Si son iguales el plan sale
-con seguimiento_short=True y el bot NO entra: el par queda en
-json/short_tracking.json hasta que el precio rompa ese máximo.
+temporalidad (verde o roja), W%R6 y W%R12 deben ser distintos. Si son
+iguales el par se DESCARTA (sin seguimiento ni archivos JSON).
 
 Pasos 7/8, CHEQUEO DE BORDES de W%R: W%R6/12/24 distintos entre sí en la
 vela roja del máximo; en la vela anterior, si es VERDE se exige lo mismo; si
 es ROJA se omite.
-Paso 3: NO descarta; solo anota es_maximo_round. Si es False, no se opera.
 
 NOTA: abre posiciones apalancadas de forma 100% automática.
 Prueba en demo o con montos pequeños antes de usar dinero real.
@@ -232,17 +234,29 @@ def find_round_start_index(df_1h_closed: pd.DataFrame):
 
 
 def check_step_2_3(df_1h_closed: pd.DataFrame):
-    """Paso 2: descarta si no hay round alcista activo. Paso 3: solo anota `es_maximo_round`."""
+    """
+    Paso 2: descarta si no hay round alcista activo.
+    Paso 3: descarta si la última vela 1h cerrada NO es el máximo de todo el round.
+    """
     round_start_idx, reason = find_round_start_index(df_1h_closed)
 
     if round_start_idx is None:
-        return False, {"reason": reason}
+        return False, {"reason": reason, "failed_step": 2}
 
     last_idx = len(df_1h_closed) - 1
     round_highs = df_1h_closed["high"].iloc[round_start_idx: last_idx + 1]
     last_high = df_1h_closed["high"].iloc[last_idx]
+    round_max = float(round_highs.max())
 
-    es_maximo_round = bool(last_high >= round_highs.max())
+    es_maximo_round = bool(last_high >= round_max)
+    if not es_maximo_round:
+        return False, {
+            "reason": (
+                f"[Paso 3] La última vela 1h (high={float(last_high)}) NO es el máximo del round "
+                f"alcista (máximo del round={round_max})"
+            ),
+            "failed_step": 3,
+        }
 
     last_candle = df_1h_closed.iloc[last_idx]
     return True, {
@@ -250,7 +264,7 @@ def check_step_2_3(df_1h_closed: pd.DataFrame):
         "last_idx": last_idx,
         "last_candle": last_candle,
         "es_verde_1h": _is_green(last_candle),
-        "es_maximo_round": es_maximo_round,
+        "es_maximo_round": True,
         "round_start_ts": int(df_1h_closed["ts"].iloc[round_start_idx]),
     }
 
@@ -649,18 +663,17 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en [Paso 2/3] %s", symbol, err)
             return None, "2/3"
 
+        # Paso 2 (round alcista activo) y Paso 3 (última vela 1h = máximo del round).
+        # Ambos DESCARTAN antes de pedir las velas de 4h, 15m y 5m.
         ok, info = check_step_2_3(df_1h)
         if not ok:
             log.info("%s descartado en %s", symbol, info.get("reason", "[Paso 2/3] motivo desconocido"))
-            return None, "2/3"
+            return None, info.get("failed_step", "2/3")
         round_start_ts = info["round_start_ts"]
         es_verde_1h = info["es_verde_1h"]
-        es_maximo_round = info["es_maximo_round"]
+        es_maximo_round = info["es_maximo_round"]  # siempre True si llegó hasta aquí
 
-        log.info(
-            "%s [Paso 3] %s en el máximo del round (informativo, no descarta).",
-            symbol, "SÍ ESTÁ" if es_maximo_round else "NO ESTÁ",
-        )
+        log.info("%s aprobó [Paso 2/3]: round alcista activo y la última vela 1h es el máximo del round.", symbol)
 
         last_candle_ts = int(info["last_candle"]["ts"])
         window_start_ts = last_candle_ts
@@ -745,6 +758,26 @@ async def evaluate_symbol(exchange, symbol: str):
         else:
             singularidad_5m = False
 
+        # ---- FILTRO: W%R6 y W%R12 deben ser distintos en la OTRA temporalidad ----
+        otra_df, otra_lbl = (df_5m, "5m") if singularidad_15m else (df_15m, "15m")
+        distintos, wr_info = check_wr6_wr12_distintos_otra_tf(otra_df, window_start_ts, window_end_ts)
+        if distintos is None:
+            log.warning(
+                "%s [SHORT] sin velas de %s en la ventana del máximo: no se pudo verificar W%%R6/W%%R12 "
+                "en la otra temporalidad; se continúa sin ese chequeo.", symbol, otra_lbl,
+            )
+        elif not distintos:
+            log.info(
+                "%s descartado en [W%%R otra temporalidad]: W%%R6 y W%%R12 IGUALES en %s (6=%.2f, 12=%.2f).",
+                symbol, otra_lbl, wr_info["wr6"], wr_info["wr12"],
+            )
+            return None, "WR_otra_tf"
+        else:
+            log.info(
+                "%s aprobó [W%%R otra temporalidad]: W%%R6/W%%R12 distintos en %s (6=%.2f, 12=%.2f).",
+                symbol, otra_lbl, wr_info["wr6"], wr_info["wr12"],
+            )
+
         max_idx_5m = _find_max_candle_in_window(df_5m, window_start_ts, window_end_ts)
         if max_idx_5m is None:
             log.info("%s descartado en [Paso 13]: sin velas de 5m en la ventana del máximo.", symbol)
@@ -777,31 +810,7 @@ async def evaluate_symbol(exchange, symbol: str):
             "vela_a_ts": window_start_ts,
             "vela_a_low": expected_max_low,
             "vela_a_high": expected_max_high,
-            "seguimiento_short": False,
         }
-
-        # ---- W%R6 y W%R12 distintos en la OTRA temporalidad ----
-        otra_df, otra_lbl = (df_5m, "5m") if singularidad_15m else (df_15m, "15m")
-        distintos, wr_info = check_wr6_wr12_distintos_otra_tf(otra_df, window_start_ts, window_end_ts)
-        if distintos is None:
-            log.warning(
-                "%s [SHORT] sin velas de %s en la ventana del máximo: no se pudo verificar W%%R6/W%%R12 "
-                "en la otra temporalidad; se continúa sin ese chequeo.", symbol, otra_lbl,
-            )
-        elif distintos:
-            log.info(
-                "%s [SHORT] W%%R6/W%%R12 distintos en %s (6=%.2f, 12=%.2f) -> sin seguimiento, puede entrar.",
-                symbol, otra_lbl, wr_info["wr6"], wr_info["wr12"],
-            )
-        else:
-            plan["seguimiento_short"] = True
-            plan["tf_seguimiento"] = otra_lbl
-            plan["max_high_seguimiento"] = wr_info["max_high"]
-            log.info(
-                "%s [SHORT] W%%R6 y W%%R12 IGUALES en %s (6=%.2f, 12=%.2f) -> NO entra; pasa a "
-                "seguimiento (json/short_tracking.json) hasta que el precio rompa el máximo %.8f.",
-                symbol, otra_lbl, wr_info["wr6"], wr_info["wr12"], wr_info["max_high"],
-            )
 
         return plan, None
 
