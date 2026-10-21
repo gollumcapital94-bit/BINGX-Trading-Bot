@@ -5,5 +5,12 @@
     "tf_seguimiento": "15m",
     "created_ts": 1792569756411,
     "demo": true
+  },
+  {
+    "symbol": "CRV/USDT:USDT",
+    "max_high": 0.3996,
+    "tf_seguimiento": "15m",
+    "created_ts": 1792609372093,
+    "demo": true
   }
 ]
