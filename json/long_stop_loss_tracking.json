@@ -1,1 +1,12 @@
-[]
+[
+  {
+    "symbol": "MASK/USDT:USDT",
+    "demo": true,
+    "entry_price": 0.4503,
+    "status": "watching",
+    "threshold_pct": null,
+    "trigger_price": null,
+    "be_order_id": null,
+    "since_ts": 1792666960007
+  }
+]
