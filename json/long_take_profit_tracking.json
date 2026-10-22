@@ -1,18 +1,1 @@
-[
-  {
-    "symbol": "MASK/USDT:USDT",
-    "demo": true,
-    "status": "filled",
-    "entry_type": "market",
-    "order_id": "2113224511034757120",
-    "entry_price": 0.4503,
-    "max_high_5m": 0.5221,
-    "leverage": 30,
-    "amount": 22160.3,
-    "created_ts": 1792666960007,
-    "filled_ts": 1792666960007,
-    "tp_price": null,
-    "tp_distance_pct": null,
-    "tp_order_id": null
-  }
-]
+[]
