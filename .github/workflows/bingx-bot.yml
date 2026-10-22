@@ -17,9 +17,8 @@ on:
         default: false
   schedule:
     # Cron INTERNO de GitHub, dedicado EXCLUSIVAMENTE a la gestión de
-    # posiciones (Paso 1: Take Profit del SHORT y seguimiento/TP del LONG) --
-    # ver BOT_MODE más abajo. Corre CADA HORA. NUNCA escanea ni abre nuevas
-    # entradas. Como schedule no es puntual, el Stop Loss en break even NO se
+    # posiciones (Paso 1) -- ver BOT_MODE más abajo. Corre CADA HORA. NUNCA
+    # escanea ni abre nuevas entradas. El Stop Loss en break even NO se
     # ejecuta desde aquí (ver RUN_STOP_LOSS_CHECK).
     - cron: "0 * * * *"
 
@@ -30,8 +29,6 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Serializa las ejecuciones para evitar órdenes TP/SL duplicadas
-    # cuando el cron interno y el disparador externo caen a la vez.
     concurrency:
       group: bingx-trading-bot
       cancel-in-progress: false
@@ -54,13 +51,17 @@ jobs:
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
           BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
+          # Riesgo del SHORT convencional y del LONG invertido:
+          # true = 5% de la cuenta | false = 10% de la cuenta.
+          BINGX_LOW_RISK: ${{ vars.BINGX_LOW_RISK || 'true' }}
+          # LONG sobrecomprado (RSI6 > 90 en 1h/15m/5m, margen fijo de 100).
+          # true = activo | false = el Paso 4 descarta como antes.
+          BINGX_OVER_DEMO: ${{ vars.BINGX_OVER_DEMO || 'false' }}
           # El cron interno (schedule) SOLO gestiona posiciones (Paso 1).
-          # Cualquier otro disparador corre el bot completo.
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
-          # Barrido de balance (Paso 15) futuros -> fondos: SOLO en disparador EXTERNO.
+          # Barrido de balance (Paso 15): SOLO en disparador EXTERNO.
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # Gatillo de Stop Loss en break even (SHORT y LONG): SOLO en
-          # disparador EXTERNO. El Take Profit no depende de esta variable.
+          # Gatillo de Stop Loss en break even (SHORT y LONG): SOLO en disparador EXTERNO.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
@@ -84,7 +85,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|Stop Loss en break even.*colocado|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
+          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|Stop Loss en break even.*colocado|Take Profit colocado.*reemplazo|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
           if [ -s signals.txt ]; then
             MSG=$(cat signals.txt)
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
