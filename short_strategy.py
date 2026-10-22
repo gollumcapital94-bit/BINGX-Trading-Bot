@@ -11,36 +11,29 @@ PASOS 2 a 9 = FILTROS OBLIGATORIOS (el par debe pasarlos todos):
   Paso 3 (1h): la última vela 1h cerrada es el MÁXIMO de todo el round.
   Paso 4 (1h): RSI6(1h) <= 90 (se mide en la vela del máximo si es verde;
                si es roja, en la verde que la antecede).
+               CON BINGX_OVER_DEMO=true YA NO DESCARTA: solo mide y anota.
   Paso 5 (15m): el máximo de 15m coincide con el high de 1h y está en una
                vela ROJA.
-  Paso 6 (5m): lo mismo en 5m. (1h, 15m y 5m deben tener el MISMO máximo.)
-  Paso 7 (15m): chequeo de bordes de W%R. En la vela roja del máximo,
-               W%R6, W%R12 y W%R24 distintos entre sí. La vela anterior
-               DEBE ser verde y en ella también W%R6/12/24 distintos.
-               Si la anterior es roja (o no existe) o algún W%R coincide
-               -> se descarta el par.
+  Paso 6 (5m): lo mismo en 5m.
+  Paso 7 (15m): chequeo de bordes de W%R.
   Paso 8 (5m): idéntico al Paso 7 en 5m.
   Paso 9: volumen 24h >= MIN_VOLUME_24H_USDT.
 
-PASO 10 (ciclo en 4h), estado en la última vela 4h cerrada. Decide la
-DIRECCIÓN:
-  SHORT -- Patrón 1 (inicio de ciclo): SMA20 > EMA50, ambas bajo la EMA200.
-  SHORT -- Patrón 2: SMA20 y EMA50 ambas sobre la EMA200 (cualquier orden
-           entre ellas).
-  SHORT -- SMA20 sobre la EMA200 con la EMA50 aún bajo ella.
-  LONG  -- SMA20 <= EMA50, ambas bajo la EMA200 (aún sin cruce hacia arriba).
-  NO ENTRA -- fin de ciclo: SMA20 bajo la EMA200 con la EMA50 sobre ella.
+PASO 10 (ciclo en 4h) decide la DIRECCIÓN (SHORT / LONG / no entra).
 
-PASOS 11 y 12 (SINGULARIDAD): solo calculan la singularidad. Se calcula
-en 15m; si no da S > 0, se calcula en 5m. Si en cualquiera S > 0 el par
-entra al mercado. Si en ninguna, se descarta. (Los filtros de vela y
-bordes ya se aplicaron en los Pasos 5 a 8.)
+LONG SOBRECOMPRADO (solo con BINGX_OVER_DEMO=true): si el RSI6 (medido en
+vela verde) supera 90 en 1h, 15m o 5m, la dirección pasa a LONG (salvo fin
+de ciclo, que sigue sin entrar) y el margen es FIJO (100), fuera de
+BINGX_LOW_RISK. Sin sobrecompra todo sigue como siempre.
+
+PASOS 11 y 12 (SINGULARIDAD): 15m y, si no, 5m. Solo S > 0.
 
 PASO 13: apalancamiento y tamaño.
   SHORT: 80 / distancia% del máximo(5m) al precio de referencia.
   LONG : 80 / distancia% del precio de referencia a la EMA200(5m).
 
-SOLO SINGULARIDAD POSITIVA: S > 0.
+RIESGO (SHORT convencional y LONG invertido): BINGX_LOW_RISK=true -> 5% de
+la cuenta; false -> 10%. Siempre con el tope del apalancamiento.
 
 LECTURA DE MERCADO SIEMPRE REAL: evaluate_symbol recibe la conexión de
 MERCADO. get_max_leverage_for_symbol() y calculate_position_size() se
@@ -52,6 +45,7 @@ Prueba en demo o con montos pequeños antes de usar dinero real.
 
 import logging
 import math
+import os
 
 import pandas as pd
 
@@ -59,15 +53,31 @@ from utils.indicators import sma, ema, rsi, williams_r
 
 log = logging.getLogger("bingx_bot.short_strategy")
 
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "y")
+
+
 # ----------------------------------------------------------------------
 # Parámetros
 # ----------------------------------------------------------------------
-RSI_OVERBOUGHT = 90  # RSI6(1h) > 90 -> se descarta el par
+RSI_OVERBOUGHT = 90  # RSI6 > 90 = sobrecompra
 MIN_VOLUME_24H_USDT = 2_000_000
-MARGIN_PCT_OF_ACCOUNT = 0.10  # 10% del margen total de la cuenta (todas las posiciones ya en break even)
-MARGIN_PCT_REDUCED = 0.05     # 5% si hay alguna posición abierta SIN break even (riesgo aún no eliminado)
+MARGIN_PCT_OF_ACCOUNT = 0.10  # BINGX_LOW_RISK=false
+MARGIN_PCT_REDUCED = 0.05     # BINGX_LOW_RISK=true
 LEVERAGE_BASE = 80
 LEVERAGE_ROUND_STEP = 5
+
+# Variables de entorno de las nuevas funciones.
+LOW_RISK = _env_flag("BINGX_LOW_RISK", "true")      # 5% (true) o 10% (false)
+OVER_DEMO = _env_flag("BINGX_OVER_DEMO", "false")   # LONG sobrecomprado
+OVERBOUGHT_FIXED_MARGIN = 100.0                      # margen fijo del LONG sobrecomprado
+
+
+def margin_fraction_normal() -> float:
+    """Fracción de la cuenta para SHORT convencional y LONG invertido."""
+    return MARGIN_PCT_REDUCED if LOW_RISK else MARGIN_PCT_OF_ACCOUNT
+
 
 # Velas a pedir por temporalidad (cerradas). Se pide +1 (la vela en formación).
 OHLCV_LIMIT_1H = 1200
@@ -75,7 +85,6 @@ OHLCV_LIMIT_4H = 1200
 OHLCV_LIMIT_15M = 1200
 OHLCV_LIMIT_5M = 1200
 
-# Mínimo de velas cerradas por temporalidad para que las medias converjan.
 MIN_CANDLES_4H = 600
 MIN_CANDLES_1H = 1200
 MIN_CANDLES_15M = 1200
@@ -267,7 +276,7 @@ def check_step_2_3(df_1h_closed: pd.DataFrame):
 
 
 # ----------------------------------------------------------------------
-# Paso 4: RSI6 de sobrecompra en 1h (DESCARTA si > 90).
+# Paso 4: RSI6 de sobrecompra en 1h.
 # ----------------------------------------------------------------------
 def medir_rsi6_vela_verde(df_closed: pd.DataFrame, idx: int):
     """
@@ -420,8 +429,6 @@ async def check_step_9_volume(exchange, symbol: str):
 
 # ----------------------------------------------------------------------
 # Paso 10: SMA20/EMA50/EMA200 en 4H -> decide la DIRECCIÓN
-# Devuelve (True, info con info["direccion"] = "short" | "long")
-#          (False, info) -> fin de ciclo o datos insuficientes.
 # ----------------------------------------------------------------------
 async def check_step_10(exchange, symbol: str):
     df_4h, err = await _fetch_closed_df(exchange, symbol, "4h", OHLCV_LIMIT_4H, MIN_CANDLES_4H)
@@ -439,9 +446,7 @@ async def check_step_10(exchange, symbol: str):
 
     if ambas_bajo:
         if s20 > e50:
-            # Patrón 1: inicio de ciclo alcista (SMA20 cruzó hacia arriba la EMA50 bajo la EMA200).
             return True, {**base, "direccion": "short", "patron": "P1_inicio_ciclo_sma20_sobre_ema50_ambas_bajo_ema200"}
-        # SMA20 aún bajo la EMA50, ambas bajo la EMA200, sin cruce: LONG.
         return True, {**base, "direccion": "long", "patron": "L1_sin_cruce_sma20_bajo_ema50_ambas_bajo_ema200"}
 
     if ambas_sobre:
@@ -449,7 +454,6 @@ async def check_step_10(exchange, symbol: str):
         return True, {**base, "direccion": "short", "patron": patron}
 
     if s20 <= e200:
-        # SMA20 bajo la EMA200 con la EMA50 aún sobre ella: fin de ciclo alcista.
         return False, {
             "reason": (
                 f"[Paso 10] Fin de ciclo: SMA20(4h)={s20:.8f} bajo la EMA200={e200:.8f} "
@@ -458,7 +462,6 @@ async def check_step_10(exchange, symbol: str):
             "failed_step": 10, "patron": "NO_ENTRAR_fin_ciclo_sma20_bajo_ema200_ema50_sobre", **base,
         }
 
-    # SMA20 sobre la EMA200 y EMA50 aún bajo ella.
     return True, {**base, "direccion": "short", "patron": "P3_sma20_sobre_ema200_ema50_bajo"}
 
 
@@ -507,10 +510,7 @@ def _leverage_from_distance(distancia_pct: float) -> float:
 
 
 def calculate_leverage(max_high_5m: float, reference_price: float) -> float:
-    """
-    SHORT. Distancia = del máximo (5m) al precio de referencia (SMA20(5m)
-    para una orden STOP, o el precio actual para una entrada a MERCADO).
-    """
+    """SHORT. Distancia = del máximo (5m) al precio de referencia."""
     if max_high_5m <= 0:
         raise ValueError("max_high_5m inválido")
 
@@ -522,11 +522,7 @@ def calculate_leverage(max_high_5m: float, reference_price: float) -> float:
 
 
 def calculate_leverage_long(reference_price: float, ema200_5m: float) -> float:
-    """
-    LONG. Distancia = del precio de referencia (SMA20(5m) para una orden
-    límite, o el precio actual para una entrada a MERCADO) hacia abajo
-    hasta la EMA200(5m).
-    """
+    """LONG. Distancia = del precio de referencia hacia abajo hasta la EMA200(5m)."""
     if reference_price <= 0:
         raise ValueError("reference_price inválido")
 
@@ -593,19 +589,27 @@ def _get_available_balance(balance: dict) -> float:
 
 
 async def calculate_position_size(exchange, symbol: str, leverage: int,
-                                  margin_fraction: float = MARGIN_PCT_OF_ACCOUNT) -> float:
+                                  margin_fraction: float | None = None,
+                                  fixed_margin: float | None = None) -> float:
     """
-    El MENOR entre `margin_fraction` del margen total de la cuenta (10% por
-    defecto, 5% si hay riesgo abierto) y el margen máximo que permite el apalancamiento.
+    El MENOR entre el margen base y el margen máximo que permite el apalancamiento.
+    Margen base = `fixed_margin` (LONG sobrecomprado, tope: el saldo total) o
+    `margin_fraction` del margen total de la cuenta (por defecto, el de BINGX_LOW_RISK).
     """
     balance = await exchange.fetch_balance()
     total_balance = _get_available_balance(balance)
-    margin_pct = total_balance * margin_fraction
+
+    if fixed_margin is not None:
+        margin_base = min(float(fixed_margin), total_balance)
+    else:
+        if margin_fraction is None:
+            margin_fraction = margin_fraction_normal()
+        margin_base = total_balance * margin_fraction
 
     max_notional = await get_max_notional_for_leverage(exchange, symbol, leverage)
     max_margin_by_leverage = max_notional / leverage if leverage else max_notional
 
-    return min(margin_pct, max_margin_by_leverage)
+    return min(margin_base, max_margin_by_leverage)
 
 
 # ----------------------------------------------------------------------
@@ -640,12 +644,19 @@ async def evaluate_symbol(exchange, symbol: str):
         expected_max_high = float(info["last_candle"]["high"])
         expected_max_low = float(info["last_candle"]["low"])
 
-        # Paso 4: RSI6(1h) de sobrecompra. DESCARTA si > 90.
+        # EMA200(1h) actual: precio del Take Profit adjunto a la entrada.
+        ema200_1h_value = float(ema(df_1h["close"], 200).iloc[-1])
+
+        # Paso 4: RSI6(1h). Descarta si > 90, salvo BINGX_OVER_DEMO=true (solo anota).
         rsi_1h, _ = medir_rsi6_vela_verde(df_1h, info["last_idx"])
         if rsi_1h is not None and rsi_1h > RSI_OVERBOUGHT:
-            log.info("%s descartado en [Paso 4]: RSI6(1h)=%.2f > %d (sobrecomprado).", symbol, rsi_1h, RSI_OVERBOUGHT)
-            return None, 4
-        log.info("%s aprobó [Paso 4]: RSI6(1h)=%s <= %d.", symbol, _fmt(rsi_1h), RSI_OVERBOUGHT)
+            if not OVER_DEMO:
+                log.info("%s descartado en [Paso 4]: RSI6(1h)=%.2f > %d (sobrecomprado).", symbol, rsi_1h, RSI_OVERBOUGHT)
+                return None, 4
+            log.info("%s [Paso 4] RSI6(1h)=%.2f > %d: NO se descarta (BINGX_OVER_DEMO=true), se anota.",
+                     symbol, rsi_1h, RSI_OVERBOUGHT)
+        else:
+            log.info("%s aprobó [Paso 4]: RSI6(1h)=%s <= %d.", symbol, _fmt(rsi_1h), RSI_OVERBOUGHT)
 
         # Paso 9: volumen
         ok, info9_vol = await check_step_9_volume(exchange, symbol)
@@ -673,7 +684,7 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s descartado en [Paso 6] %s", symbol, err5)
             return None, 6
 
-        # Paso 5 (15m): máximo coincide con el de 1h y está en vela roja.
+        # Paso 5 (15m)
         ok5, res5 = check_max_candle_matches_and_is_red(
             df_15m, window_start_ts, window_end_ts, expected_max_high, "15m", 5,
         )
@@ -683,7 +694,7 @@ async def evaluate_symbol(exchange, symbol: str):
         idx15 = res5["idx"]
         log.info("%s aprobó [Paso 5]: máximo en 15m coincide con 1h y está en vela roja.", symbol)
 
-        # Paso 6 (5m): lo mismo.
+        # Paso 6 (5m)
         ok6, res6 = check_max_candle_matches_and_is_red(
             df_5m, window_start_ts, window_end_ts, expected_max_high, "5m", 6,
         )
@@ -693,7 +704,7 @@ async def evaluate_symbol(exchange, symbol: str):
         idx5 = res6["idx"]
         log.info("%s aprobó [Paso 6]: máximo en 5m coincide con 1h y está en vela roja.", symbol)
 
-        # Paso 7 (15m): bordes de W%R.
+        # Paso 7 (15m)
         ok7, res7 = check_wr_bordes(df_15m, idx15, "15m", 7)
         if not ok7:
             log.info("%s descartado en %s", symbol, res7["reason"])
@@ -701,7 +712,7 @@ async def evaluate_symbol(exchange, symbol: str):
         log.info("%s aprobó [Paso 7]: bordes W%%R 15m OK (6=%.2f, 12=%.2f, 24=%.2f).",
                  symbol, res7["wr6"], res7["wr12"], res7["wr24"])
 
-        # Paso 8 (5m): bordes de W%R.
+        # Paso 8 (5m)
         ok8, res8 = check_wr_bordes(df_5m, idx5, "5m", 8)
         if not ok8:
             log.info("%s descartado en %s", symbol, res8["reason"])
@@ -709,13 +720,26 @@ async def evaluate_symbol(exchange, symbol: str):
         log.info("%s aprobó [Paso 8]: bordes W%%R 5m OK (6=%.2f, 12=%.2f, 24=%.2f).",
                  symbol, res8["wr6"], res8["wr12"], res8["wr24"])
 
-        # RSI6 informativo en 15m y 5m (no descarta).
+        # RSI6 en vela verde en 15m y 5m.
         rsi_15m, _ = medir_rsi6_vela_verde(df_15m, idx15)
         rsi_5m, _ = medir_rsi6_vela_verde(df_5m, idx5)
         log.info(
             "%s [RSI6 sobrecompra] 1h=%s | 15m=%s | 5m=%s (umbral %d)",
             symbol, _fmt(rsi_1h), _fmt(rsi_15m), _fmt(rsi_5m), RSI_OVERBOUGHT,
         )
+
+        # LONG SOBRECOMPRADO (solo BINGX_OVER_DEMO=true): RSI6 > 90 en alguna temporalidad.
+        sobrecompra_long = False
+        if OVER_DEMO:
+            hay_sobrecompra = any(v is not None and v > RSI_OVERBOUGHT for v in (rsi_1h, rsi_15m, rsi_5m))
+            if hay_sobrecompra:
+                sobrecompra_long = True
+                if direccion != "long":
+                    log.info("%s [OVER_DEMO] sobrecompra -> la dirección pasa de %s a LONG.", symbol, direccion.upper())
+                direccion = "long"
+            else:
+                log.info("%s [OVER_DEMO] RSI6 < %d en 1h/15m/5m: sin sobrecompra, sigue como %s.",
+                         symbol, RSI_OVERBOUGHT, direccion.upper())
 
         # Paso 11 (15m): singularidad.
         rsi6_15, rsi12_15 = _get_rsi6_rsi12(df_15m, idx15)
@@ -727,7 +751,7 @@ async def evaluate_symbol(exchange, symbol: str):
             log.info("%s no aprobó %s -> continúa al Paso 12 (5m)", symbol, res11["reason"])
             singularidad_15m = False
 
-        # Paso 12 (5m): solo si el 15m no dio singularidad positiva.
+        # Paso 12 (5m)
         singularidad_5m = False
         if not singularidad_15m:
             rsi6_5, rsi12_5 = _get_rsi6_rsi12(df_5m, idx5)
@@ -745,16 +769,18 @@ async def evaluate_symbol(exchange, symbol: str):
         ema200_5m_value = float(ema(df_5m["close"], 200).iloc[-1])
 
         log.info(
-            "%s [Paso 13] Datos preparados: %s | max_high_5m=%.8f | ma20_5m_value=%.8f | ema200_5m=%.8f",
-            symbol, direccion.upper(), max_high_5m, ma20_5m_value, ema200_5m_value,
+            "%s [Paso 13] Datos preparados: %s | max_high_5m=%.8f | ma20_5m_value=%.8f | ema200_5m=%.8f | ema200_1h=%.8f",
+            symbol, direccion.upper(), max_high_5m, ma20_5m_value, ema200_5m_value, ema200_1h_value,
         )
 
         plan = {
             "symbol": symbol,
             "direccion": direccion,
             "patron_4h": info10["patron"],
+            "sobrecompra_long": sobrecompra_long,
             "ma20_5m_value": ma20_5m_value,
             "ema200_5m_value": ema200_5m_value,
+            "ema200_1h_value": ema200_1h_value,
             "max_high_5m": max_high_5m,
             "round_start_ts": round_start_ts,
             "es_verde_1h": es_verde_1h,
