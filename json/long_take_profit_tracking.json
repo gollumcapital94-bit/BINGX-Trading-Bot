@@ -1,22 +1,5 @@
 [
   {
-    "symbol": "TREE/USDT:USDT",
-    "demo": true,
-    "status": "filled",
-    "entry_type": "market",
-    "order_id": "2113828439954821120",
-    "entry_price": 0.04342,
-    "max_high_5m": 0.04693,
-    "leverage": 15,
-    "amount": 114737.08,
-    "created_ts": 1792810947876,
-    "filled_ts": 1792810947876,
-    "sobrecompra": false,
-    "tp_price": 0.04771,
-    "tp_distance_pct": null,
-    "tp_order_id": "adjunto"
-  },
-  {
     "symbol": "M/USDT:USDT",
     "demo": true,
     "status": "filled",
