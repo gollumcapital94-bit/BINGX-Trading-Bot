@@ -1,12 +1,1 @@
-[
-  {
-    "symbol": "BREV/USDT:USDT",
-    "demo": true,
-    "entry_price": 0.08675,
-    "status": "watching",
-    "threshold_pct": null,
-    "trigger_price": null,
-    "be_order_id": null,
-    "since_ts": 1792840134000
-  }
-]
+[]
