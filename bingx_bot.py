@@ -12,9 +12,8 @@ PASO 1  -> Gestión de posiciones abiertas:
                     sube desde la entrada la distancia entrada->EMA50(1h).
                     Orden límite sin llenar que rompe el máximo -> se cancela.
 PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py.
-           Margen (SHORT convencional y LONG invertido): BINGX_LOW_RISK=true
+           Margen (TODAS las entradas, SHORT y LONG): BINGX_LOW_RISK=true
            -> 5% de la cuenta, false -> 10%.
-           LONG sobrecomprado (BINGX_OVER_DEMO=true): margen fijo de 100.
 PASO 15 -> BARRIDO DE BALANCE (solo mercado real, solo disparador externo).
 
 LECTURA DE MERCADO: el universo de símbolos y todo el escaneo se leen
@@ -23,8 +22,7 @@ SIEMPRE del mercado REAL (ver build_market_data_exchange()).
 Variables de entorno:
     BINGX_API_KEY, BINGX_API_SECRET,
     BINGX_DEMO_SHORT, BINGX_DEMO_LONG,
-    BINGX_LOW_RISK   (true = 5% | false = 10%; por defecto true),
-    BINGX_OVER_DEMO  (true = activa el LONG sobrecomprado; por defecto false)
+    BINGX_LOW_RISK   (true = 5% | false = 10%; por defecto true)
 
 Dependencias: ccxt, pandas, numpy (ver utils/requirements.txt)
 """
@@ -1102,30 +1100,33 @@ async def _set_leverage_with_cap_retry(exchange: "ccxt.bingx", symbol: str, leve
             return None
 
 
-def _nota_sobrecompra(plan: dict) -> str:
-    """Texto informativo para el log de entrada (y por tanto para Telegram)."""
+def _nota_entrada(plan: dict) -> str:
+    """
+    Texto informativo para el log de entrada (y por tanto para Telegram).
+    Primero las lecturas del momento (RSI6 15m y 5m); en P2a/P2b (ambas sobre la
+    EMA200 en 4h) después el MACRO ANÁLISIS: RSI6 de la vela 4h anterior ya cerrada.
+    """
     def f(v):
         return "n/d" if v is None else f"{v:.1f}"
 
     tf_sing = "15m" if plan.get("singularidad_15m") else "5m"
-    tfs = plan.get("sobrecompra_tfs") or []
-    estado = f"RSI6>90 en {','.join(tfs)}" if tfs else "sin RSI6>90 en 15m/5m"
     nota = (
-        f"singularidad en {tf_sing} | {estado} "
-        f"(RSI6 1h={f(plan.get('rsi6_1h'))}, 15m={f(plan.get('rsi6_15m'))}, 5m={f(plan.get('rsi6_5m'))})"
+        f"patrón 4h={plan.get('patron_4h')} | singularidad en {tf_sing} | "
+        f"RSI6 15m={f(plan.get('rsi6_15m'))}, 5m={f(plan.get('rsi6_5m'))}"
     )
-    if plan.get("sobrecompra_long"):
-        nota += " | LONG SOBRECOMPRADO (BINGX_OVER_DEMO)"
+    if plan.get("macro_aplica"):
+        nota += f" | Macro análisis (vela 4h anterior, cerrada): RSI6={f(plan.get('rsi6_4h_macro'))}"
+    if plan.get("dir_nota"):
+        nota += f" | {plan['dir_nota']}"
     if plan.get("margen_nota"):
         nota += f" | {plan['margen_nota']}"
     return nota
 
 
 # ----------------------------------------------------------------------
-# GESTIÓN DE RIESGO (SHORT convencional y LONG invertido):
+# GESTIÓN DE RIESGO (TODAS las entradas, SHORT y LONG):
 #   BINGX_LOW_RISK=true  -> 5% de la cuenta
 #   BINGX_LOW_RISK=false -> 10% de la cuenta
-# El LONG sobrecomprado (BINGX_OVER_DEMO) usa margen fijo y NO pasa por aquí.
 # ----------------------------------------------------------------------
 def _fraccion_margen() -> tuple[float, str]:
     if strat_short.LOW_RISK:
@@ -1155,7 +1156,6 @@ def _registrar_entrada_long(exchange: "ccxt.bingx", plan: dict, order: dict, tou
         "amount": float(order.get("amount") or amount),
         "created_ts": now_ms,
         "filled_ts": now_ms if touched else None,
-        "sobrecompra": bool(plan.get("sobrecompra_long")),
         "tp_price": tp_price if tp_adjunto else None,
         "tp_distance_pct": None,
         "tp_order_id": "adjunto" if tp_adjunto else None,
@@ -1169,7 +1169,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     según plan["direccion"]. La orden de entrada lleva el Take Profit ADJUNTO.
       SHORT: precio <= SMA20(5m) -> mercado; si no, STOP-LIMIT en la SMA20(5m).
       LONG : precio <= SMA20(5m) -> mercado; si no, orden LÍMITE en la SMA20(5m).
-    Margen: LONG sobrecomprado = fijo; resto = BINGX_LOW_RISK (5% / 10%).
+    Margen (todas las entradas): BINGX_LOW_RISK (5% / 10%).
     """
     symbol = plan["symbol"]
     direccion = plan.get("direccion", "short")
@@ -1178,7 +1178,6 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     max_high_5m = plan["max_high_5m"]
     ma20_5m_value = plan["ma20_5m_value"]
     es_maximo_round = plan.get("es_maximo_round", True)
-    sobrecompra_long = bool(plan.get("sobrecompra_long")) and es_long
 
     market = exchange.markets.get(symbol, {})
     if _looks_like_forex_or_cfd(market):
@@ -1243,15 +1242,10 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
             log.error("%s: no se pudo configurar el apalancamiento en BingX, se omite la entrada.", symbol)
             return
 
-        # Margen: fijo para el LONG sobrecomprado; BINGX_LOW_RISK para el resto.
-        if sobrecompra_long:
-            fixed = strat_short.OVERBOUGHT_FIXED_MARGIN
-            plan["margen_nota"] = f"margen FIJO {fixed:.0f} (LONG sobrecomprado)"
-            margin_usdt = await strat_short.calculate_position_size(exchange, symbol, leverage, fixed_margin=fixed)
-        else:
-            margin_fraction, margen_motivo = _fraccion_margen()
-            plan["margen_nota"] = f"margen {margen_motivo}"
-            margin_usdt = await strat_short.calculate_position_size(exchange, symbol, leverage, margin_fraction)
+        # Margen: BINGX_LOW_RISK (5% / 10%) para TODAS las entradas.
+        margin_fraction, margen_motivo = _fraccion_margen()
+        plan["margen_nota"] = f"margen {margen_motivo}"
+        margin_usdt = await strat_short.calculate_position_size(exchange, symbol, leverage, margin_fraction)
 
         if margin_usdt <= 0:
             log.info("%s descartado en [Paso 13][%s]: margen calculado <= 0", symbol, tag)
@@ -1279,7 +1273,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 )
                 log.info(
                     "[Paso 14][LONG] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=%s | %s",
-                    symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_sobrecompra(plan),
+                    symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_entrada(plan),
                 )
             else:
                 order, tp_adj = await _create_entry_order(
@@ -1288,7 +1282,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 )
                 log.info(
                     "[Paso 14][LONG] Long LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=%s | %s",
-                    ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_sobrecompra(plan),
+                    ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_entrada(plan),
                 )
             _registrar_entrada_long(exchange, plan, order, touched, last_price, leverage, amount, tp_price, tp_adj)
         else:
@@ -1299,7 +1293,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 )
                 log.info(
                     "[Paso 14][SHORT] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=%s | %s",
-                    symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_sobrecompra(plan),
+                    symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_entrada(plan),
                 )
             else:
                 order, tp_adj = await _create_entry_order(
@@ -1308,7 +1302,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 )
                 log.info(
                     "[Paso 14][SHORT] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=%s | %s",
-                    ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_sobrecompra(plan),
+                    ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_entrada(plan),
                 )
             if tp_adj:
                 _registrar_protector(
@@ -1375,11 +1369,10 @@ async def run_pasos_2_a_14_entradas(
     plans = await _scan_and_collect_plans(market_exchange, allowed_symbols, excl_short, excl_long)
     for plan in plans:
         log.info(
-            "  -> %s %s | patrón 4h=%s | máximo(5m)=%.8f | SMA20(5m)=%.8f | EMA200(5m)=%.8f | es_maximo_round=%s%s",
+            "  -> %s %s | patrón 4h=%s | máximo(5m)=%.8f | SMA20(5m)=%.8f | EMA200(5m)=%.8f | es_maximo_round=%s",
             plan.get("direccion", "short").upper(), plan["symbol"], plan.get("patron_4h"),
             plan["max_high_5m"], plan["ma20_5m_value"], plan.get("ema200_5m_value", float("nan")),
             plan.get("es_maximo_round"),
-            " | SOBRECOMPRADO" if plan.get("sobrecompra_long") else "",
         )
     for plan in plans:
         ex = exchange_long if plan.get("direccion") == "long" else exchange_short
@@ -1536,10 +1529,8 @@ async def main() -> None:
     run_stop_loss_check = _env_flag("RUN_STOP_LOSS_CHECK", "false")
     log.info("Modo de ejecución: %s", mode)
     log.info(
-        "BINGX_LOW_RISK=%s (margen %s) | BINGX_OVER_DEMO=%s (LONG sobrecomprado %s, margen fijo %.0f)",
+        "BINGX_LOW_RISK=%s (margen %s para todas las entradas)",
         strat_short.LOW_RISK, "5%" if strat_short.LOW_RISK else "10%",
-        strat_short.OVER_DEMO, "ACTIVO" if strat_short.OVER_DEMO else "inactivo",
-        strat_short.OVERBOUGHT_FIXED_MARGIN,
     )
     log.info(
         "Gatillo de Stop Loss (SHORT: toque de EMA50(1h) | LONG: subida hasta la distancia a la EMA50(1h)) %s "
