@@ -51,12 +51,9 @@ jobs:
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
           BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
-          # Riesgo del SHORT convencional y del LONG invertido:
+          # Riesgo de TODAS las entradas (SHORT y LONG):
           # true = 5% de la cuenta | false = 10% de la cuenta.
           BINGX_LOW_RISK: ${{ vars.BINGX_LOW_RISK || 'true' }}
-          # LONG sobrecomprado (RSI6 > 90 en 1h/15m/5m, margen fijo de 100).
-          # true = activo | false = el Paso 4 descarta como antes.
-          BINGX_OVER_DEMO: ${{ vars.BINGX_OVER_DEMO || 'false' }}
           # El cron interno (schedule) SOLO gestiona posiciones (Paso 1).
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
           # Barrido de balance (Paso 15): SOLO en disparador EXTERNO.
