@@ -1,1 +1,19 @@
-[]
+[
+  {
+    "symbol": "H/USDT:USDT",
+    "demo": true,
+    "status": "pending",
+    "entry_type": "limit",
+    "order_id": "2115368619421470720",
+    "entry_price": 0.0572465,
+    "max_high_5m": 0.05914,
+    "leverage": 70,
+    "amount": 86177.03,
+    "created_ts": 1793178155275,
+    "filled_ts": null,
+    "sobrecompra": true,
+    "tp_price": 0.0587,
+    "tp_distance_pct": null,
+    "tp_order_id": "adjunto"
+  }
+]
