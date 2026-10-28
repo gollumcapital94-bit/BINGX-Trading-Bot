@@ -1,12 +1,1 @@
-[
-  {
-    "symbol": "H/USDT:USDT",
-    "demo": true,
-    "entry_price": 0.05725,
-    "status": "watching",
-    "threshold_pct": null,
-    "trigger_price": null,
-    "be_order_id": null,
-    "since_ts": 1793182915000
-  }
-]
+[]
