@@ -82,11 +82,21 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|Stop Loss en break even.*colocado|Take Profit colocado.*reemplazo|Barrido de balance\] Transferencia ejecutada" bot_output.log > signals.txt || true
-          if [ -s signals.txt ]; then
-            MSG=$(cat signals.txt)
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=📊 BingX Bot:
-          ${MSG}"
+          # Señales + advertencias importantes (TP rechazado, errores de entrada).
+          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|Stop Loss en break even.*colocado|Take Profit colocado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|Error ejecutando entrada|Error colocando Take Profit" bot_output.log > signals.txt || true
+
+          if [ ! -s signals.txt ]; then
+            echo "Telegram: no hubo líneas de señal en el log"
+            exit 0
           fi
+
+          # Telegram rechaza mensajes de más de 4096 caracteres: se parte en bloques.
+          rm -f part_*
+          split -C 3500 -d signals.txt part_
+          for f in part_*; do
+            TEXT=$(printf '📊 BingX Bot:\n%s' "$(cat "$f")")
+            RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${TEXT}")
+            echo "Telegram: ${RESP}"
+          done
