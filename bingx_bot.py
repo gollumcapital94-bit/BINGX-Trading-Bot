@@ -11,6 +11,9 @@ PASO 1  -> Gestión de posiciones abiertas:
                     distancia entrada->EMA200(1h)). Break even cuando el precio
                     sube desde la entrada la distancia entrada->EMA50(1h).
                     Orden límite sin llenar que rompe el máximo -> se cancela.
+           TAKE PROFIT = ORDEN LÍMITE (TAKE_PROFIT con precio = gatillo), igual
+           que el break even: sin slippage. Si BingX rechaza el TP adjunto como
+           límite, se reintenta con TP adjunto a mercado y, en último caso, sin TP.
 PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py.
            Margen (TODAS las entradas, SHORT y LONG): BINGX_LOW_RISK=true
            -> 5% de la cuenta, false -> 10%.
@@ -410,6 +413,7 @@ async def _symbol_has_open_order(exchange: "ccxt.bingx", symbol: str, raw_order_
     """
     True/False según haya una orden abierta de ese tipo y lado de posición.
     None si NO se pudo verificar (los llamadores NO deben crear la orden).
+    Para TAKE_PROFIT / TAKE_PROFIT_MARKET se acepta cualquier tipo que contenga "TAKE_PROFIT".
     """
     try:
         open_orders = await exchange.fetch_open_orders(symbol)
@@ -423,7 +427,7 @@ async def _symbol_has_open_order(exchange: "ccxt.bingx", symbol: str, raw_order_
         o_position_side = str(info.get("positionSide") or order.get("positionSide") or "").upper()
         o_side = str(order.get("side") or info.get("side") or "").upper()
 
-        if raw_order_type == "TAKE_PROFIT_MARKET":
+        if raw_order_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
             tipo_ok = "TAKE_PROFIT" in o_type
         else:
             tipo_ok = o_type == raw_order_type
@@ -498,7 +502,10 @@ async def _proteccion_existente(exchange: "ccxt.bingx", symbol: str, kind: str, 
 
 async def set_take_profit(exchange: "ccxt.bingx", position: dict, tp_price: float,
                           motivo: str = "toque de SMA20(1h)") -> bool:
-    """Devuelve True si el TP quedó colocado (o ya existía), False si falló."""
+    """
+    Devuelve True si el TP quedó colocado (o ya existía), False si falló.
+    TP LÍMITE (TAKE_PROFIT con precio = gatillo): se llena a tu precio o mejor, sin slippage.
+    """
     symbol = position["symbol"]
     amount = abs(float(position.get("contracts") or 0))
 
@@ -506,25 +513,26 @@ async def set_take_profit(exchange: "ccxt.bingx", position: dict, tp_price: floa
         log.warning("Cantidad de contratos inválida para %s, se omite Take Profit.", symbol)
         return False
 
-    existente = await _proteccion_existente(exchange, symbol, "TP", "TAKE_PROFIT_MARKET")
+    existente = await _proteccion_existente(exchange, symbol, "TP", "TAKE_PROFIT")
     if existente is not False:
         return existente is True
 
+    tp_price = _px(exchange, symbol, tp_price)
     tp_params = {
         "stopPrice": tp_price,
         "positionSide": "SHORT",
         "workingType": "CONTRACT_PRICE",
     }
     try:
-        tp_order = await exchange.create_order(symbol, "TAKE_PROFIT_MARKET", "buy", amount, None, tp_params)
+        tp_order = await exchange.create_order(symbol, "TAKE_PROFIT", "buy", amount, tp_price, tp_params)
         log.info(
-            "Take Profit colocado (%s): %s | SHORT | TP=%.6f | orden_id=%s",
+            "Take Profit colocado (%s): %s | SHORT | TP=%.6f (LÍMITE, sin slippage) | orden_id=%s",
             motivo, symbol, tp_price, tp_order.get("id"),
         )
         _registrar_protector(exchange, symbol, "TP", tp_order.get("id"))
         return True
     except Exception as exc:
-        log.error("Error colocando Take Profit para %s: %s", symbol, exc)
+        log.error("Error colocando Take Profit LÍMITE para %s: %s", symbol, exc)
         return False
 
 
@@ -818,7 +826,7 @@ async def _long_gestionar_abierta(exchange: "ccxt.bingx", market_exchange: "ccxt
 
     # TP adjunto a la entrada: se verifica que realmente exista; si no, se recrea.
     if rec.get("tp_order_id") == "adjunto":
-        existe_tp = await _symbol_has_open_order(exchange, symbol, "TAKE_PROFIT_MARKET", "LONG", close_side="SELL")
+        existe_tp = await _symbol_has_open_order(exchange, symbol, "TAKE_PROFIT", "LONG", close_side="SELL")
         if existe_tp is False:
             log.info("%s [LONG]: no se ve el Take Profit adjunto en las órdenes abiertas; se recreará.", symbol)
             rec["tp_order_id"] = None
@@ -846,25 +854,26 @@ async def _long_gestionar_abierta(exchange: "ccxt.bingx", market_exchange: "ccxt
                                 symbol, ema200, entry)
                 else:
                     tp_price = _px(exchange, symbol, entry * (1 + dist_tp / 100))
-                    existe = await _symbol_has_open_order(exchange, symbol, "TAKE_PROFIT_MARKET", "LONG", close_side="SELL")
+                    existe = await _symbol_has_open_order(exchange, symbol, "TAKE_PROFIT", "LONG", close_side="SELL")
                     if existe is True:
                         rec["tp_order_id"] = rec.get("tp_order_id") or "existente"
                         log.info("%s [LONG]: ya existe un Take Profit abierto; se omite (evita duplicados).", symbol)
                     elif existe is False:
                         try:
+                            # TP LÍMITE (TAKE_PROFIT con precio = gatillo): sin slippage.
                             tp_order = await exchange.create_order(
-                                symbol, "TAKE_PROFIT_MARKET", "sell", amount, None,
+                                symbol, "TAKE_PROFIT", "sell", amount, tp_price,
                                 {"stopPrice": tp_price, "positionSide": "LONG", "workingType": "CONTRACT_PRICE"},
                             )
                             rec["tp_order_id"] = str(tp_order.get("id"))
                             rec["tp_price"] = tp_price
                             rec["tp_distance_pct"] = dist_tp
                             log.info(
-                                "Take Profit colocado (LONG): %s | entrada=%.8f | distancia a EMA200(1h)=%.3f%% | TP=%.8f | orden_id=%s",
+                                "Take Profit colocado (LONG): %s | entrada=%.8f | distancia a EMA200(1h)=%.3f%% | TP=%.8f (LÍMITE, sin slippage) | orden_id=%s",
                                 symbol, entry, dist_tp, tp_price, rec["tp_order_id"],
                             )
                         except Exception as exc:
-                            log.error("Error colocando Take Profit LONG para %s: %s", symbol, exc)
+                            log.error("Error colocando Take Profit LONG LÍMITE para %s: %s", symbol, exc)
 
             if needs_threshold:
                 dist_be = (entry - ema50) / entry * 100
@@ -1009,23 +1018,35 @@ async def _create_entry_order(
     amount: float, price, params: dict, last_price: float, tp_price: float | None,
 ):
     """
-    Crea la orden de entrada con el Take Profit ADJUNTO (parámetro takeProfit de ccxt).
-    Si BingX rechaza el TP adjunto, reintenta la entrada SIN TP y el Paso 1 lo colocará después.
+    Crea la orden de entrada con el Take Profit ADJUNTO. Cadena de intentos:
+      1) TP adjunto LÍMITE (sin slippage)  <- preferido
+      2) TP adjunto a MERCADO (si BingX no acepta el límite adjunto)
+      3) Entrada SIN TP (el Paso 1 lo colocará después)
     Devuelve (orden, tp_adjunto: bool).
     """
     if tp_price is not None:
-        params_tp = dict(params)
-        params_tp["takeProfit"] = {"triggerPrice": tp_price}
-        try:
-            order = await _create_order_with_notional_cap_retry(
-                exchange, symbol, order_type, side, amount, price, params_tp, last_price,
-            )
-            return order, True
-        except Exception as exc:
-            log.warning(
-                "%s: BingX no aceptó la entrada con Take Profit adjunto (%s). Se reintenta SIN TP "
-                "(el Paso 1 lo colocará).", symbol, exc,
-            )
+        intentos = (
+            ("LÍMITE", {"triggerPrice": tp_price, "price": tp_price, "type": "limit"}),
+            ("MERCADO", {"triggerPrice": tp_price}),
+        )
+        for nombre, tp_cfg in intentos:
+            params_tp = dict(params)
+            params_tp["takeProfit"] = tp_cfg
+            try:
+                order = await _create_order_with_notional_cap_retry(
+                    exchange, symbol, order_type, side, amount, price, params_tp, last_price,
+                )
+                if nombre == "MERCADO":
+                    log.warning(
+                        "%s: BingX no aceptó el TP adjunto LÍMITE; la entrada quedó con TP adjunto a MERCADO "
+                        "(puede tener slippage en mechonazos).", symbol,
+                    )
+                return order, True
+            except Exception as exc:
+                log.warning(
+                    "%s: BingX no aceptó la entrada con Take Profit adjunto %s (%s).", symbol, nombre, exc,
+                )
+        log.warning("%s: se reintenta la entrada SIN TP (el Paso 1 lo colocará).", symbol)
     order = await _create_order_with_notional_cap_retry(
         exchange, symbol, order_type, side, amount, price, params, last_price,
     )
@@ -1166,7 +1187,7 @@ def _registrar_entrada_long(exchange: "ccxt.bingx", plan: dict, order: dict, tou
 async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     """
     Paso 13 (apalancamiento y margen) + Paso 14 (ejecución), SHORT o LONG
-    según plan["direccion"]. La orden de entrada lleva el Take Profit ADJUNTO.
+    según plan["direccion"]. La orden de entrada lleva el Take Profit ADJUNTO (límite).
       SHORT: precio <= SMA20(5m) -> mercado; si no, STOP-LIMIT en la SMA20(5m).
       LONG : precio <= SMA20(5m) -> mercado; si no, orden LÍMITE en la SMA20(5m).
     Margen (todas las entradas): BINGX_LOW_RISK (5% / 10%).
