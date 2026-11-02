@@ -2,22 +2,22 @@
 Bot de trading para BingX (SHORT y LONG)
 ----------------------------------------
 PASO 1  -> Gestión de posiciones abiertas:
-             SHORT: la entrada ya lleva un Take Profit ADJUNTO en la EMA200(1h).
-                    Al primer toque de SMA20(1h) POSTERIOR a la entrada se
-                    cancela ese TP y se coloca uno nuevo en la EMA200(1h)
-                    actual (una sola vez).
+             SHORT: la entrada va SIN Take Profit adjunto. Al primer toque de
+                    SMA20(1h) se coloca el Take Profit (LÍMITE) en la EMA200(1h).
                     toque de EMA50(1h) -> Stop Loss en break even.
              LONG : la entrada ya lleva un Take Profit ADJUNTO (entrada +
                     distancia entrada->EMA200(1h)). Break even cuando el precio
                     sube desde la entrada la distancia entrada->EMA50(1h).
                     Orden límite sin llenar que rompe el máximo -> se cancela.
            TAKE PROFIT = ORDEN LÍMITE (TAKE_PROFIT con precio = gatillo), igual
-           que el break even: sin slippage. Si BingX rechaza el TP adjunto como
-           límite, se reintenta con TP adjunto a mercado y, en último caso, sin TP.
+           que el break even: sin slippage. En el LONG, si BingX rechaza el TP
+           adjunto como límite, se reintenta con TP adjunto a mercado y, en
+           último caso, sin TP.
 PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py.
            Margen (TODAS las entradas, SHORT y LONG): BINGX_LOW_RISK=true
            -> 5% de la cuenta, false -> 10%.
 PASO 15 -> BARRIDO DE BALANCE (solo mercado real, solo disparador externo).
+           Tope: 30,000 USDT.
 
 LECTURA DE MERCADO: el universo de símbolos y todo el escaneo se leen
 SIEMPRE del mercado REAL (ver build_market_data_exchange()).
@@ -53,7 +53,7 @@ log = logging.getLogger("bingx_bot")
 # Configuración PASO 1 (gestión de TP/SL)
 # ----------------------------------------------------------------------
 TIMEFRAME_TP = "1h"
-SMA_TP_TRIGGER = 20   # toque de esta SMA(1h) dispara el reemplazo del TP del SHORT
+SMA_TP_TRIGGER = 20   # toque de esta SMA(1h) dispara la colocación del TP del SHORT
 EMA_FAST = 50
 EMA_SLOW = 200
 
@@ -183,8 +183,8 @@ async def get_usdt_futures_symbols(market_exchange: "ccxt.bingx") -> list[str]:
 # ----------------------------------------------------------------------
 # REGISTROS JSON
 #   protective_orders.json         -> TP / break even del SHORT (anti-duplicados)
-#       kind "TP_ATTACHED": TP adjunto a la entrada del SHORT (replaced=True
-#                           cuando ya se reemplazó tras el toque de SMA20(1h))
+#       kind "TP_ATTACHED": (ya no se crea para SHORT; se mantiene por compatibilidad
+#                           con registros antiguos)
 #       kind "TP" / "BE"  : órdenes colocadas por el Paso 1
 #   long_take_profit_tracking.json -> seguimiento de la entrada y el TP del LONG
 #   long_stop_loss_tracking.json   -> seguimiento del break even del LONG
@@ -579,12 +579,9 @@ async def set_stop_loss_breakeven(exchange: "ccxt.bingx", position: dict,
 async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_loss_check: bool = True) -> None:
     """
     PASO 1 (SHORT):
-      - Con TP adjunto registrado: al primer toque de SMA20(1h) posterior a la
-        entrada se cancela el TP y se coloca uno nuevo en la EMA200(1h) actual
-        (una sola vez).
-      - Sin TP adjunto registrado (posiciones antiguas o TP que BingX rechazó):
-        comportamiento clásico (toque de SMA20(1h) -> TP en la EMA200(1h)).
+      - Toque de SMA20(1h) -> Take Profit LÍMITE en la EMA200(1h) actual.
       - Toque de EMA50(1h) -> Stop Loss en break even (solo si `run_stop_loss_check`).
+      (Si existiera un registro antiguo de TP adjunto, se conserva su lógica de reemplazo.)
     """
     symbol = position["symbol"]
     if position.get("side") != "short":
@@ -1018,10 +1015,12 @@ async def _create_entry_order(
     amount: float, price, params: dict, last_price: float, tp_price: float | None,
 ):
     """
-    Crea la orden de entrada con el Take Profit ADJUNTO. Cadena de intentos:
+    Crea la orden de entrada. Con `tp_price` (solo LONG) lleva el Take Profit
+    ADJUNTO. Cadena de intentos:
       1) TP adjunto LÍMITE (sin slippage)  <- preferido
       2) TP adjunto a MERCADO (si BingX no acepta el límite adjunto)
       3) Entrada SIN TP (el Paso 1 lo colocará después)
+    Con `tp_price=None` (SHORT) la entrada va directamente SIN TP.
     Devuelve (orden, tp_adjunto: bool).
     """
     if tp_price is not None:
@@ -1056,7 +1055,7 @@ async def _create_entry_order(
 def _calcular_tp_entrada(exchange: "ccxt.bingx", symbol: str, direccion: str,
                          entry_ref: float, ema200_1h) -> float | None:
     """
-    SHORT: TP = EMA200(1h) (debe quedar bajo la entrada).
+    SHORT: TP = EMA200(1h) (debe quedar bajo la entrada). (Ya no se usa: el SHORT entra sin TP adjunto.)
     LONG : TP = entrada + distancia entrada->EMA200(1h) (la EMA200(1h) debe quedar bajo la entrada).
     """
     if ema200_1h is None or entry_ref <= 0:
@@ -1187,9 +1186,11 @@ def _registrar_entrada_long(exchange: "ccxt.bingx", plan: dict, order: dict, tou
 async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
     """
     Paso 13 (apalancamiento y margen) + Paso 14 (ejecución), SHORT o LONG
-    según plan["direccion"]. La orden de entrada lleva el Take Profit ADJUNTO (límite).
-      SHORT: precio <= SMA20(5m) -> mercado; si no, STOP-LIMIT en la SMA20(5m).
-      LONG : precio <= SMA20(5m) -> mercado; si no, orden LÍMITE en la SMA20(5m).
+    según plan["direccion"].
+      SHORT: SIN TP adjunto. precio <= SMA20(5m) -> mercado; si no, STOP-limit en la SMA20(5m).
+             El Take Profit lo coloca el Paso 1 al tocar la SMA20(1h).
+      LONG : con Take Profit ADJUNTO (límite). precio <= SMA20(5m) -> mercado;
+             si no, orden LÍMITE en la SMA20(5m).
     Margen (todas las entradas): BINGX_LOW_RISK (5% / 10%).
     """
     symbol = plan["symbol"]
@@ -1282,9 +1283,11 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
         notional = margin_usdt * leverage
         amount = notional / last_price
 
-        # Take Profit adjunto: se calcula con el precio de entrada esperado.
-        entry_ref = last_price if touched else ma20_5m_value
-        tp_price = _calcular_tp_entrada(exchange, symbol, direccion, entry_ref, plan.get("ema200_1h_value"))
+        # Take Profit adjunto: SOLO en LONG. El SHORT entra sin TP adjunto.
+        tp_price = None
+        if es_long:
+            entry_ref = last_price if touched else ma20_5m_value
+            tp_price = _calcular_tp_entrada(exchange, symbol, direccion, entry_ref, plan.get("ema200_1h_value"))
 
         if es_long:
             if touched:
@@ -1307,28 +1310,24 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> None:
                 )
             _registrar_entrada_long(exchange, plan, order, touched, last_price, leverage, amount, tp_price, tp_adj)
         else:
+            # SHORT: siempre SIN TP adjunto (tp_price=None). El Paso 1 coloca el TP.
             if touched:
-                order, tp_adj = await _create_entry_order(
+                order, _tp_adj = await _create_entry_order(
                     exchange, symbol, "market", "sell", amount, None,
-                    {"positionSide": "SHORT"}, last_price, tp_price,
+                    {"positionSide": "SHORT"}, last_price, None,
                 )
                 log.info(
-                    "[Paso 14][SHORT] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=%s | %s",
-                    symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_entrada(plan),
+                    "[Paso 14][SHORT] Market entry executed: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=no | %s",
+                    symbol, margin_usdt, leverage, order.get("id"), _nota_entrada(plan),
                 )
             else:
-                order, tp_adj = await _create_entry_order(
+                order, _tp_adj = await _create_entry_order(
                     exchange, symbol, "STOP", "sell", amount, ma20_5m_value,
-                    {"stopPrice": ma20_5m_value, "positionSide": "SHORT"}, last_price, tp_price,
+                    {"stopPrice": ma20_5m_value, "positionSide": "SHORT"}, last_price, None,
                 )
                 log.info(
-                    "[Paso 14][SHORT] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=%s | %s",
-                    ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"), tp_price if tp_adj else "no", _nota_entrada(plan),
-                )
-            if tp_adj:
-                _registrar_protector(
-                    exchange, symbol, "TP_ATTACHED", order.get("id"),
-                    extra={"tp_price": tp_price, "replaced": False},
+                    "[Paso 14][SHORT] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=no | %s",
+                    ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"), _nota_entrada(plan),
                 )
 
     except Exception as exc:
@@ -1415,7 +1414,7 @@ async def ensure_hedge_mode(exchange: "ccxt.bingx", label: str) -> None:
 # ----------------------------------------------------------------------
 # PASO 15: BARRIDO DE BALANCE EXCEDENTE (cuenta de futuros -> fondos).
 # ----------------------------------------------------------------------
-FUTURES_BALANCE_CAP_USDT = 10_000.0
+FUTURES_BALANCE_CAP_USDT = 30_000.0
 FUND_TRANSFER_FROM_ACCOUNT = "swap"
 FUND_TRANSFER_TO_ACCOUNT = "funding"
 
