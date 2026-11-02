@@ -1,0 +1,57 @@
+name: Notify Closed Positions
+
+on:
+  # Mismo disparador externo (cronjob.org) que el bot de señales:
+  # un solo evento "bingx-trigger" lanza los dos workflows.
+  repository_dispatch:
+    types: [bingx-trigger]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # para guardar json/notify_state.json
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: bingx-notify
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install -r utils/requirements.txt
+
+      - name: Revisar operaciones cerradas
+        env:
+          BINGX_API_KEY: ${{ secrets.BINGX_API_KEY }}
+          BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
+          NOTIFY_BOT_TOKEN: ${{ secrets.NOTIFY_BOT_TOKEN }}
+          NOTIFY_CHAT_ID: ${{ secrets.NOTIFY_CHAT_ID }}
+          # Cuentas a revisar: real y demo.
+          NOTIFY_MODES: "real,demo"
+        run: |
+          set -o pipefail
+          python utils/notify_closed.py 2>&1 | tee notify_output.log
+
+      - name: Guardar estado (json/notify_state.json)
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain json/notify_state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add json/notify_state.json
+            git commit -m "chore: actualizar estado del notificador [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase origin "${{ github.ref_name }}" && git push && break
+              sleep 3
+            done || echo "No se pudo hacer push del estado"
+          fi
