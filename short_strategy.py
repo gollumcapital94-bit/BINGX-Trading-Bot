@@ -31,7 +31,7 @@ combinación de SMA20 / EMA50 / EMA200 en 4h indica qué hacer.
         precio de entrada BAJO la EMA200(4h):
             RSI6 15m y 5m < 90 -> LONG | alguno >= 90 -> se descarta.
         precio de entrada SOBRE la EMA200(4h) (excepción):
-            RSI6 15m y 5m < 90 -> SHORT | alguno >= 90 -> LONG.
+            RSI6 15m y 5m < 90 -> SHORT | alguno >= 90 -> se DESCARTA (no LONG).
   Resto de patrones (P2a, P2b, P3 y el antiguo "fin de ciclo"): SIEMPRE SHORT,
   el RSI de 15m/5m no aplica (solo se anota).
   En P2a/P2b además se anota el RSI6 "macro" de la vela 4h anterior ya cerrada.
@@ -526,7 +526,8 @@ def resolver_direccion(info10: dict, rsi_15m, rsi_5m, precio_ref):
     precio_sobre_ema200 = precio_ref is not None and precio_ref > e200_4h
     if precio_sobre_ema200:
         if sobre:
-            return "long", "L1 con precio sobre EMA200(4h) y RSI6>=90 en 15m/5m: LONG"
+            # Cambio: ya NO se va LONG en esta excepción; se descarta.
+            return None, "L1 con precio sobre EMA200(4h) y RSI6>=90 en 15m/5m: se descarta (no LONG)"
         return "short", "L1 con precio sobre EMA200(4h) y RSI6<90 en 15m/5m: SHORT (excepción)"
 
     if sobre:
@@ -709,7 +710,7 @@ async def evaluate_symbol(exchange, symbol: str):
         expected_max_high = float(info["last_candle"]["high"])
         expected_max_low = float(info["last_candle"]["low"])
 
-        # EMA200(1h) actual: precio del Take Profit adjunto a la entrada.
+        # EMA200(1h) actual: precio del Take Profit adjunto a la entrada (LONG).
         ema200_1h_value = float(ema(df_1h["close"], 200).iloc[-1])
 
         # Paso 4: FILTRO DURO. RSI6(1h) > 90 -> se descarta.
