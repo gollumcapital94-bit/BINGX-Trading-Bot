@@ -72,31 +72,61 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add json/
             git commit -m "chore: actualizar seguimiento json [skip ci]"
-            git pull --rebase origin "${{ github.ref_name }}" || true
-            git push || echo "No se pudo hacer push del registro"
+            for i in 1 2 3; do
+              git pull --rebase origin "${{ github.ref_name }}" && git push && break
+              sleep 3
+            done || echo "No se pudo hacer push del registro"
           fi
 
-      - name: Enviar señales a Telegram
+      - name: Enviar señales y errores a Telegram
         if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Señales + advertencias importantes (TP rechazado, errores de entrada).
-          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|Stop Loss en break even.*colocado|Take Profit colocado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|Error ejecutando entrada|Error colocando Take Profit" bot_output.log > signals.txt || true
+          rm -f signals.txt
+
+          # 1) Eventos de la operación + TODO error [ERROR] completo + advertencias importantes.
+          #    Los "Error evaluando" del escáner se resumen aparte (pueden ser cientos).
+          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|\[LONG\]: la orden límite se llenó|Stop Loss en break even.*colocado|Take Profit colocado|Take Profit adjunto LÍMITE aceptado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|\[Límite de riesgo\] (BLOQUEADA|ADVERTENCIA)|no se pudo cancelar|BingX rechazó|no se pudo configurar el apalancamiento|\[ERROR\]" bot_output.log \
+            | grep -v "Error evaluando" > signals.txt || true
+
+          # 2) Resumen de errores del escáner (1 línea + ejemplo).
+          N=$(grep -c "Error evaluando" bot_output.log || true)
+          if [ "${N:-0}" -gt 0 ]; then
+            {
+              echo "⚠️ ${N} error(es) evaluando pares en el escáner. Primero:"
+              grep -m1 "Error evaluando" bot_output.log
+            } >> signals.txt
+          fi
+
+          # 3) Caída del bot por excepción no controlada: traceback con contexto.
+          if grep -q "Traceback" bot_output.log; then
+            {
+              echo "💥 El bot se cayó con una excepción no controlada:"
+              grep -A 15 "Traceback" bot_output.log
+            } >> signals.txt
+          fi
 
           if [ ! -s signals.txt ]; then
-            echo "Telegram: no hubo líneas de señal en el log"
+            echo "Telegram: no hubo líneas de señal ni errores en el log"
             exit 0
           fi
 
-          # Telegram rechaza mensajes de más de 4096 caracteres: se parte en bloques.
+          # Telegram rechaza mensajes de más de 4096 caracteres: se parte en bloques
+          # (máximo 4 mensajes por corrida para no llenar el chat).
           rm -f part_*
           split -C 3500 -d signals.txt part_
-          for f in part_*; do
+          TOTAL=$(ls part_* | wc -l)
+          for f in $(ls part_* | head -4); do
             TEXT=$(printf '📊 BingX Bot:\n%s' "$(cat "$f")")
             RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
               --data-urlencode "text=${TEXT}")
             echo "Telegram: ${RESP}"
           done
+          if [ "${TOTAL}" -gt 4 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=⚠️ Hubo más de 4 bloques de avisos; se omitieron $((TOTAL-4)). Revisa el log en GitHub." > /dev/null
+          fi
