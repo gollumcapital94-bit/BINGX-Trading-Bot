@@ -88,7 +88,7 @@ jobs:
 
           # 1) Eventos de la operación + TODO error [ERROR] completo + advertencias importantes.
           #    Los "Error evaluando" del escáner se resumen aparte (pueden ser cientos).
-          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|\[LONG\]: la orden límite se llenó|Stop Loss en break even.*colocado|Take Profit colocado|Take Profit adjunto LÍMITE aceptado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|\[Límite de riesgo\] (BLOQUEADA|ADVERTENCIA)|no se pudo cancelar|BingX rechazó|no se pudo configurar el apalancamiento|\[ERROR\]" bot_output.log \
+          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|\[LONG\]: la orden límite se llenó|Stop Loss en break even.*colocado|Take Profit colocado|Take Profit adjunto LÍMITE aceptado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|\[Límite de riesgo\] (BLOQUEADA|ADVERTENCIA)|\[Entrada descartada\]|no se pudo cancelar|BingX rechazó|no se pudo configurar el apalancamiento|\[ERROR\]" bot_output.log \
             | grep -v "Error evaluando" > signals.txt || true
 
           # 2) Resumen de errores del escáner (1 línea + ejemplo).
