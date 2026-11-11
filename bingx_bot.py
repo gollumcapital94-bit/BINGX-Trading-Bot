@@ -27,6 +27,10 @@ PASO 15 -> BARRIDO DE BALANCE (solo mercado real, solo disparador externo).
 LECTURA DE MERCADO: el universo de símbolos y todo el escaneo se leen
 SIEMPRE del mercado REAL (ver build_market_data_exchange()).
 
+RESILIENCIA: utils/resilience.py añade reintentos con espera creciente a las
+lecturas (error 100410 / límite de peticiones), repasa los pares que fallen en
+el escáner y registra [DIAGNÓSTICO] cuando falla una llamada de escritura.
+
 Variables de entorno:
     BINGX_API_KEY, BINGX_API_SECRET,
     BINGX_DEMO_SHORT, BINGX_DEMO_LONG,
@@ -47,6 +51,7 @@ import ccxt.async_support as ccxt
 
 import short_strategy as strat_short
 from utils.indicators import sma, ema
+from utils import resilience
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1439,13 +1444,8 @@ async def _scan_and_collect_plans(market_exchange: "ccxt.bingx", allowed_symbols
     candidatos = [s for s in allowed_symbols if not (s in excl_short and s in excl_long)]
     log.info("[Pasos 2-14] Escaneando %d pares candidatos para nuevas entradas...", len(candidatos))
 
-    semaphore = asyncio.Semaphore(10)
-
-    async def _bounded_eval(symbol):
-        async with semaphore:
-            return await strat_short.evaluate_symbol(market_exchange, symbol)
-
-    results = await asyncio.gather(*[_bounded_eval(s) for s in candidatos])
+    # Escáner completo: reintentos por par y rondas de repaso (ver utils/resilience.py).
+    results = await resilience.scan_all(strat_short.evaluate_symbol, market_exchange, candidatos)
 
     plans = []
     for plan, _fs in results:
@@ -1670,6 +1670,9 @@ async def main() -> None:
         exchange_long = build_exchange(demo_long, "LONG")
 
     market_exchange = build_market_data_exchange([(exchange_short, demo_short), (exchange_long, demo_long)])
+
+    # Reintentos en lecturas (100410) + diagnóstico en escrituras (ver utils/resilience.py).
+    resilience.instrument(market_exchange, [exchange_short, exchange_long])
 
     cuentas_unicas = [(exchange_short, "SHORT")]
     if exchange_long is not exchange_short:
