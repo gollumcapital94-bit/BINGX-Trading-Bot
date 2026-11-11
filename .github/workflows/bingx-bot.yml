@@ -28,7 +28,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20   # antes 10: el escáner ahora repasa los pares que fallen
     concurrency:
       group: bingx-trading-bot
       cancel-in-progress: false
@@ -86,21 +86,13 @@ jobs:
         run: |
           rm -f signals.txt
 
-          # 1) Eventos de la operación + TODO error [ERROR] completo + advertencias importantes.
-          #    Los "Error evaluando" del escáner se resumen aparte (pueden ser cientos).
-          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|\[LONG\]: la orden límite se llenó|Stop Loss en break even.*colocado|Take Profit colocado|Take Profit adjunto LÍMITE aceptado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|\[Límite de riesgo\] (BLOQUEADA|ADVERTENCIA)|\[Entrada descartada\]|no se pudo cancelar|BingX rechazó|no se pudo configurar el apalancamiento|\[ERROR\]" bot_output.log \
+          # 1) Eventos de la operación + errores + DIAGNÓSTICO (qué llamada falló y con qué datos)
+          #    + RESUMEN DEL ESCÁNER (pares evaluados, sin evaluar, códigos de error, versión de ccxt).
+          #    Los "Error evaluando" individuales se omiten (pueden ser cientos): los cubre el RESUMEN.
+          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|\[LONG\]: la orden límite se llenó|Stop Loss en break even.*colocado|Take Profit colocado|Take Profit adjunto LÍMITE aceptado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|\[Límite de riesgo\] (BLOQUEADA|ADVERTENCIA)|\[Entrada descartada\]|no se pudo cancelar|BingX rechazó|no se pudo configurar el apalancamiento|\[ESCÁNER\]|\[DIAGNÓSTICO\]|\[ERROR\]" bot_output.log \
             | grep -v "Error evaluando" > signals.txt || true
 
-          # 2) Resumen de errores del escáner (1 línea + ejemplo).
-          N=$(grep -c "Error evaluando" bot_output.log || true)
-          if [ "${N:-0}" -gt 0 ]; then
-            {
-              echo "⚠️ ${N} error(es) evaluando pares en el escáner. Primero:"
-              grep -m1 "Error evaluando" bot_output.log
-            } >> signals.txt
-          fi
-
-          # 3) Caída del bot por excepción no controlada: traceback con contexto.
+          # 2) Caída del bot por excepción no controlada: traceback con contexto.
           if grep -q "Traceback" bot_output.log; then
             {
               echo "💥 El bot se cayó con una excepción no controlada:"
