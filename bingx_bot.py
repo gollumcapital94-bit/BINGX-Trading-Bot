@@ -1305,7 +1305,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> bool:
         return False
 
     if not es_maximo_round:
-        log.info("%s [Paso 13][%s] es_maximo_round=False -> no se opera nada.", symbol, tag)
+        log.warning("[Entrada descartada] %s %s: es_maximo_round=False, no se opera nada.", symbol, tag)
         return False
 
     try:
@@ -1337,7 +1337,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> bool:
             else:
                 leverage_calc = strat_short.calculate_leverage(max_high_5m, reference_price)
         except ValueError as exc:
-            log.info("%s descartado en [Paso 13][%s]: %s", symbol, tag, exc)
+            log.warning("[Entrada descartada] %s %s en [Paso 13]: %s", symbol, tag, exc)
             return False
 
         max_leverage_exchange = await strat_short.get_max_leverage_for_symbol(exchange, symbol)
@@ -1364,7 +1364,7 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> bool:
         margin_usdt = await strat_short.calculate_position_size(exchange, symbol, leverage, margin_fraction)
 
         if margin_usdt <= 0:
-            log.info("%s descartado en [Paso 13][%s]: margen calculado <= 0", symbol, tag)
+            log.warning("[Entrada descartada] %s %s en [Paso 13]: margen calculado <= 0", symbol, tag)
             return False
 
         log.info(
@@ -1453,8 +1453,8 @@ async def _scan_and_collect_plans(market_exchange: "ccxt.bingx", allowed_symbols
             continue
         excluido = excl_long if plan.get("direccion") == "long" else excl_short
         if plan["symbol"] in excluido:
-            log.info("%s: señal %s ignorada, ya hay una operación de ese lado abierta o en seguimiento.",
-                     plan["symbol"], plan.get("direccion", "short").upper())
+            log.warning("[Entrada descartada] %s %s: señal ignorada, ya hay una operación de ese lado abierta o en seguimiento.",
+                        plan["symbol"], plan.get("direccion", "short").upper())
             continue
         plans.append(plan)
 
