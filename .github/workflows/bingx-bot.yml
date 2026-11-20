@@ -28,7 +28,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 20   # antes 10: el escáner ahora repasa los pares que fallen
+    timeout-minutes: 20
     concurrency:
       group: bingx-trading-bot
       cancel-in-progress: false
@@ -51,14 +51,9 @@ jobs:
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           BINGX_DEMO_SHORT: ${{ github.event.inputs.demo_mode_short || vars.BINGX_DEMO_SHORT || 'true' }}
           BINGX_DEMO_LONG: ${{ github.event.inputs.demo_mode_long || vars.BINGX_DEMO_LONG || 'true' }}
-          # Riesgo de TODAS las entradas (SHORT y LONG):
-          # true = 5% de la cuenta | false = 10% de la cuenta.
           BINGX_LOW_RISK: ${{ vars.BINGX_LOW_RISK || 'true' }}
-          # El cron interno (schedule) SOLO gestiona posiciones (Paso 1).
           BOT_MODE: ${{ github.event_name == 'schedule' && 'tp_only' || 'full' }}
-          # Barrido de balance (Paso 15, tope 30,000 USDT): SOLO en disparador EXTERNO.
           RUN_BALANCE_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
-          # Gatillo de Stop Loss en break even (SHORT y LONG): SOLO en disparador EXTERNO.
           RUN_STOP_LOSS_CHECK: ${{ github.event_name == 'repository_dispatch' && 'true' || 'false' }}
         run: |
           set -o pipefail
@@ -78,21 +73,22 @@ jobs:
             done || echo "No se pudo hacer push del registro"
           fi
 
-      - name: Enviar señales y errores a Telegram
+      - name: Enviar entradas, TP/BE y errores a Telegram
         if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EVENTO: ${{ github.event_name }}
         run: |
           rm -f signals.txt
 
-          # 1) Eventos de la operación + errores + DIAGNÓSTICO (qué llamada falló y con qué datos)
-          #    + RESUMEN DEL ESCÁNER (pares evaluados, sin evaluar, códigos de error, versión de ccxt).
-          #    Los "Error evaluando" individuales se omiten (pueden ser cientos): los cubre el RESUMEN.
-          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|\[LONG\]: la orden límite se llenó|Stop Loss en break even.*colocado|Take Profit colocado|Take Profit adjunto LÍMITE aceptado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|\[Límite de riesgo\] (BLOQUEADA|ADVERTENCIA)|\[Entrada descartada\]|no se pudo cancelar|BingX rechazó|no se pudo configurar el apalancamiento|\[ESCÁNER\]|\[DIAGNÓSTICO\]|\[ERROR\]" bot_output.log \
+          # Solo se avisa de: entradas, TP, break even, órdenes canceladas/llenadas,
+          # barrido de balance, bloqueos de riesgo y ERRORES / fallos de API.
+          # YA NO se manda el RESUMEN del escáner de cada corrida.
+          grep -E "Market entry executed|(STOP-)?LIMIT order placed|Orden límite LONG cancelada|\[LONG\]: la orden límite se llenó|Stop Loss en break even.*colocado|Take Profit colocado|Take Profit adjunto LÍMITE aceptado|Barrido de balance\] Transferencia ejecutada|no aceptó la entrada con Take Profit|no aceptó el TP adjunto|\[Límite de riesgo\] (BLOQUEADA|ADVERTENCIA)|\[Entrada descartada\]|no se pudo cancelar|BingX rechazó|no se pudo configurar el apalancamiento|no se pudo verificar|no se pudieron obtener las órdenes abiertas|Datos insuficientes de OHLCV|\[DIAGNÓSTICO\]|\[ERROR\]" bot_output.log \
             | grep -v "Error evaluando" > signals.txt || true
 
-          # 2) Caída del bot por excepción no controlada: traceback con contexto.
+          # Caída por excepción no controlada
           if grep -q "Traceback" bot_output.log; then
             {
               echo "💥 El bot se cayó con una excepción no controlada:"
@@ -101,17 +97,22 @@ jobs:
           fi
 
           if [ ! -s signals.txt ]; then
-            echo "Telegram: no hubo líneas de señal ni errores en el log"
+            echo "Telegram: nada que avisar en esta corrida"
             exit 0
           fi
 
-          # Telegram rechaza mensajes de más de 4096 caracteres: se parte en bloques
-          # (máximo 4 mensajes por corrida para no llenar el chat).
+          # Contexto en cada mensaje: versión de ccxt, Python, modo y hora
+          VER=$(grep -o 'ccxt=[0-9][0-9.]*' bot_output.log | head -1)
+          PYV=$(python --version 2>&1)
+          FECHA=$(date -u '+%Y-%m-%d %H:%M UTC')
+          HEADER="📊 BingX Bot | ${VER:-ccxt=?} | ${PYV} | ${EVENTO} | ${FECHA}"
+
+          # Telegram rechaza mensajes de más de 4096 caracteres: máx. 4 bloques
           rm -f part_*
           split -C 3500 -d signals.txt part_
           TOTAL=$(ls part_* | wc -l)
           for f in $(ls part_* | head -4); do
-            TEXT=$(printf '📊 BingX Bot:\n%s' "$(cat "$f")")
+            TEXT=$(printf '%s\n%s' "${HEADER}" "$(cat "$f")")
             RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
               --data-urlencode "text=${TEXT}")
