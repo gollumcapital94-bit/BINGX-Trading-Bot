@@ -22,7 +22,7 @@ PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py.
            (límite LONG sin llenar / STOP-limit SHORT sin activar) cuentan como en riesgo.
            Si hay más señales que cupos, se abren en el orden en que salen del escáner.
 PASO 15 -> BARRIDO DE BALANCE (solo mercado real, solo disparador externo).
-           Tope: 30,000 USDT.
+           Tope: 20,000 USDT.
 
 LECTURA DE MERCADO: el universo de símbolos y todo el escaneo se leen
 SIEMPRE del mercado REAL (ver build_market_data_exchange()).
@@ -374,6 +374,132 @@ def _px(exchange: "ccxt.bingx", symbol: str, price: float) -> float:
         return float(exchange.price_to_precision(symbol, price))
     except Exception:
         return float(price)
+
+
+# ----------------------------------------------------------------------
+# MEMORIA DE PARÁMETROS DE ENTRADA (json/entry_params.json)
+#   Cuando BingX rechaza una forma de enviar la orden y otra sí la acepta, se
+#   anota aquí (por modo demo/real) para probarla PRIMERO en la próxima entrada.
+#   La memoria caduca a las MEMORIA_HORAS: pasado ese tiempo se vuelve al orden
+#   preferido (así se detecta si BingX arregló la forma original).
+#   Es silencioso: no genera avisos de Telegram.
+# ----------------------------------------------------------------------
+ENTRY_PARAMS_FILE = os.path.join(JSON_DIR, "entry_params.json")
+MEMORIA_HORAS = 24
+
+
+def _params_load() -> dict:
+    try:
+        with open(ENTRY_PARAMS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("[Params] No se pudo leer entry_params.json (%s); se usa el orden por defecto.", exc)
+        return {}
+
+
+def _params_recordado(exchange: "ccxt.bingx", clave: str):
+    """Nombre de la variante que funcionó la última vez (si la memoria no ha caducado)."""
+    modo = "demo" if _es_sandbox(exchange) else "real"
+    rec = (_params_load().get(modo) or {}).get(clave) or {}
+    variante, ts = rec.get("variante"), rec.get("ts")
+    if not variante or not ts:
+        return None
+    if int(exchange.milliseconds()) - int(ts) > MEMORIA_HORAS * 3_600_000:
+        return None
+    return variante
+
+
+def _params_guardar(exchange: "ccxt.bingx", clave: str, variante: str) -> None:
+    """Anota la variante que BingX aceptó (y la versión de ccxt) en json/entry_params.json."""
+    try:
+        modo = "demo" if _es_sandbox(exchange) else "real"
+        data = _params_load()
+        bloque = data.setdefault(modo, {})
+        ahora = int(exchange.milliseconds())
+        previo = bloque.get(clave) or {}
+        try:
+            import ccxt as _ccxt_base
+            version = getattr(_ccxt_base, "__version__", None)
+        except Exception:
+            version = None
+        bloque[clave] = {
+            "variante": variante,
+            "ts": ahora,
+            "fecha_utc": pd.to_datetime(ahora, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M"),
+            "ccxt": version,
+        }
+        _save_json_dict(ENTRY_PARAMS_FILE, data)
+        if previo.get("variante") != variante:
+            log.info("[Params] %s (%s): BingX aceptó la variante '%s'; se recuerda para próximas entradas.",
+                     clave, modo, variante)
+    except Exception as exc:
+        log.warning("[Params] No se pudo guardar entry_params.json: %s", exc)
+
+
+def _save_json_dict(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+# --- Aprendizaje silencioso: mientras el bot prueba variantes, los [DIAGNÓSTICO] de los
+#     intentos fallidos NO se mandan a Telegram. Si TODAS fallan, sí se avisa (log.error).
+import contextvars
+
+_DIAG_SILENCIADO = contextvars.ContextVar("diag_silenciado", default=False)
+
+
+class _FiltroDiagnosticoAprendizaje(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _DIAG_SILENCIADO.get():
+            return not record.getMessage().startswith("[DIAGNÓSTICO] Falló create_order")
+        return True
+
+
+logging.getLogger("bingx_bot.resilience").addFilter(_FiltroDiagnosticoAprendizaje())
+
+_CODE_RE = re.compile(r'"code"\s*:\s*(\d+)')
+_TIPOS_ORDEN_CONOCIDOS = ("TRIGGER_LIMIT", "TRIGGER_MARKET", "STOP_MARKET", "STOP",
+                          "TAKE_PROFIT_MARKET", "TAKE_PROFIT")
+
+
+def _params_error(exchange: "ccxt.bingx", clave: str, variante: str, exc: Exception) -> None:
+    """Anota en entry_params.json el último error que dio cada variante (código y mensaje de BingX)."""
+    try:
+        modo = "demo" if _es_sandbox(exchange) else "real"
+        data = _params_load()
+        m = _CODE_RE.search(str(exc))
+        ahora = int(exchange.milliseconds())
+        data.setdefault(modo, {}).setdefault("errores", {}).setdefault(clave, {})[variante] = {
+            "codigo": m.group(1) if m else type(exc).__name__,
+            "mensaje": str(exc)[:300],
+            "fecha_utc": pd.to_datetime(ahora, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M"),
+        }
+        _save_json_dict(ENTRY_PARAMS_FILE, data)
+    except Exception as e2:
+        log.warning("[Params] No se pudo anotar el error en entry_params.json: %s", e2)
+
+
+def _pista_tipo_en_error(exc: Exception, ya_probados: set):
+    """Si el mensaje de BingX nombra un tipo de orden que aún no se probó, lo devuelve."""
+    texto = str(exc).upper()
+    for t in _TIPOS_ORDEN_CONOCIDOS:
+        if t not in ya_probados and re.search(r"\b" + t + r"\b", texto):
+            return t
+    return None
+
+
+def _ordenar_por_recordado(intentos: tuple, recordado) -> list:
+    """Pone primero la variante recordada (el nombre es el primer elemento de cada intento)."""
+    lista = list(intentos)
+    if recordado:
+        lista.sort(key=lambda it: 0 if it[0] == recordado else 1)  # sort estable
+    return lista
 
 
 # ----------------------------------------------------------------------
@@ -1125,9 +1251,11 @@ async def _create_entry_order(
             # Se deja EXACTAMENTE como funcionaba antes (sin "type").
             ("MERCADO", {"triggerPrice": tp_price}),
         )
+        intentos = _ordenar_por_recordado(intentos, _params_recordado(exchange, "long_tp_adjunto"))
         for nombre, tp_cfg in intentos:
             params_tp = dict(params)
             params_tp["takeProfit"] = tp_cfg
+            token = _DIAG_SILENCIADO.set(True)
             try:
                 order = await _create_order_with_notional_cap_retry(
                     exchange, symbol, order_type, side, amount, price, params_tp, last_price,
@@ -1139,16 +1267,78 @@ async def _create_entry_order(
                     )
                 else:
                     log.info("%s: Take Profit adjunto LÍMITE aceptado por BingX (TP=%.8f, sin slippage).", symbol, tp_price)
+                _params_guardar(exchange, "long_tp_adjunto", nombre)
                 return order, True
             except Exception as exc:
-                log.warning(
-                    "%s: BingX no aceptó la entrada con Take Profit adjunto %s (%s).", symbol, nombre, exc,
-                )
+                _params_error(exchange, "long_tp_adjunto", nombre, exc)
+                log.info("[Params] %s: TP adjunto %s no aceptado (%s).", symbol, nombre, exc)
+            finally:
+                _DIAG_SILENCIADO.reset(token)
         log.warning("%s: se reintenta la entrada SIN TP (el Paso 1 lo colocará).", symbol)
     order = await _create_order_with_notional_cap_retry(
         exchange, symbol, order_type, side, amount, price, params, last_price,
     )
     return order, False
+
+
+async def _entrada_short_stop(exchange: "ccxt.bingx", symbol: str, amount: float,
+                              ma20: float, last_price: float) -> dict:
+    """
+    Entrada SHORT pendiente (se activa al subir hasta la SMA20(5m)).
+    Prueba variantes en cadena (la recordada en json/entry_params.json va primero) y se
+    queda con la primera que BingX acepte. Cada error se anota en el JSON y, si el mensaje
+    de BingX nombra un tipo de orden aún no probado, se prueba también.
+    Durante el aprendizaje NO se avisa por Telegram; si todas fallan, sí.
+    """
+    try:
+        from ccxt.base.errors import NetworkError
+    except Exception:  # pragma: no cover
+        NetworkError = ()
+
+    lado = {"positionSide": "SHORT"}
+    cola = _ordenar_por_recordado((
+        ("STOP límite (stopPrice)", "STOP", ma20, {"stopPrice": ma20, **lado}),
+        ("limit + triggerPrice (ccxt)", "limit", ma20, {"triggerPrice": ma20, **lado}),
+        ("TRIGGER_LIMIT", "TRIGGER_LIMIT", ma20,
+         {"stopPrice": ma20, "workingType": "CONTRACT_PRICE", **lado}),
+        ("TRIGGER_MARKET", "TRIGGER_MARKET", None,
+         {"stopPrice": ma20, "workingType": "CONTRACT_PRICE", **lado}),
+        ("STOP límite (triggerPrice)", "STOP", ma20, {"triggerPrice": ma20, **lado}),
+        ("STOP_MARKET", "STOP_MARKET", None, {"stopPrice": ma20, **lado}),
+    ), _params_recordado(exchange, "short_pendiente"))
+
+    tipos_probados: set = set()
+    errores: list[str] = []
+    ultimo = None
+    while cola:
+        nombre, tipo, precio, params = cola.pop(0)
+        tipos_probados.add(str(tipo).upper())
+        token = _DIAG_SILENCIADO.set(True)
+        try:
+            order = await _create_order_with_notional_cap_retry(
+                exchange, symbol, tipo, "sell", amount, precio, params, last_price,
+            )
+            _params_guardar(exchange, "short_pendiente", nombre)
+            return order
+        except Exception as exc:
+            # Un error de red es ambiguo (la orden pudo llegar): NO se reintenta para no duplicar.
+            if NetworkError and isinstance(exc, NetworkError):
+                raise
+            ultimo = exc
+            _params_error(exchange, "short_pendiente", nombre, exc)
+            errores.append(f"{nombre}: {str(exc)[:160]}")
+            log.info("[Params] %s SHORT: variante '%s' no aceptada (%s).", symbol, nombre, str(exc)[:160])
+            pista = _pista_tipo_en_error(exc, tipos_probados)
+            if pista:
+                pista_precio = None if pista.endswith("_MARKET") else ma20
+                cola.insert(0, (f"pista_{pista}", pista, pista_precio, {"stopPrice": ma20, **lado}))
+                log.info("[Params] %s SHORT: el error de BingX nombra el tipo %s; se prueba.", symbol, pista)
+        finally:
+            _DIAG_SILENCIADO.reset(token)
+
+    log.error("%s [SHORT]: BingX no aceptó NINGUNA variante de la entrada pendiente. Errores: %s",
+              symbol, " || ".join(errores))
+    raise ultimo
 
 
 def _calcular_tp_entrada(exchange: "ccxt.bingx", symbol: str, direccion: str,
@@ -1421,10 +1611,8 @@ async def execute_entry(exchange: "ccxt.bingx", plan: dict) -> bool:
                     symbol, margin_usdt, leverage, order.get("id"), _nota_entrada(plan),
                 )
             else:
-                order, _tp_adj = await _create_entry_order(
-                    exchange, symbol, "STOP", "sell", amount, ma20_5m_value,
-                    {"stopPrice": ma20_5m_value, "positionSide": "SHORT"}, last_price, None,
-                )
+                # Entrada pendiente: _entrada_short_stop prueba variantes si BingX responde 109420.
+                order = await _entrada_short_stop(exchange, symbol, amount, ma20_5m_value, last_price)
                 log.info(
                     "[Paso 14][SHORT] Short STOP-LIMIT order placed at MA20(5m)=%.6f: %s | margin=%.2f USDT | leverage=%dx | order_id=%s | TP adjunto=no | %s",
                     ma20_5m_value, symbol, margin_usdt, leverage, order.get("id"), _nota_entrada(plan),
@@ -1546,8 +1734,9 @@ async def ensure_hedge_mode(exchange: "ccxt.bingx", label: str) -> None:
 
 # ----------------------------------------------------------------------
 # PASO 15: BARRIDO DE BALANCE EXCEDENTE (cuenta de futuros -> fondos).
+# Solo cuenta REAL (en DEMO se omite). Tope: 20,000 USDT.
 # ----------------------------------------------------------------------
-FUTURES_BALANCE_CAP_USDT = 30_000.0
+FUTURES_BALANCE_CAP_USDT = 20_000.0
 FUND_TRANSFER_FROM_ACCOUNT = "swap"
 FUND_TRANSFER_TO_ACCOUNT = "funding"
 
