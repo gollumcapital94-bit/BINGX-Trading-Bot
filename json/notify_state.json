@@ -1,14 +1,15 @@
 {
   "real": {
-    "last_check_ms": 1795269636132,
+    "last_check_ms": 1795273236479,
     "notified": [],
     "symbols": []
   },
   "demo": {
-    "last_check_ms": 1795269637769,
+    "last_check_ms": 1795273238885,
     "notified": [],
     "symbols": [
-      "ERA-USDT"
+      "ERA-USDT",
+      "IDOL-USDT"
     ]
   }
 }
