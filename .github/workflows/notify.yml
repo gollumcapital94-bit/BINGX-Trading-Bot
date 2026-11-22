@@ -13,7 +13,7 @@ permissions:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15   # antes 5: ahora el notificador barre TODOS los pares USDT-M
     concurrency:
       group: bingx-notify
       cancel-in-progress: false
