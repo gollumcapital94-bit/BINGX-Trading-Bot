@@ -32,9 +32,19 @@ combinación de SMA20 / EMA50 / EMA200 en 4h indica qué hacer.
             RSI6 15m y 5m < 90 -> LONG | alguno >= 90 -> se descarta.
         precio de entrada SOBRE la EMA200(4h) (excepción):
             RSI6 15m y 5m < 90 -> SHORT | alguno >= 90 -> se DESCARTA (no LONG).
-  Resto de patrones (P2a, P2b, P3 y el antiguo "fin de ciclo"): SIEMPRE SHORT,
-  el RSI de 15m/5m no aplica (solo se anota).
-  En P2a/P2b además se anota el RSI6 "macro" de la vela 4h anterior ya cerrada.
+
+  Ambas SOBRE la EMA200 (la EMA50 lleva sin interrupción sobre la EMA200 desde
+  su último cruce hacia arriba; ese es el "tramo actual"):
+    - SMA20 bajo EMA50 (P2b): SIEMPRE SHORT (el RSI no importa).
+    - SMA20 sobre EMA50:
+        * TRENZADO (nuevo): dentro del tramo actual, la SMA20 ya había estado
+          sobre la EMA50, luego se metió por debajo de la EMA50 (o de la
+          EMA200 con la EMA50 sin cruzarla) y VOLVIÓ a salir. Basta una vez.
+          RSI6 15m o 5m >= 90 -> LONG | ambos < 90 -> SHORT.
+        * LIMPIO (P2a) o RE-CRUCE (ambas se metieron bajo la EMA200, salieron
+          y la SMA20 cruzó por primera vez sobre la EMA50): SIEMPRE SHORT.
+  Resto de patrones (P3 y el antiguo "fin de ciclo"): SIEMPRE SHORT.
+  En P2a/P2b/TRENZADO además se anota el RSI6 "macro" de la vela 4h anterior ya cerrada.
 
 PASOS 11 y 12 (SINGULARIDAD): 15m y, si no, 5m. Solo S > 0.
   Todos los LONG y SHORT pasan por la cadena completa.
@@ -124,7 +134,7 @@ def _is_red(row) -> bool:
 async def _fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str, total_limit: int) -> list:
     """
     Descarga hasta `total_limit` velas paginando hacia atrás (BingX capa a
-    1440 por llamada). Devuelve la lista ordenada de más antigua a más
+    ~1000-1440 por llamada). Devuelve la lista ordenada de más antigua a más
     reciente, sin duplicados.
     """
     per_request = min(total_limit, BINGX_MAX_OHLCV_PER_REQUEST)
@@ -459,12 +469,38 @@ async def check_step_9_volume(exchange, symbol: str):
 # ----------------------------------------------------------------------
 # Paso 10: SMA20/EMA50/EMA200 en 4H -> patrón (tipo) y dirección base
 # ----------------------------------------------------------------------
+def detectar_trenza_4h(s20: pd.Series, e50: pd.Series, e200: pd.Series):
+    """
+    Solo se llama con ambas medias SOBRE la EMA200 y la SMA20 SOBRE la EMA50 (ahora).
+    TRAMO ACTUAL = desde el último cruce de la EMA50 hacia arriba de la EMA200
+    (la EMA50 lleva sin interrupción sobre la EMA200 desde entonces).
+    TRENZADO = dentro del tramo, la SMA20 ya había estado sobre la EMA50, después
+    se metió por debajo de la EMA50 (o de la EMA200 con la EMA50 sin cruzarla;
+    eso implica también estar bajo la EMA50) y volvió a salir. Basta una vez.
+    La primera recuperación normal de la SMA20 (re-cruce) NO cuenta como trenza.
+    Devuelve (trenzado: bool, idx_inicio_tramo: int).
+    """
+    last = len(e50) - 1
+    i = last
+    while i > 0 and e50.iloc[i - 1] > e200.iloc[i - 1]:
+        i -= 1
+    inicio = max(i, 19)  # la SMA20 no existe antes de la vela 19
+    arriba = (s20.iloc[inicio:] > e50.iloc[inicio:]).to_numpy()
+    if not arriba.any():
+        return False, inicio
+    primera = int(arriba.argmax())
+    trenzado = bool((~arriba[primera:]).any())
+    return trenzado, inicio
+
+
 async def check_step_10(exchange, symbol: str):
     """
     No existe "fin de ciclo": todo patrón indica una operación.
     Devuelve `tipo`:
       "L1"          -> ambas bajo EMA200, SMA20 bajo EMA50 (LONG convencional)
       "P1"          -> ambas bajo EMA200, SMA20 sobre EMA50 (SHORT con posible conversión a LONG)
+      "TRENZADO"    -> ambas sobre EMA200, SMA20 sobre EMA50 pero con la SMA20 "trenzada"
+                       en el tramo actual (SHORT, o LONG si RSI6 15m/5m >= 90)
       "SHORT_FIJO"  -> resto de patrones: siempre SHORT, el RSI 15m/5m no aplica
     La dirección FINAL la fija resolver_direccion() con los RSI6 de 15m/5m.
     """
@@ -473,9 +509,12 @@ async def check_step_10(exchange, symbol: str):
         return False, {"reason": f"[Paso 10] {err}", "failed_step": 10, "datos_insuficientes": True}
 
     close_4h = df_4h["close"]
-    s20 = float(sma(close_4h, 20).iloc[-1])
-    e50 = float(ema(close_4h, 50).iloc[-1])
-    e200 = float(ema(close_4h, 200).iloc[-1])
+    s20_series = sma(close_4h, 20)
+    e50_series = ema(close_4h, 50)
+    e200_series = ema(close_4h, 200)
+    s20 = float(s20_series.iloc[-1])
+    e50 = float(e50_series.iloc[-1])
+    e200 = float(e200_series.iloc[-1])
 
     base = {"sma20_4h": s20, "ema50_4h": e50, "ema200_4h": e200}
     ambas_sobre = s20 > e200 and e50 > e200
@@ -489,11 +528,24 @@ async def check_step_10(exchange, symbol: str):
                       "patron": "L1_sma20_bajo_ema50_ambas_bajo_ema200"}
 
     if ambas_sobre:
-        patron = "P2a_sma20_sobre_ema50_ambas_sobre_ema200" if s20 > e50 else "P2b_sma20_bajo_ema50_ambas_sobre_ema200"
         # Macro análisis: RSI6 de la última vela 4h YA CERRADA (la anterior a la que está en formación),
         # medido en la verde más cercana hacia atrás. SOLO informativo.
         macro, _ = medir_rsi6_verde_hacia_atras(df_4h, len(df_4h) - 1)
-        return True, {**base, "tipo": "SHORT_FIJO", "direccion": "short", "patron": patron,
+
+        if s20 <= e50:
+            return True, {**base, "tipo": "SHORT_FIJO", "direccion": "short",
+                          "patron": "P2b_sma20_bajo_ema50_ambas_sobre_ema200",
+                          "macro_aplica": True, "rsi6_4h_macro": macro}
+
+        trenzado, inicio = detectar_trenza_4h(s20_series, e50_series, e200_series)
+        if trenzado:
+            log.info("%s [Paso 10] SMA20(4h) TRENZADA en el tramo actual (inicio idx=%d): se metió bajo la EMA50 "
+                     "y se recuperó.", symbol, inicio)
+            return True, {**base, "tipo": "TRENZADO", "direccion": "short", "trenzado": True,
+                          "patron": "P2c_trenzado_sma20_sobre_ema50_ambas_sobre_ema200",
+                          "macro_aplica": True, "rsi6_4h_macro": macro}
+        return True, {**base, "tipo": "SHORT_FIJO", "direccion": "short",
+                      "patron": "P2a_sma20_sobre_ema50_ambas_sobre_ema200",
                       "macro_aplica": True, "rsi6_4h_macro": macro}
 
     if s20 <= e200:
@@ -514,6 +566,11 @@ def resolver_direccion(info10: dict, rsi_15m, rsi_5m, precio_ref):
     sobre = _sobrecomprado(rsi_15m) or _sobrecomprado(rsi_5m)
 
     if tipo == "SHORT_FIJO":
+        return "short", None
+
+    if tipo == "TRENZADO":
+        if sobre:
+            return "long", "P2c TRENZADO con RSI6>=90 en 15m/5m: pasa de SHORT a LONG"
         return "short", None
 
     if tipo == "P1":
@@ -852,6 +909,7 @@ async def evaluate_symbol(exchange, symbol: str):
             "direccion": direccion,
             "patron_4h": info10["patron"],
             "tipo_4h": info10["tipo"],
+            "trenzado": bool(info10.get("trenzado")),
             "dir_nota": nota_dir,
             "ma20_5m_value": ma20_5m_value,
             "ema200_5m_value": ema200_5m_value,
