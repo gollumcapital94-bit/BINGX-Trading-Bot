@@ -13,6 +13,9 @@ PASO 1  -> Gestión de posiciones abiertas:
            que el break even: sin slippage. En el LONG, si BingX rechaza el TP
            adjunto como límite, se reintenta con TP adjunto a mercado y, en
            último caso, sin TP.
+           VELAS DE LA GESTIÓN: BingX entrega como máximo ~1000 velas por llamada,
+           así que la gestión (SHORT y LONG) PAGINA igual que el escáner
+           (strat_short._fetch_ohlcv_paginated) y lee del mercado REAL.
 PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py.
            Margen (TODAS las entradas, SHORT y LONG): BINGX_LOW_RISK=true
            -> 5% de la cuenta, false -> 10%.
@@ -722,19 +725,23 @@ async def set_stop_loss_breakeven(exchange: "ccxt.bingx", position: dict,
         return False
 
 
-async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_loss_check: bool = True) -> None:
+async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_loss_check: bool = True,
+                              market_exchange: "ccxt.bingx | None" = None) -> None:
     """
     PASO 1 (SHORT):
       - Toque de SMA20(1h) -> Take Profit LÍMITE en la EMA200(1h) actual.
       - Toque de EMA50(1h) -> Stop Loss en break even (solo si `run_stop_loss_check`).
       (Si existiera un registro antiguo de TP adjunto, se conserva su lógica de reemplazo.)
+    Las velas se leen del mercado REAL y PAGINADAS (BingX da ~1000 por llamada).
     """
     symbol = position["symbol"]
     if position.get("side") != "short":
         log.info("%s: posición no-SHORT (%s), se omite el Paso 1 (SHORT).", symbol, position.get("side"))
         return
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_FETCH_LIMIT_TP)
+        ohlcv = await strat_short._fetch_ohlcv_paginated(
+            market_exchange or exchange, symbol, TIMEFRAME_TP, OHLCV_FETCH_LIMIT_TP,
+        )
 
         closed = ohlcv[:-1]
         if len(closed) < MIN_CANDLES_TP:
@@ -840,20 +847,23 @@ async def process_position_tp(exchange: "ccxt.bingx", position: dict, run_stop_l
         log.error("Error procesando TP/SL de %s: %s", symbol, exc)
 
 
-async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str], run_stop_loss_check: bool = True) -> None:
+async def run_paso1_gestion_tp(exchange: "ccxt.bingx", allowed_symbols: set[str], run_stop_loss_check: bool = True,
+                               market_exchange: "ccxt.bingx | None" = None) -> None:
     open_positions = await get_open_positions(exchange, allowed_symbols, side="short")
     if not open_positions:
         log.info("[Paso 1][SHORT] No hay posiciones SHORT abiertas en pares de futuros USDT.")
         return
-    await asyncio.gather(*[process_position_tp(exchange, pos, run_stop_loss_check) for pos in open_positions])
+    await asyncio.gather(*[
+        process_position_tp(exchange, pos, run_stop_loss_check, market_exchange) for pos in open_positions
+    ])
 
 
 # ----------------------------------------------------------------------
 # PASO 1 (LONG): seguimiento de la entrada, Take Profit y break even
 # ----------------------------------------------------------------------
 async def _emas_1h(market_exchange: "ccxt.bingx", symbol: str):
-    """(EMA50(1h), EMA200(1h)) de la última vela cerrada, o None si faltan velas."""
-    ohlcv = await market_exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TP, limit=OHLCV_FETCH_LIMIT_TP)
+    """(EMA50(1h), EMA200(1h)) de la última vela cerrada, o None si faltan velas. Velas PAGINADAS."""
+    ohlcv = await strat_short._fetch_ohlcv_paginated(market_exchange, symbol, TIMEFRAME_TP, OHLCV_FETCH_LIMIT_TP)
     closed = ohlcv[:-1]
     if len(closed) < MIN_CANDLES_TP:
         log.warning("%s: datos insuficientes de 1h (%d velas) para EMA50/EMA200 del LONG.", symbol, len(closed))
@@ -1903,7 +1913,7 @@ async def main() -> None:
         # La gestión de posiciones (TP / break even / cancelaciones) va SIEMPRE primero:
         # el conteo de operaciones en riesgo del escáner debe ver el estado ya actualizado.
         await asyncio.gather(
-            run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check),
+            run_paso1_gestion_tp(exchange_short, allowed_symbols, run_stop_loss_check, market_exchange),
             run_long_management(exchange_long, market_exchange, allowed_symbols, run_stop_loss_check),
         )
 
