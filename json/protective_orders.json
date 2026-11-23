@@ -1,16 +1,1 @@
-[
-  {
-    "symbol": "ERA/USDT:USDT",
-    "kind": "TP",
-    "order_id": "2124533536769269760",
-    "created_ts": 1795363241843,
-    "demo": true
-  },
-  {
-    "symbol": "ERA/USDT:USDT",
-    "kind": "BE",
-    "order_id": "2124533540237959168",
-    "created_ts": 1795363242670,
-    "demo": true
-  }
-]
+[]
