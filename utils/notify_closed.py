@@ -3,7 +3,13 @@ Bot NOTIFICADOR de operaciones cerradas (BingX -> Telegram)
 -----------------------------------------------------------
 Consulta a BingX las posiciones que se CERRARON desde la última corrida y manda
 a Telegram el PnL realizado en USDT y el ROI (ganancia, pérdida o liquidación).
-Funciona en cuenta REAL y DEMO (VST).
+
+CUENTA REVISADA (solo UNA por corrida, la misma en la que opera el bot):
+  BINGX_DEMO_SHORT manda. Si no existe, se usa BINGX_DEMO_LONG. Si no existe
+  ninguna, se revisa la cuenta REAL.
+    true  -> cuenta DEMO (VST)
+    false -> cuenta REAL
+  Ya NO se revisan real y demo a la vez.
 
 CAMBIOS (cierres que no avisaban):
   1) RED DE SEGURIDAD: si positionHistory no devuelve una operación (p. ej. en
@@ -12,17 +18,18 @@ CAMBIOS (cierres que no avisaban):
   3) Los pares con actividad reciente se revisan PRIMERO; el barrido completo
      va después y tiene un presupuesto de tiempo (NOTIFY_MAX_SECONDS).
   4) Líneas [DIAGNÓSTICO] en el log con lo que devolvió BingX en cada paso.
-  5) El estado se guarda al terminar cada cuenta.
+  5) El estado se guarda al terminar la revisión de la cuenta.
 
 Variables de entorno:
     BINGX_API_KEY, BINGX_API_SECRET
+    BINGX_DEMO_SHORT, BINGX_DEMO_LONG   (define la cuenta a revisar; manda SHORT)
     NOTIFY_BOT_TOKEN, NOTIFY_CHAT_ID
-    NOTIFY_MODES            "real,demo" (por defecto) | "real" | "demo"
     NOTIFY_LOOKBACK_HOURS   horas mínimas hacia atrás en cada corrida (6)
     NOTIFY_MAX_SECONDS      presupuesto del barrido completo (540)
 
-Ubicación: utils/notify_closed.py. Estado: json/notify_state.json.
-La PRIMERA corrida solo inicializa el estado y no envía avisos viejos.
+Ubicación: utils/notify_closed.py. Estado: json/notify_state.json
+(una sección "real" y otra "demo"; solo se usa la de la cuenta activa).
+La PRIMERA corrida de cada cuenta solo inicializa el estado y no envía avisos viejos.
 """
 
 import asyncio
@@ -55,6 +62,38 @@ MAX_SECONDS = float(os.environ.get("NOTIFY_MAX_SECONDS", "540"))
 
 def _utc(ms) -> str:
     return datetime.datetime.fromtimestamp(float(ms) / 1000, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "y")
+
+
+def _cuenta_a_revisar() -> bool:
+    """
+    Devuelve True si hay que revisar la cuenta DEMO, False si la REAL.
+    BINGX_DEMO_SHORT manda; si no está definida, BINGX_DEMO_LONG; si no, REAL.
+    """
+    short_raw = os.environ.get("BINGX_DEMO_SHORT", "").strip()
+    long_raw = os.environ.get("BINGX_DEMO_LONG", "").strip()
+
+    if short_raw:
+        demo = _env_flag("BINGX_DEMO_SHORT")
+        origen = f"BINGX_DEMO_SHORT={short_raw}"
+    elif long_raw:
+        demo = _env_flag("BINGX_DEMO_LONG")
+        origen = f"BINGX_DEMO_LONG={long_raw} (SHORT no está definida)"
+    else:
+        demo = False
+        origen = "ninguna variable definida, se usa REAL por defecto"
+
+    if short_raw and long_raw and _env_flag("BINGX_DEMO_SHORT") != _env_flag("BINGX_DEMO_LONG"):
+        log.warning(
+            "BINGX_DEMO_SHORT (%s) y BINGX_DEMO_LONG (%s) NO coinciden; manda SHORT.",
+            short_raw, long_raw,
+        )
+
+    log.info("Cuenta a revisar: %s (origen: %s)", "DEMO" if demo else "REAL", origen)
+    return demo
 
 
 # ----------------------------------------------------------------------
@@ -427,14 +466,10 @@ async def check_account(demo: bool, state: dict) -> None:
 
 
 async def main() -> None:
-    modes = {m.strip().lower() for m in os.environ.get("NOTIFY_MODES", "real,demo").split(",")}
+    demo = _cuenta_a_revisar()
     state = _load_state()
-    if "real" in modes:
-        await check_account(False, state)
-        _save_state(state)
-    if "demo" in modes:
-        await check_account(True, state)
-        _save_state(state)
+    await check_account(demo, state)
+    _save_state(state)
 
 
 if __name__ == "__main__":
