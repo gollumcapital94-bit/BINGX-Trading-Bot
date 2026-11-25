@@ -16,7 +16,7 @@ PASO 1  -> Gestión de posiciones abiertas:
            VELAS DE LA GESTIÓN: BingX entrega como máximo ~1000 velas por llamada,
            así que la gestión (SHORT y LONG) PAGINA igual que el escáner
            (strat_short._fetch_ohlcv_paginated) y lee del mercado REAL.
-PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py.
+PASOS 2-14 -> Escáner de nuevas entradas con strategy_entries.py.
            Margen (TODAS las entradas, SHORT y LONG): BINGX_LOW_RISK=true
            -> 5% de la cuenta, false -> 10%.
            LÍMITE DE RIESGO: como máximo MAX_OPERACIONES_EN_RIESGO (3) operaciones
@@ -25,7 +25,7 @@ PASOS 2-14 -> Escáner de nuevas entradas con short_strategy.py.
            (límite LONG sin llenar / STOP-limit SHORT sin activar) cuentan como en riesgo.
            Si hay más señales que cupos, se abren en el orden en que salen del escáner.
 PASO 15 -> BARRIDO DE BALANCE (solo mercado real, solo disparador externo).
-           Tope: 20,000 USDT.
+           Tope: 10,000 USDT.
 
 LECTURA DE MERCADO: el universo de símbolos y todo el escaneo se leen
 SIEMPRE del mercado REAL (ver build_market_data_exchange()).
@@ -52,7 +52,7 @@ import sys
 import pandas as pd
 import ccxt.async_support as ccxt
 
-import short_strategy as strat_short
+import strategy_entries as strat_short
 from utils.indicators import sma, ema
 from utils import resilience
 
@@ -1744,9 +1744,9 @@ async def ensure_hedge_mode(exchange: "ccxt.bingx", label: str) -> None:
 
 # ----------------------------------------------------------------------
 # PASO 15: BARRIDO DE BALANCE EXCEDENTE (cuenta de futuros -> fondos).
-# Solo cuenta REAL (en DEMO se omite). Tope: 20,000 USDT.
+# Solo cuenta REAL (en DEMO se omite). Tope: 10,000 USDT.
 # ----------------------------------------------------------------------
-FUTURES_BALANCE_CAP_USDT = 20_000.0
+FUTURES_BALANCE_CAP_USDT = 10_000.0
 FUND_TRANSFER_FROM_ACCOUNT = "swap"
 FUND_TRANSFER_TO_ACCOUNT = "funding"
 
