@@ -13,7 +13,7 @@ permissions:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15   # antes 5: ahora el notificador barre TODOS los pares USDT-M
+    timeout-minutes: 15   # el notificador barre todos los pares USDT-M de UNA sola cuenta
     concurrency:
       group: bingx-notify
       cancel-in-progress: false
@@ -36,8 +36,10 @@ jobs:
           BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
           NOTIFY_BOT_TOKEN: ${{ secrets.NOTIFY_BOT_TOKEN }}
           NOTIFY_CHAT_ID: ${{ secrets.NOTIFY_CHAT_ID }}
-          # Cuentas a revisar: real y demo.
-          NOTIFY_MODES: "real,demo"
+          # Cuenta a revisar: la MISMA que usa el bot. Manda BINGX_DEMO_SHORT.
+          # true = DEMO | false = REAL. Se leen de las variables del repo (vars).
+          BINGX_DEMO_SHORT: ${{ vars.BINGX_DEMO_SHORT || 'true' }}
+          BINGX_DEMO_LONG: ${{ vars.BINGX_DEMO_LONG || 'true' }}
         run: |
           set -o pipefail
           python utils/notify_closed.py 2>&1 | tee notify_output.log
