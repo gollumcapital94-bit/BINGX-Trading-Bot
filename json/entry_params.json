@@ -1,0 +1,19 @@
+{
+  "demo": {
+    "errores": {
+      "short_pendiente": {
+        "STOP límite (stopPrice)": {
+          "codigo": "109420",
+          "mensaje": "bingx {\"code\":109420,\"msg\":\"position not exist\",\"data\":{}}",
+          "fecha_utc": "2026-11-26 19:02"
+        }
+      }
+    },
+    "short_pendiente": {
+      "variante": "limit + triggerPrice (ccxt)",
+      "ts": 1795719780359,
+      "fecha_utc": "2026-11-26 19:03",
+      "ccxt": "4.5.93"
+    }
+  }
+}
