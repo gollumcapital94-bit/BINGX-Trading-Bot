@@ -16,7 +16,7 @@ PASO 1  -> Gestión de posiciones abiertas:
            VELAS DE LA GESTIÓN: BingX entrega como máximo ~1000 velas por llamada,
            así que la gestión (SHORT y LONG) PAGINA igual que el escáner
            (strat_short._fetch_ohlcv_paginated) y lee del mercado REAL.
-PASOS 2-14 -> Escáner de nuevas entradas con strategy_entries.py.
+PASOS 2-14 -> Escáner de nuevas entradas con strategy.py.
            Margen (TODAS las entradas, SHORT y LONG): BINGX_LOW_RISK=true
            -> 5% de la cuenta, false -> 10%.
            LÍMITE DE RIESGO: como máximo MAX_OPERACIONES_EN_RIESGO (3) operaciones
@@ -52,7 +52,7 @@ import sys
 import pandas as pd
 import ccxt.async_support as ccxt
 
-import strategy_entries as strat_short
+import strategy as strat_short
 from utils.indicators import sma, ema
 from utils import resilience
 
