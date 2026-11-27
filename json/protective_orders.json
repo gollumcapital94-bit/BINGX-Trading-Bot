@@ -5,5 +5,12 @@
     "order_id": "2126043487148793856",
     "created_ts": 1795723242091,
     "demo": true
+  },
+  {
+    "symbol": "RUNE/USDT:USDT",
+    "kind": "BE",
+    "order_id": "2126103868751831040",
+    "created_ts": 1795737638231,
+    "demo": true
   }
 ]
