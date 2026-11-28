@@ -5,10 +5,12 @@
     "symbols": []
   },
   "demo": {
-    "last_check_ms": 1795831237722,
+    "last_check_ms": 1795834829734,
     "notified": [
       "I:RUNE-USDT:1795738740000"
     ],
-    "symbols": []
+    "symbols": [
+      "STX-USDT"
+    ]
   }
 }
