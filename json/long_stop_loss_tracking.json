@@ -1,12 +1,1 @@
-[
-  {
-    "symbol": "STX/USDT:USDT",
-    "demo": true,
-    "entry_price": 0.2688,
-    "status": "watching",
-    "threshold_pct": 2.533457552004283,
-    "trigger_price": 0.2756,
-    "be_order_id": null,
-    "since_ts": 1795831678000
-  }
-]
+[]

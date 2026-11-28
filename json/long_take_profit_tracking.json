@@ -1,18 +1,1 @@
-[
-  {
-    "symbol": "STX/USDT:USDT",
-    "demo": true,
-    "status": "filled",
-    "entry_type": "limit",
-    "order_id": "2126497026729316352",
-    "entry_price": 0.2688,
-    "max_high_5m": 0.2709,
-    "leverage": 35,
-    "amount": 235331.0,
-    "created_ts": 1795831374356,
-    "filled_ts": 1795831678000,
-    "tp_price": 0.2758,
-    "tp_distance_pct": null,
-    "tp_order_id": "adjunto"
-  }
-]
+[]
